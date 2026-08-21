@@ -13,8 +13,16 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 
-set(CMAKE_CXX_STANDARD "17" CACHE STRING "C++ standard to enforce")
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# The C++ standard is set per target, with target_compile_features below, and
+# deliberately not here. CMAKE_CXX_STANDARD is a cache variable DuckDB owns and
+# sets to 11; raising it from an extension raises it for DuckDB's own targets
+# too, and only for those configured after this point. That produces a build
+# where some translation units are C++11 and some are C++17, which is not a
+# style question: `static constexpr` members are implicitly inline from C++17,
+# so the two halves emit a strong and a weak definition of the same symbol and
+# the link fails on ELF with "multiple definition of
+# duckdb::BufferedFileWriter::DEFAULT_OPEN_FLAGS". macOS links it anyway, so
+# this only ever showed up on Linux CI.
 
 include_directories(src/include)
 

@@ -27,7 +27,15 @@ jobs:
       duckdb_version: v1.5.4
       ci_tools_version: v1.5-variegata
       extension_name: oracle_scanner
-      format_checks: 'format;tidy'
+      # `tidy` only, deliberately. The format check applies duckdb/.clang-format
+      # across all of src/, and this tree has two styles on purpose: protocol and
+      # session code uses 4-space indentation and snake_case file names per
+      # AGENTS.md, while the DuckDB adapter follows DuckDB house style because it
+      # mirrors template and API code. Running the check would demand the
+      # protocol half be reindented, which is the opposite of the rule it is
+      # supposed to enforce. Re-enable it by adding 'format' here if that
+      # split is ever dropped.
+      format_checks: 'tidy'
 
   # The distribution pipeline runs the sqllogictest suite and nothing else, so
   # the protocol suite — parsers, codecs, session contract, and every bounds and

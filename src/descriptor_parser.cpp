@@ -157,7 +157,12 @@ const Node &RequiredChild(const Node &node, const std::string &key) {
     return *result;
 }
 
-const Node &RequiredContainer(const Node &node, const std::string &key) {
+// Returns a pointer rather than a reference because the caller keeps the
+// result, and GCC's -Wdangling-reference cannot see that it points into `node`
+// — which outlives the call — rather than into the temporary `key`. The
+// warning is a false positive, but CI builds with -Werror, and a pointer says
+// what is actually meant: this borrows from `node`.
+const Node *RequiredContainer(const Node &node, const std::string &key) {
     const Node *result = nullptr;
     for (const auto &child : node.children) {
         if (child.key != key) {
@@ -171,7 +176,7 @@ const Node &RequiredContainer(const Node &node, const std::string &key) {
     if (!result || !result->value.empty()) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle descriptor is missing a required section");
     }
-    return *result;
+    return result;
 }
 
 void CollectAddresses(const Node &description, std::vector<const Node *> &result) {
@@ -242,8 +247,8 @@ ParsedConnectDescriptor ParseConnectDescriptor(const std::string &descriptor) {
         endpoint.port = ParsePort(RequiredChild(*address, "PORT").value);
         result.endpoints.push_back(std::move(endpoint));
     }
-    const auto &connect_data = RequiredContainer(root, "CONNECT_DATA");
-    result.service_name = RequiredChild(connect_data, "SERVICE_NAME").value;
+    const Node *connect_data = RequiredContainer(root, "CONNECT_DATA");
+    result.service_name = RequiredChild(*connect_data, "SERVICE_NAME").value;
     // (security=(ssl_server_dn_match=yes)(ssl_server_cert_dn="...")). The DN is
     // an extra check on top of hostname verification, not a replacement for it,
     // and ssl_server_dn_match=no does not turn verification off here: this
