@@ -12,4 +12,4 @@ extension:
 
 repo:
   github: krokozyab/quack-oracle
-  ref: v0.1.0
+  ref: 6f454dbe00c28fddd0132f49439eba261852e08c
