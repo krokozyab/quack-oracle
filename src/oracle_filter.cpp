@@ -12,12 +12,16 @@
 #include "oracle_adapter.hpp"
 
 #include "duckdb/common/types/time.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
-#include "duckdb/planner/filter/in_filter.hpp"
-#include "duckdb/planner/filter/null_filter.hpp"
-#include "duckdb/planner/filter/optional_filter.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/filter/table_filter_functions.hpp"
 #include "duckdb/planner/table_filter.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
 
 #include <cstdio>
 #include <optional>
@@ -199,69 +203,151 @@ std::string ComparisonOperator(ExpressionType comparison, const OracleColumn &co
     }
 }
 
-// Returns the translated predicate, or nothing when the filter is optional and
-// could not be translated. An optional filter is a hint DuckDB does not rely on
-// for correctness, so dropping one is allowed where dropping a required filter
-// would change the answer.
-std::optional<std::string> TranslateOptional(const TableFilter &filter, const OracleColumn &column,
-                                             const std::string &quoted_name);
+// DuckDB 2.0 hands a scan one kind of filter: an ExpressionFilter wrapping a
+// bound expression tree. The legacy filter classes still exist, but
+// LogicalGet converts every one of them to an expression before a scan ever
+// sees it, so there is exactly one input shape to translate and it is this one.
+//
+// The shapes the planner produces for the predicates this translator accepts,
+// taken from how each legacy filter's ToExpression builds them:
+//
+//   col = C            BoundFunctionExpression whose GetExpressionType() is a
+//                      COMPARE_*; operands via BoundComparisonExpression::Left/Right
+//   col IS [NOT] NULL  BoundOperatorExpression(OPERATOR_IS_[NOT_]NULL) with one child
+//   col IN (C, ...)    BoundOperatorExpression(COMPARE_IN), children [col, C, C, ...]
+//   a AND b / a OR b   BoundConjunctionExpression
+//   optional(f)        BoundFunctionExpression named OptionalFilterScalarFun::NAME,
+//                      the real filter in its BindInfo()->child_filter_expr
+//
+// The column itself is a BoundReferenceExpression. A single-column filter
+// refers to index 0; anything else is a multi-column filter this translator
+// does not attempt.
 
-std::string TranslateFilter(const TableFilter &filter, const OracleColumn &column, const std::string &quoted_name) {
-    switch (filter.filter_type) {
-    case TableFilterType::OPTIONAL_FILTER: {
-        // Reached only as a child of a required filter, where dropping it is
-        // not allowed, so here it must translate or refuse like any other.
-        const auto &optional = filter.Cast<OptionalFilter>();
-        if (!optional.child_filter) {
+bool IsOptionalWrapper(const Expression &expression) {
+    if (expression.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+        return false;
+    }
+    const auto &name = expression.Cast<BoundFunctionExpression>().Function().GetName();
+    return name == OptionalFilterScalarFun::NAME || name == SelectivityOptionalFilterScalarFun::NAME;
+}
+
+// The expression an optional wrapper carries, or null when it carries none.
+const Expression *OptionalChild(const Expression &expression) {
+    const auto &function = expression.Cast<BoundFunctionExpression>();
+    if (!function.BindInfo()) {
+        return nullptr;
+    }
+    const auto &name = function.Function().GetName();
+    if (name == OptionalFilterScalarFun::NAME) {
+        return function.BindInfo()->Cast<OptionalFilterFunctionData>().child_filter_expr.get();
+    }
+    return function.BindInfo()->Cast<SelectivityOptionalFilterFunctionData>().child_filter_expr.get();
+}
+
+void RequireColumnReference(const Expression &expression) {
+    if (expression.GetExpressionClass() != ExpressionClass::BOUND_REF) {
+        Refuse("a predicate whose subject is not the column itself");
+    }
+    if (expression.Cast<BoundReferenceExpression>().Index() != 0) {
+        // A filter over several columns binds them as references 0, 1, ...;
+        // this translator is handed one column and proves things about that
+        // column only.
+        Refuse("a predicate over more than one column");
+    }
+}
+
+const Value &RequireConstant(const Expression &expression) {
+    if (expression.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+        Refuse("a comparison against something other than a constant");
+    }
+    return expression.Cast<BoundConstantExpression>().GetValue();
+}
+
+std::string TranslateExpression(const Expression &expression, const OracleColumn &column,
+                                const std::string &quoted_name);
+
+std::string TranslateComparison(const BoundFunctionExpression &comparison, const OracleColumn &column,
+                                const std::string &quoted_name) {
+    const auto &left = BoundComparisonExpression::Left(comparison);
+    const auto &right = BoundComparisonExpression::Right(comparison);
+    // The planner puts the column on the left for a pushed filter. A constant
+    // on the left would need the operator flipped, and nothing observed
+    // produces that shape, so it is refused rather than guessed at.
+    RequireColumnReference(left);
+    const auto &constant = RequireConstant(right);
+    const auto oracle_operator = ComparisonOperator(comparison.GetExpressionType(), column);
+    return quoted_name + " " + oracle_operator + " " + OracleLiteral(constant, column);
+}
+
+std::string TranslateExpression(const Expression &expression, const OracleColumn &column,
+                                const std::string &quoted_name) {
+    if (IsOptionalWrapper(expression)) {
+        // Reached only beneath a required predicate, where dropping it is not
+        // allowed, so here it must translate or refuse like any other.
+        const auto *child = OptionalChild(expression);
+        if (!child) {
             Refuse("an optional filter with no child");
         }
-        return TranslateFilter(*optional.child_filter, column, quoted_name);
+        return TranslateExpression(*child, column, quoted_name);
     }
-    case TableFilterType::IS_NULL:
-        // Identical in both engines.
-        return quoted_name + " IS NULL";
-    case TableFilterType::IS_NOT_NULL:
-        return quoted_name + " IS NOT NULL";
-    case TableFilterType::CONSTANT_COMPARISON: {
-        const auto &comparison = filter.Cast<ConstantFilter>();
-        const auto oracle_operator = ComparisonOperator(comparison.comparison_type, column);
-        return quoted_name + " " + oracle_operator + " " + OracleLiteral(comparison.constant, column);
+    switch (expression.GetExpressionClass()) {
+    case ExpressionClass::BOUND_FUNCTION: {
+        if (!BoundComparisonExpression::IsComparison(expression)) {
+            Refuse("a function call");
+        }
+        return TranslateComparison(expression.Cast<BoundFunctionExpression>(), column, quoted_name);
     }
-    case TableFilterType::IN_FILTER: {
-        // An IN list is a disjunction of equalities, and equality carries the
-        // same proof: exact for NUMBER, collation-independent for VARCHAR2, and
-        // refused for an empty string. Each value goes through the same literal
-        // check, so a list containing one unprovable value refuses as a whole
-        // rather than being partly applied.
-        const auto &in_filter = filter.Cast<InFilter>();
-        if (in_filter.values.empty()) {
-            Refuse("an empty IN list");
-        }
-        if (in_filter.values.size() > MAX_IN_LIST_VALUES) {
-            // Oracle's own limit on an expression list is 1000.
-            Refuse("an IN list longer than " + std::to_string(MAX_IN_LIST_VALUES) + " values");
-        }
-        std::string list;
-        for (const auto &value : in_filter.values) {
-            if (!list.empty()) {
-                list += ", ";
+    case ExpressionClass::BOUND_OPERATOR: {
+        const auto &op = expression.Cast<BoundOperatorExpression>();
+        const auto &children = op.GetChildren();
+        switch (op.GetExpressionType()) {
+        case ExpressionType::OPERATOR_IS_NULL:
+        case ExpressionType::OPERATOR_IS_NOT_NULL:
+            if (children.size() != 1) {
+                Refuse("a malformed null test");
             }
-            list += OracleLiteral(value, column);
+            RequireColumnReference(*children[0]);
+            // Identical in both engines.
+            return quoted_name +
+                   (op.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL ? " IS NULL" : " IS NOT NULL");
+        case ExpressionType::COMPARE_IN: {
+            // An IN list is a disjunction of equalities, and equality carries
+            // the same proof: exact for NUMBER, collation-independent for
+            // VARCHAR2, and refused for an empty string. Each value goes
+            // through the same literal check, so a list containing one
+            // unprovable value refuses as a whole rather than being partly
+            // applied.
+            if (children.size() < 2) {
+                Refuse("an empty IN list");
+            }
+            RequireColumnReference(*children[0]);
+            if (children.size() - 1 > MAX_IN_LIST_VALUES) {
+                // Oracle's own limit on an expression list is 1000.
+                Refuse("an IN list longer than " + std::to_string(MAX_IN_LIST_VALUES) + " values");
+            }
+            std::string list;
+            for (size_t index = 1; index < children.size(); index++) {
+                if (!list.empty()) {
+                    list += ", ";
+                }
+                list += OracleLiteral(RequireConstant(*children[index]), column);
+            }
+            return quoted_name + " IN (" + list + ")";
         }
-        return quoted_name + " IN (" + list + ")";
+        default:
+            Refuse("operator " + ExpressionTypeToString(op.GetExpressionType()));
+        }
     }
-    case TableFilterType::CONJUNCTION_AND:
-    case TableFilterType::CONJUNCTION_OR: {
-        const auto &conjunction = filter.filter_type == TableFilterType::CONJUNCTION_AND
-                                      ? static_cast<const ConjunctionFilter &>(filter.Cast<ConjunctionAndFilter>())
-                                      : static_cast<const ConjunctionFilter &>(filter.Cast<ConjunctionOrFilter>());
-        const std::string separator = filter.filter_type == TableFilterType::CONJUNCTION_AND ? " AND " : " OR ";
+    case ExpressionClass::BOUND_CONJUNCTION: {
+        const auto &conjunction = expression.Cast<BoundConjunctionExpression>();
+        const std::string separator =
+            conjunction.GetExpressionType() == ExpressionType::CONJUNCTION_AND ? " AND " : " OR ";
         std::string result;
-        for (const auto &child : conjunction.child_filters) {
+        for (const auto &child : conjunction.GetChildren()) {
             if (!result.empty()) {
                 result += separator;
             }
-            result += TranslateFilter(*child, column, quoted_name);
+            result += TranslateExpression(*child, column, quoted_name);
         }
         // An empty conjunction would silently become no predicate at all.
         if (result.empty()) {
@@ -270,21 +356,32 @@ std::string TranslateFilter(const TableFilter &filter, const OracleColumn &colum
         return "(" + result + ")";
     }
     default:
-        Refuse("filter kind " + std::to_string(static_cast<int>(filter.filter_type)));
+        Refuse("expression class " + ExpressionClassToString(expression.GetExpressionClass()));
     }
 }
 
+// Returns the translated predicate, or nothing when the filter is optional and
+// could not be translated. An optional filter is a hint DuckDB does not rely on
+// for correctness, so dropping one is allowed where dropping a required filter
+// would change the answer.
 std::optional<std::string> TranslateOptional(const TableFilter &filter, const OracleColumn &column,
                                              const std::string &quoted_name) {
-    if (filter.filter_type != TableFilterType::OPTIONAL_FILTER) {
-        return TranslateFilter(filter, column, quoted_name);
+    if (filter.filter_type != TableFilterType::EXPRESSION_FILTER) {
+        // LogicalGet converts every legacy filter before a scan sees it, so
+        // one arriving here is a planner path this code has not met.
+        Refuse("a filter that is not an expression (kind " + std::to_string(static_cast<int>(filter.filter_type)) +
+               ")");
     }
-    const auto &optional = filter.Cast<OptionalFilter>();
-    if (!optional.child_filter) {
+    const auto &expression = *filter.Cast<ExpressionFilter>().expr;
+    if (!IsOptionalWrapper(expression)) {
+        return TranslateExpression(expression, column, quoted_name);
+    }
+    const auto *child = OptionalChild(expression);
+    if (!child) {
         return std::nullopt;
     }
     try {
-        return TranslateFilter(*optional.child_filter, column, quoted_name);
+        return TranslateExpression(*child, column, quoted_name);
     } catch (const NotImplementedException &) {
         // DuckDB does not need this one, so not sending it is correct rather
         // than merely convenient.
@@ -297,11 +394,17 @@ std::optional<std::string> TranslateOptional(const TableFilter &filter, const Or
 std::string OracleWhereClause(const TableFilterSet &filters, const std::vector<OracleColumn> &columns,
                               const std::vector<column_t> &scanned_columns) {
     std::string predicate;
-    for (const auto &entry : filters.filters) {
-        if (entry.first >= scanned_columns.size()) {
+    if (filters.HasMultiColumnFilters()) {
+        // A predicate over several columns binds each as its own reference;
+        // this translator proves things about one column at a time.
+        Refuse("a predicate over more than one column");
+    }
+    for (const auto &entry : filters) {
+        const auto projection = entry.GetIndex().GetIndex();
+        if (projection >= scanned_columns.size()) {
             Refuse("a filter on a column this scan does not read");
         }
-        const auto column_index = scanned_columns[entry.first];
+        const auto column_index = scanned_columns[projection];
         if (column_index >= columns.size()) {
             Refuse("a filter on a virtual column");
         }
@@ -309,7 +412,7 @@ std::string OracleWhereClause(const TableFilterSet &filters, const std::vector<O
         // A column this client cannot read cannot be reasoned about either.
         RequireReadableColumn(column);
         const auto quoted_name = KeywordHelper::WriteQuoted(column.name, '"');
-        const auto translated = TranslateOptional(*entry.second, column, quoted_name);
+        const auto translated = TranslateOptional(entry.Filter(), column, quoted_name);
         if (!translated) {
             continue;
         }
