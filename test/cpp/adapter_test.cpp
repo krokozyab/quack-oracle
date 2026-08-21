@@ -113,6 +113,9 @@ struct FakeTable {
 // scripted to answer with. It outlives the session because the adapter owns and
 // destroys the session on its own schedule.
 struct FakeScript {
+    //! Answer rows on the first Fetch and an empty exhausted batch on the second,
+    //! the way a real cursor does.
+    bool two_batch_fetch = false;
     // A parallel scan drives several sessions at once, all of them recording
     // into this one script. Unsynchronised, the recording loses entries and the
     // test that reads them back becomes a coin flip — which is how this was
@@ -249,8 +252,12 @@ public:
         if (!drained) {
             batch.rows = answer ? answer->rows : script->rows;
             drained = true;
+            // Like a real cursor, which only learns it is exhausted on the
+            // fetch that returns nothing: rows now, the empty end-of-data next.
+            batch.exhausted = !script->two_batch_fetch;
+            return batch;
         }
-        batch.exhausted = drained;
+        batch.exhausted = true;
         return batch;
     }
 
@@ -691,6 +698,49 @@ void TestLobColumnsMapToTextAndBlob() {
     CHECK(result->GetTypes()[2] == duckdb::LogicalType::BLOB);
     CHECK(result->GetValue(0, 0).ToString() == "hi");
     CHECK(result->GetValue(1, 0).ToString() == "\xd0\xbf");
+}
+
+// A NULL has to survive from the wire to whatever DuckDB evaluates on top of
+// the scan. In 2.0 every vector carries its own size and SetValue does not
+// advance it, so a scan that set only the chunk's cardinality emitted vectors
+// of size zero. VectorOperations::IsNull sizes its loop from the vector, not
+// from the chunk's count, and so evaluated over nothing: `label IS NULL` read
+// false on every row, including the NULL one.
+//
+// The form matters, and the first version of this test was vacuous because of
+// it. A query that is *only* `label IS NULL`, or a count(*) over a WHERE, passed
+// with the bug in place: the projection's ExpressionExecutor re-sizes its own
+// output from the chunk's count, and a materialized result is copied by that
+// count too, so both repaired the sizes before anything read them. What does
+// not get repaired is a reference to the scan's vector used inside a wider
+// projection — exactly what `SELECT id, label, label IS NULL FROM ...` does,
+// and what the shell showed against a live database. So that is what this
+// reads, from a streaming result, which is what the shell and every pipeline
+// operator consume.
+void TestNullsSurviveAboveTheScan() {
+    auto script = std::make_shared<FakeScript>();
+    script->two_batch_fetch = true;
+    script->columns = {Column("ID", 2, 10, 0), Column("LABEL", 1)};
+    script->rows = {{oracle_scanner::EncodeOracleNumber("1"), std::vector<uint8_t>({'a'})},
+                    {oracle_scanner::EncodeOracleNumber("2"), std::nullopt},
+                    {oracle_scanner::EncodeOracleNumber("3"), std::vector<uint8_t>({'c'})}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    const std::string scan = "oracle_query('ora', 'SELECT id, label FROM app.items')";
+
+    auto streamed = database.con.SendQuery("SELECT id, label, label IS NULL AS n FROM " + scan);
+    CHECK(!streamed->HasError());
+    CHECK(streamed->GetResultType() == duckdb::QueryResultType::STREAM_RESULT);
+    auto chunk = streamed->Fetch();
+    CHECK(chunk != nullptr && chunk->size() == 3);
+    CHECK(chunk->GetValue(1, 1).IsNull());
+    CHECK(chunk->GetValue(2, 0).GetValue<bool>() == false);
+    CHECK(chunk->GetValue(2, 1).GetValue<bool>() == true);
+    CHECK(chunk->GetValue(2, 2).GetValue<bool>() == false);
+
+    // And the aggregate, which counts non-NULLs by the same validity.
+    auto counted = database.Query("SELECT count(label) FROM " + scan);
+    CHECK(!counted->HasError() && counted->GetValue(0, 0).GetValue<int64_t>() == 2);
 }
 
 // Filter pushdown translates only what is provably identical in Oracle, and
@@ -1592,6 +1642,7 @@ int main() {
     TestProtocolFailuresBecomeTypedDuckDbErrors();
     TestUnsupportedColumnTypesAreRefusedAtBind();
     TestLobColumnsMapToTextAndBlob();
+    TestNullsSurviveAboveTheScan();
     TestFilterPushdownTranslatesOnlyTheProvenSubset();
     TestExecuteManyBatchesAndCommits();
     TestNamedCallRequestAndOutputs();

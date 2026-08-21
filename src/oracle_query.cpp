@@ -563,7 +563,7 @@ void OracleExecuteFunction(ClientContext &, TableFunctionInput &input, DataChunk
     auto &state = input.global_state->Cast<OracleExecuteGlobalState>();
     if (!state.emitted) {
         output.SetValue(0, 0, Value::UBIGINT(state.affected_rows));
-        output.SetCardinality(1);
+        output.SetChildCardinality(1);
         state.emitted = true;
     }
 }
@@ -712,7 +712,7 @@ void OracleCallNumberFunction(ClientContext &, TableFunctionInput &input, DataCh
     auto &state = input.global_state->Cast<OracleCallScalarGlobalState>();
     if (!state.emitted) {
         output.SetValue(0, 0, state.value ? Value(*state.value) : Value());
-        output.SetCardinality(1);
+        output.SetChildCardinality(1);
         state.emitted = true;
     }
 }
@@ -924,7 +924,7 @@ void OracleCallFunction(ClientContext &, TableFunctionInput &input, DataChunk &o
         output.SetValue(0, index, Value(state.handles[state.next_handle + index]));
     }
     state.next_handle += count;
-    output.SetCardinality(count);
+    output.SetChildCardinality(count);
 }
 
 unique_ptr<FunctionData> OracleCallImplicitBind(ClientContext &context, TableFunctionBindInput &input,
@@ -1115,7 +1115,7 @@ void OracleArgumentsFunction(ClientContext &, TableFunctionInput &input, DataChu
                         argument.unsupported_reason.empty() ? Value() : Value(argument.unsupported_reason));
     }
     state.next_row += count;
-    output.SetCardinality(count);
+    output.SetChildCardinality(count);
 }
 
 struct OracleCallAutoBindData final : TableFunctionData {
@@ -1352,7 +1352,7 @@ void OracleCallNamedFunction(ClientContext &, TableFunctionInput &input, DataChu
         output.SetValue(2, index, row.cursor_handle ? Value(*row.cursor_handle) : Value());
     }
     state.next_row += count;
-    output.SetCardinality(count);
+    output.SetChildCardinality(count);
 }
 
 unique_ptr<FunctionData> OracleCallNamedFunctionBind(ClientContext &context, TableFunctionBindInput &input,
@@ -1503,7 +1503,7 @@ void OracleCloseCallFunction(ClientContext &, TableFunctionInput &input, DataChu
     auto &state = input.global_state->Cast<OracleCloseCallGlobalState>();
     if (!state.emitted) {
         output.SetValue(0, 0, Value::BOOLEAN(state.closed));
-        output.SetCardinality(1);
+        output.SetChildCardinality(1);
         state.emitted = true;
     }
 }
@@ -1612,7 +1612,13 @@ void OracleQueryFunction(ClientContext &, TableFunctionInput &input, DataChunk &
                             }));
         }
     }
-    output.SetCardinality(batch.rows.size());
+    // SetChildCardinality, not SetCardinality. In DuckDB 2.0 every vector
+    // carries its own size, and SetValue does not advance it; SetCardinality
+    // sets the chunk's count only, leaving each vector at size 0. A consumer
+    // then reads the validity mask by the vector's size and sees no NULL at
+    // all: `col IS NULL` matched every row, and count(col) counted them. The
+    // compiler cannot see that; the adapter suite now does.
+    output.SetChildCardinality(batch.rows.size());
 }
 
 
