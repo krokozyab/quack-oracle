@@ -1,5 +1,5 @@
 #
-# Does this extension still compile against DuckDB's main branch?
+# Does the duckdb-2.0 branch still compile against DuckDB's main branch?
 #
 # DuckDB 2.0 has no tag, no branch and no ci-tools track yet: it is `main`, and
 # its API moves. A trial build against it found 52 distinct errors in 6 adapter files,
@@ -37,6 +37,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # The port lives on its own branch; measuring main would report the
+          # unported tree's 98 errors every week and tell nobody anything.
+          ref: duckdb-2.0
           submodules: true
 
       - name: Install build dependencies
