@@ -19,11 +19,72 @@
 #else
 #include <arpa/inet.h>
 #include <cerrno>
+#include <csignal>
+#include <pthread.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #endif
 
 namespace oracle_scanner {
+
+#if defined(_WIN32)
+// Windows has no SIGPIPE; a closed peer surfaces as an error return.
+class ScopedSigPipeBlock {};
+#else
+// Blocks SIGPIPE for this thread across a write, and consumes the one our own
+// write may have raised.
+//
+// Writing to a peer that has closed returns EPIPE and raises SIGPIPE, whose
+// default action terminates the process. Without this, an Oracle server closing
+// mid-write takes down the whole DuckDB process instead of failing one
+// statement. macOS suppresses the signal for sockets and Linux does not, which
+// is why it only ever appeared there.
+//
+// Only a signal this scope could have raised is consumed. If SIGPIPE was
+// already blocked on entry, a pending one may predate us and belongs to
+// whoever blocked it, so it is left alone.
+class ScopedSigPipeBlock {
+public:
+    ScopedSigPipeBlock() {
+        sigset_t block;
+        sigemptyset(&block);
+        sigaddset(&block, SIGPIPE);
+        if (pthread_sigmask(SIG_BLOCK, &block, &previous) != 0) {
+            return;
+        }
+        active = true;
+        was_blocked = sigismember(&previous, SIGPIPE) == 1;
+    }
+
+    ~ScopedSigPipeBlock() {
+        if (!active) {
+            return;
+        }
+        if (!was_blocked) {
+            sigset_t pending;
+            sigemptyset(&pending);
+            if (sigpending(&pending) == 0 && sigismember(&pending, SIGPIPE) == 1) {
+                sigset_t just_sigpipe;
+                sigemptyset(&just_sigpipe);
+                sigaddset(&just_sigpipe, SIGPIPE);
+                int delivered = 0;
+                // It is pending and blocked, so this takes it without waiting.
+                sigwait(&just_sigpipe, &delivered);
+            }
+        }
+        pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+    }
+
+    ScopedSigPipeBlock(const ScopedSigPipeBlock &) = delete;
+    ScopedSigPipeBlock &operator=(const ScopedSigPipeBlock &) = delete;
+
+private:
+    sigset_t previous {};
+    bool active = false;
+    bool was_blocked = false;
+};
+#endif
+
 
 struct OpenSslByteStream::Impl {
     BIO *bio = nullptr;
@@ -313,6 +374,9 @@ std::unique_ptr<OpenSslByteStream> OpenSslByteStream::Connect(const std::string 
     }
 
     BIO_set_nbio(result->bio, 1);
+    // The handshake writes, so a peer that resets mid-negotiation would raise
+    // SIGPIPE here just as an ordinary write would.
+    const ScopedSigPipeBlock no_sigpipe;
     if (BIO_do_connect_retry(result->bio, static_cast<int>(connect_timeout_seconds), 100) != 1) {
         const auto error_detail = DrainOpenSslErrors();
         throw ProtocolError(ProtocolErrorKind::TRUNCATED,
@@ -444,6 +508,7 @@ size_t OpenSslByteStream::Write(const uint8_t *source, size_t size) {
     if (!implementation || implementation->closed || !source || size == 0) {
         return 0;
     }
+    const ScopedSigPipeBlock no_sigpipe;
     const auto requested = static_cast<int>(std::min(size, static_cast<size_t>(std::numeric_limits<int>::max())));
     while (true) {
         const auto count = BIO_write(implementation->bio, source, requested);
@@ -470,6 +535,7 @@ void OpenSslByteStream::SendUrgent(uint8_t value) {
         throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "Oracle TCP urgent-byte send failed");
     }
 #else
+    const ScopedSigPipeBlock no_sigpipe;
     while (true) {
         const auto sent = send(implementation->socket_fd, &value, 1, MSG_OOB);
         if (sent == 1) {
@@ -492,6 +558,9 @@ void OpenSslByteStream::SendUrgent(uint8_t value) {
 void OpenSslByteStream::Close() {
     if (implementation) {
         implementation->closed = true;
+        // Freeing the BIO can drive a TLS shutdown, which is a write like any
+        // other and so can meet a peer that has already gone.
+        const ScopedSigPipeBlock no_sigpipe;
         implementation.reset();
     }
 }

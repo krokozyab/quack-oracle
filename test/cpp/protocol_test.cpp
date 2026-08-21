@@ -66,6 +66,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <csignal>
+#include <pthread.h>
 #include <cstdlib>
 #include <cstdint>
 #include <exception>
@@ -1290,6 +1291,16 @@ public:
 
 private:
     void Serve() {
+        // This thread's own writes can meet a client that has already rejected
+        // the certificate and gone. Blocking the signal here, rather than for
+        // the whole process, keeps the main thread's disposition at the default
+        // — which is what makes the client-side protection in openssl_stream
+        // something this suite actually exercises rather than hides.
+        sigset_t block;
+        sigemptyset(&block);
+        sigaddset(&block, SIGPIPE);
+        pthread_sigmask(SIG_BLOCK, &block, nullptr);
+
         const auto accepted = accept(listener, nullptr, nullptr);
         if (accepted < 0) {
             return;
@@ -2954,6 +2965,63 @@ static std::vector<uint8_t> AcceptPacketBytes(bool check_oob) {
     return EncodeTnsPacket(TnsPacketType::ACCEPT, 0, payload, false);
 }
 
+// Writing to a peer that has closed returns EPIPE and raises SIGPIPE, whose
+// default action terminates the process. That is not a test concern: an Oracle
+// server closing mid-write would take down the whole DuckDB process instead of
+// failing one statement, and it does so only on Linux, because macOS suppresses
+// the signal for sockets. openssl_stream blocks it around every write and
+// consumes the one it raised, so this has to surface as an ordinary
+// ProtocolError — and this process has to still be here to report it.
+static void TestWriteToClosedPeerDoesNotKillTheProcess() {
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(listener >= 0);
+    int reuse = 1;
+    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    sockaddr_in address {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    CHECK(bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0);
+    CHECK(listen(listener, 1) == 0);
+    socklen_t address_size = sizeof(address);
+    CHECK(getsockname(listener, reinterpret_cast<sockaddr *>(&address), &address_size) == 0);
+    const auto port = ntohs(address.sin_port);
+
+    // Accepts once and drops the connection immediately, which is what an
+    // Oracle listener does to a connection it will not serve.
+    std::thread closer([listener] {
+        const auto accepted = accept(listener, nullptr, nullptr);
+        if (accepted >= 0) {
+            close(accepted);
+        }
+    });
+
+    auto stream = OpenSslByteStream::Connect("127.0.0.1", port, 5, 5, false);
+    CHECK(stream != nullptr);
+    closer.join();
+    close(listener);
+
+    // The first write usually lands in the kernel buffer; the peer's RST is
+    // seen by the next one. Both are attempted, and either an error or a clean
+    // return is acceptable — what is not acceptable is dying.
+    const std::vector<uint8_t> payload(64, 0x5a);
+    bool reported = false;
+    for (int attempt = 0; attempt < 8 && !reported; attempt++) {
+        try {
+            stream->Write(payload.data(), payload.size());
+        } catch (const ProtocolError &error) {
+            reported = error.Kind() == ProtocolErrorKind::INVALID_STATE ||
+                       error.Kind() == ProtocolErrorKind::TRUNCATED;
+        }
+    }
+    // There is deliberately no CHECK on `reported`: whether the peer's RST has
+    // arrived by any given attempt is timing, and asserting on it would make
+    // this flaky. Reaching this line is the assertion — an unprotected write
+    // would have killed the process several lines ago, with no output.
+    (void)reported;
+    stream->Close();
+}
+
 static void TestConnectRunsThroughTheTransportSeam() {
     const std::string redirect_descriptor =
         "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=10.0.0.9)(PORT=1522))(CONNECT_DATA=(SERVICE_NAME=moved)))";
@@ -3318,15 +3386,6 @@ static void TestAuthCrypto() {
 }
 
 int main() {
-    // A failed TLS handshake against the local test server leaves the peer
-    // closed, and the next write returns EPIPE — which on Linux raises SIGPIPE
-    // and kills the process by default, while macOS sockets suppress it. That
-    // made this suite die with no output on one Linux runner and pass on
-    // another. A test binary owns its process, so ignoring the signal here is
-    // proper; the library's own exposure is a separate question.
-#ifndef _WIN32
-    std::signal(SIGPIPE, SIG_IGN);
-#endif
 
     TestUniversalIntegers();
     TestWalletArchive();
@@ -3391,6 +3450,7 @@ int main() {
     TestPartialLobResponseReadsAsTruncated();
     TestLobRequestLayout();
     TestUtf16BeConversion();
+    TestWriteToClosedPeerDoesNotKillTheProcess();
     TestConnectRunsThroughTheTransportSeam();
     TestTransportWithoutOutOfBandRefusesTheOobProbe();
     TestRepeatedRowsCarryNoValues();
