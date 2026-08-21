@@ -5,24 +5,6 @@ docs:
     Instant Client, no OCI, no ODPI-C, no ODBC, no JDBC, no Python runtime and
     no helper process. Installing it is copying one file.
 
-    Reads a query with `oracle_query`, or mounts a whole schema with `ATTACH`
-    and queries it as ordinary DuckDB tables — including `INSERT`, `UPDATE` and
-    `DELETE` inside a DuckDB transaction, which commits and rolls back in Oracle
-    with it. Also calls procedures and functions, reads `SYS_REFCURSOR` results,
-    and can split one large table across several sessions at a single system
-    change number.
-
-    Types read exactly rather than approximately: `NUMBER` keeps its precision,
-    an Oracle `DATE` keeps its time, `TIMESTAMP(9)` keeps its nanoseconds, and
-    `CLOB`/`NCLOB`/`BLOB` are read through LOB operations. A column whose type
-    this version cannot decode is refused while the query is bound, with the
-    reason named, rather than being turned into something that looks right and
-    is not.
-
-    Connects over TCP or TCPS. Certificate and hostname verification are always
-    on and have no off switch, and a cloud wallet ZIP is read in memory and
-    never written to disk.
-
     Verified against live Oracle 19c, Oracle Free 23ai and OCI Autonomous
     Database. The precise support boundary — every type, every refusal and its
     reason, and what is not supported — is in
@@ -49,11 +31,6 @@ extension:
   license: Apache-2.0
   maintainers:
     - krokozyab
-  # A WebAssembly build cannot open a raw TCP socket, so it cannot speak TNS at
-  # all and refuses at connect. An artifact that always refuses is worse than no
-  # artifact. mingw is excluded for a different reason: windows_amd64, the MSVC
-  # target, is the Windows build that matters and it passes. This line must match
-  # `exclude_archs` in this project's own workflow.
   excluded_platforms: wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw
 
 repo:
