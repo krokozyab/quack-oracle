@@ -62,11 +62,9 @@ this repository and the exact commit to build.
 that what was submitted stays under version control. It is submission-ready as
 it stands — copy it verbatim to `extensions/oracle_scanner/description.yml` in a
 fork of their repository, with no editing. Nothing in this repository reads it. Its
-field names were checked against a published descriptor; the one field it
-deliberately omits is `requires_toolchains`, because this project needs no
-toolchain beyond a C++ compiler and the OpenSSL that vcpkg resolves from
-`vcpkg.json` — which the distribution pipeline confirms by building without
-one.
+field names were checked against a published descriptor. `requires_toolchains:
+vcpkg` is required, not optional: OpenSSL comes from vcpkg through `vcpkg.json`,
+and without the toolchain their build has nothing to resolve it with.
 
 Before submitting, three things have to be true:
 
@@ -87,7 +85,7 @@ changes. What this project has to supply it with:
 | --- | --- |
 | extension name | `oracle_scanner` |
 | license | Apache-2.0, see [LICENSE](../LICENSE) |
-| repository and ref | this repository at the release tag |
+| repository and ref | the full commit SHA of the release, which is also tagged `v<version>` |
 | a one-line description | reads Oracle over TNS/TTC with no Oracle client |
 | platforms to skip | `excluded_platforms: wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw` |
 | a smoke test that runs in their CI | see below |
