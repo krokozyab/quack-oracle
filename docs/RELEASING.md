@@ -65,7 +65,24 @@ changes. What this project has to supply it with:
 | license | Apache-2.0, see [LICENSE](../LICENSE) |
 | repository and ref | this repository at the release tag |
 | a one-line description | reads Oracle over TNS/TTC with no Oracle client |
+| platforms to skip | `excluded_platforms: wasm_mvp;wasm_eh;wasm_threads` |
 | a smoke test that runs in their CI | see below |
+
+### Why the descriptor excludes WebAssembly
+
+`excluded_platforms` has to be set, and it has to match `exclude_archs` in this
+repository's own workflow, or their build attempts a target ours does not.
+
+The reason is not a build problem to be fixed later. TNS runs over a raw TCP
+stream, and no browser WebAssembly runtime has one — so the extension refuses
+at connect, by name, and an artifact that always refuses is worse than no
+artifact. `docs/CAPABILITIES.md` states this as the support boundary, which is
+what a reviewer should be pointed at if they ask.
+
+This is ordinary rather than exceptional: of the extensions published in that
+registry, roughly three in five set `excluded_platforms`, and `httpserver` and
+`shellfs` — which likewise need a socket or a process — exclude exactly these
+three targets.
 
 Their CI has no Oracle, so the smoke test cannot connect to one. It has to
 prove the extension loads and registers its surface:
