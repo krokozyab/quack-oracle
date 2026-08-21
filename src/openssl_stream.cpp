@@ -1,3 +1,11 @@
+// Before any include. Windows defines min and max as function-like macros, and
+// OpenSSL's own headers pull in <windows.h> on that platform — so defining this
+// down beside <winsock2.h> happens after the damage is already done, which is
+// exactly how the first attempt at this failed.
+#if defined(_WIN32) && !defined(NOMINMAX)
+#define NOMINMAX
+#endif
+
 #include "oracle_scanner/byte_stream.hpp"
 #include "oracle_scanner/protocol_error.hpp"
 
@@ -14,12 +22,6 @@
 #include <utility>
 
 #if defined(_WIN32)
-// Windows headers define min and max as macros, which then eat
-// `std::numeric_limits<int>::max()` and every other qualified call by those
-// names. NOMINMAX has to be set before the headers arrive, not after.
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #else
@@ -494,7 +496,7 @@ size_t OpenSslByteStream::Read(uint8_t *destination, size_t maximum_size) {
     if (!implementation || implementation->closed || !destination || maximum_size == 0) {
         return 0;
     }
-    const auto requested = static_cast<int>(std::min(maximum_size, static_cast<size_t>(std::numeric_limits<int>::max())));
+    const auto requested = static_cast<int>(std::min(maximum_size, static_cast<size_t>((std::numeric_limits<int>::max)())));
     while (true) {
         const auto count = BIO_read(implementation->bio, destination, requested);
         if (count > 0) {
@@ -515,7 +517,7 @@ size_t OpenSslByteStream::Write(const uint8_t *source, size_t size) {
         return 0;
     }
     const ScopedSigPipeBlock no_sigpipe;
-    const auto requested = static_cast<int>(std::min(size, static_cast<size_t>(std::numeric_limits<int>::max())));
+    const auto requested = static_cast<int>(std::min(size, static_cast<size_t>((std::numeric_limits<int>::max)())));
     while (true) {
         const auto count = BIO_write(implementation->bio, source, requested);
         if (count > 0) {

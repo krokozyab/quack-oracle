@@ -1,3 +1,9 @@
+// Before any include: OpenSSL's headers pull in <windows.h>, which defines min
+// and max as macros. See openssl_stream.cpp.
+#if defined(_WIN32) && !defined(NOMINMAX)
+#define NOMINMAX
+#endif
+
 #include "oracle_scanner/auth_crypto.hpp"
 #include "oracle_scanner/protocol_error.hpp"
 
@@ -28,7 +34,7 @@ static const EVP_CIPHER *CipherForKey(size_t key_size) {
 }
 
 std::vector<uint8_t> SecureRandomBytes(size_t size) {
-    if (size == 0 || size > 1024 || size > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    if (size == 0 || size > 1024 || size > static_cast<size_t>((std::numeric_limits<int>::max)())) {
         throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "requested random material exceeds supported bounds");
     }
     std::vector<uint8_t> result(size);
@@ -54,9 +60,9 @@ std::string Base64Encode(const std::vector<uint8_t> &value) {
 std::vector<uint8_t> Pbkdf2Sha512(const std::vector<uint8_t> &password, const std::vector<uint8_t> &salt,
                                   uint32_t iterations, size_t output_size) {
     if (iterations == 0 || iterations > 10000000 || output_size == 0 || output_size > 1024 ||
-        password.size() > static_cast<size_t>(std::numeric_limits<int>::max()) ||
-        salt.size() > static_cast<size_t>(std::numeric_limits<int>::max()) ||
-        output_size > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        password.size() > static_cast<size_t>((std::numeric_limits<int>::max)()) ||
+        salt.size() > static_cast<size_t>((std::numeric_limits<int>::max)()) ||
+        output_size > static_cast<size_t>((std::numeric_limits<int>::max)())) {
         throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "PBKDF2 parameters exceed supported bounds");
     }
     std::vector<uint8_t> output(output_size);
@@ -109,7 +115,7 @@ static std::vector<uint8_t> AesCbc(const std::vector<uint8_t> &key, const std::v
     if (!padding && (input.empty() || input.size() % 16 != 0)) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "raw AES-CBC input must be a non-empty block sequence");
     }
-    if (input.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    if (input.size() > static_cast<size_t>((std::numeric_limits<int>::max)())) {
         throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "AES-CBC input exceeds supported bounds");
     }
     std::vector<uint8_t> output(input.size() + 16);
