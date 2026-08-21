@@ -59,8 +59,9 @@ this repository and the exact commit to build.
 
 **The descriptor is written and kept here**, at
 [community-extension-description.yml](community-extension-description.yml), so
-that what was submitted stays under version control. Copy it to
-`extensions/oracle_scanner/description.yml` in a fork of their repository. Its
+that what was submitted stays under version control. It is submission-ready as
+it stands — copy it verbatim to `extensions/oracle_scanner/description.yml` in a
+fork of their repository, with no editing. Nothing in this repository reads it. Its
 field names were checked against a published descriptor; the one field it
 deliberately omits is `requires_toolchains`, because this project needs no
 toolchain beyond a C++ compiler and the OpenSSL that vcpkg resolves from

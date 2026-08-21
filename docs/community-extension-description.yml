@@ -1,13 +1,3 @@
-# The Community Extensions submission, kept here so that what was submitted is
-# under version control. It is NOT read by any build in this repository.
-#
-# To submit: fork https://github.com/duckdb/community-extensions, copy this file
-# to extensions/oracle_scanner/description.yml there, and open a pull request.
-# Check the field names against their current template first — the schema is
-# theirs and it changes. See docs/RELEASING.md.
-#
-# `ref` must name a tag that has a green full distribution matrix behind it.
-
 docs:
   extended_description: |
     Reads and writes Oracle Database over Oracle's own TNS/TTC network protocol,
