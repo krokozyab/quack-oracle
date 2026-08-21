@@ -119,7 +119,7 @@ int64_t IntegralKey(const std::string &text, const std::string &column_name, con
 }
 
 unique_ptr<FunctionData> OracleParallelBind(ClientContext &context, TableFunctionBindInput &input,
-                                            vector<LogicalType> &return_types, vector<string> &names) {
+                                            vector<LogicalType> &return_types, vector<Identifier> &names) {
     if (input.inputs[0].IsNull() || input.inputs[1].IsNull() || input.inputs[2].IsNull()) {
         throw BinderException("oracle_scan_parallel secret, table, and key column cannot be NULL");
     }
@@ -151,7 +151,7 @@ unique_ptr<FunctionData> OracleParallelBind(ClientContext &context, TableFunctio
 
     idx_t shards = 0;
     for (const auto &parameter : input.named_parameters) {
-        if (StringUtil::CIEquals(parameter.first, "shards")) {
+        if (StringUtil::CIEquals(static_cast<const std::string &>(parameter.first), "shards")) {
             const auto requested = BigIntValue::Get(parameter.second);
             if (requested < 1 || static_cast<idx_t>(requested) > MAX_SHARDS) {
                 throw BinderException("oracle_scan_parallel shards must be between 1 and %llu",
@@ -272,7 +272,7 @@ unique_ptr<FunctionData> OracleParallelBind(ClientContext &context, TableFunctio
 
     std::unordered_set<std::string> used_names;
     for (idx_t index = 0; index < result->columns.size(); index++) {
-        names.push_back(OutputName(result->columns[index], index, used_names));
+        names.push_back(Identifier(OutputName(result->columns[index], index, used_names)));
         result->types.push_back(TypeFor(result->columns[index]));
     }
     for (const auto &type : result->types) {

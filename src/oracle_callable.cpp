@@ -193,7 +193,7 @@ OracleCallableBind EncodeOracleCallableArgument(const std::string &type_name,
         const auto text = require_value("TIMESTAMP");
         try {
             const auto timestamp = Timestamp::FromString(text, false);
-            if (!Timestamp::IsFinite(timestamp)) {
+            if (!timestamp.IsFinite()) {
                 throw BinderException("infinite TIMESTAMP");
             }
             date_t date;
