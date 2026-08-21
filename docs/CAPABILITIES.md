@@ -52,11 +52,17 @@ outside it:
 
 Both are decisions to take deliberately. Neither is blocked on the code.
 
-One thing is genuinely unverified rather than refused: whether the `wasm_mvp` /
-`wasm_eh` / `wasm_threads` targets **compile** here at all. The distribution
-pipeline does not exclude them and no such build has been run against this tree,
-so the honest statement is that the connect-time refusal is what a wasm build
-would hit *if* it links.
+This has now been measured rather than assumed. Our own sources **do** compile
+for `wasm32-emscripten`, and so does OpenSSL through vcpkg. What fails is the
+link of the threaded target:
+
+> `wasm-ld: error: --shared-memory is disallowed by libssl-lib-ssl_lib.o because
+> it was not compiled with 'atomics' or 'bulk-memory' features`
+
+That is a mismatch in how the dependency was built, not a limit of this code.
+The wasm targets are excluded from the distribution matrix regardless, because a
+build that links would still refuse at connect for the reason above, and an
+artifact that always refuses is worse than no artifact.
 
 ### Secrets
 

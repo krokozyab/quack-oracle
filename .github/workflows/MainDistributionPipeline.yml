@@ -11,14 +11,40 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
   cancel-in-progress: true
 
+# What runs when, and why.
+#
+# Every push and pull request gets the cheap Linux lanes: the protocol suite,
+# the adapter suite with the clean-machine gate, and tidy. Those are what
+# actually find things — of the defects this pipeline has caught, all but one
+# came from a Linux lane, and none from macOS.
+#
+# The full distribution matrix runs only on a tag or by hand, because it is
+# expensive and rarely informative between releases. On a private repository
+# Actions minutes bill with multipliers — macOS at 10x, Windows at 2x — so one
+# full matrix run costs roughly 900 billed minutes against a 2,000-minute
+# monthly allowance, and macOS alone is two thirds of that. Restricting it to
+# releases takes a push from ~900 minutes to ~45.
+#
+# Make this repository public and the whole calculation goes away: Actions are
+# free and unmetered there, with no multipliers. Until then, this split is what
+# keeps the allowance from being spent on comment edits.
 jobs:
   duckdb-stable-build:
     name: Build extension binaries
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
     with:
       duckdb_version: v1.5.4
       ci_tools_version: v1.5-variegata
       extension_name: oracle_scanner
+      # A WebAssembly build cannot open a TCP socket, so it cannot connect to
+      # Oracle at all — docs/CAPABILITIES.md says so, and the extension refuses
+      # by name at connect. Shipping an artifact that always refuses is worse
+      # than not shipping one. It is also the only target that does not build:
+      # wasm_threads fails to link because the vcpkg OpenSSL for
+      # wasm32-emscripten is not compiled with the atomics/bulk-memory features
+      # that --shared-memory needs. Our own sources compile for wasm fine.
+      exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads'
 
   code-quality-check:
     name: Code Quality Check
@@ -43,11 +69,27 @@ jobs:
   # makes running it on every push affordable.
   protocol-tests:
     name: Protocol tests
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install OpenSSL
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Build and run
+        run: scripts/build_protocol_test.sh
+
+  # macOS costs ten billed minutes for every one it runs, and it has never been
+  # the lane that found a defect here — the platform-specific bugs this suite
+  # caught were all Linux-only, and macOS hid several of them (SIGPIPE, a
+  # hardcoded /private/tmp, an unspecified evaluation order). It is worth
+  # running before a release and not on every commit.
+  protocol-tests-macos:
+    name: Protocol tests (macOS)
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -55,12 +97,8 @@ jobs:
 
       - name: Install OpenSSL
         run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
-          else
-            brew install openssl@3 pkg-config
-            echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig" >> "$GITHUB_ENV"
-          fi
+          brew install openssl@3 pkg-config
+          echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig" >> "$GITHUB_ENV"
 
       - name: Build and run
         run: scripts/build_protocol_test.sh
