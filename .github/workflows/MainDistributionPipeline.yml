@@ -12,8 +12,13 @@ on:
         type: boolean
         default: false
 
+# Superseding a push is the point: a newer commit makes the older run's answer
+# uninteresting. A manual run is different — it is the release matrix, it takes
+# most of an hour, and it is started deliberately. Giving each dispatch its own
+# group by run id means an unrelated docs push cannot kill it, which is exactly
+# what happened twice before this line existed.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || '' }}
   cancel-in-progress: true
 
 # What runs when, and why.
