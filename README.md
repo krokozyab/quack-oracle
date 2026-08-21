@@ -123,7 +123,7 @@ CREATE SECRET ora_cloud (
     USER 'ADMIN',
     PASSWORD '...',
     PROTOCOL 'tcps',
-    TLS_SERVER_NAME 'adb.eu-frankfurt-1.oraclecloud.com',
+    TLS_SERVER_NAME 'adb.<your-region>.oraclecloud.com',
     WALLET_FILE '/secure/Wallet_mydb.zip',
     WALLET_PASSWORD '...'
 );

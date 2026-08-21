@@ -6,6 +6,11 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      run_live:
+        description: 'Also run the live Oracle stages (needs the ORA19C_* secrets)'
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
@@ -141,7 +146,11 @@ jobs:
   # types is a lane nobody else can reproduce.
   live-oracle:
     name: Live Oracle stages
-    if: github.event_name == 'workflow_dispatch'
+    # Opt-in even on a manual run. The endpoints live nowhere but a maintainer's
+    # own machine, so without the secrets this lane cannot pass, and having it
+    # fail on every manual run of the release matrix would train people to
+    # ignore a red mark.
+    if: github.event_name == 'workflow_dispatch' && inputs.run_live
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
