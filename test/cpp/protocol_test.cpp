@@ -932,7 +932,7 @@ static void TestTtcCallResponse() {
     response.WriteByte(9).WriteUB4(0).WriteUB2(0);
     const auto decoded = DecodeTtcCallResponse(response.Data(), binds);
     CHECK(decoded.completed && decoded.bytes_consumed == response.Data().size() && decoded.out_binds && decoded.completion);
-    CHECK(decoded.out_binds->scalar_values[0] == std::optional<std::vector<uint8_t>>({static_cast<uint8_t>('x')}));
+    CHECK(decoded.out_binds->scalar_values[0] == std::optional<std::vector<uint8_t>>(std::vector<uint8_t> {static_cast<uint8_t>('x')}));
     CHECK(decoded.completion->cursor_id == 77 && decoded.completion->row_count == 1);
 }
 
@@ -2044,7 +2044,7 @@ static void TestTtcExecuteStatementChannel() {
     bound_request.binds = {{"value", 1, BindDirection::BIND_OUT, std::nullopt, 32}};
     bound_statements.ExecuteBinds(bound_handle, bound_request);
     const auto output = bound_statements.ReceivePlsqlOutBindsResponse(bound_handle, bound_request.binds);
-    CHECK(output.values.scalar_values[0] == std::optional<std::vector<uint8_t>>({static_cast<uint8_t>('x')}));
+    CHECK(output.values.scalar_values[0] == std::optional<std::vector<uint8_t>>(std::vector<uint8_t> {static_cast<uint8_t>('x')}));
     bound_statements.CompleteExecute(bound_handle, false, 0);
     CHECK(bound_registry.State(bound_handle) == OracleStatementState::EXHAUSTED && !bound_stream.output.empty());
 

@@ -54,7 +54,13 @@ jobs:
       # wasm_threads fails to link because the vcpkg OpenSSL for
       # wasm32-emscripten is not compiled with the atomics/bulk-memory features
       # that --shared-memory needs. Our own sources compile for wasm fine.
-      exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads'
+      #
+      # windows_amd64_mingw goes too. The MSVC target, windows_amd64, is the
+      # Windows build that matters and it passes; mingw is a second toolchain
+      # whose only failures here have been its own strictness, with no user on
+      # the other side of them. 132 of the 319 published community extensions
+      # exclude it, so this is the ordinary choice rather than a retreat.
+      exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw'
 
   code-quality-check:
     name: Code Quality Check

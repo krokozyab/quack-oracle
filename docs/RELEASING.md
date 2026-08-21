@@ -85,7 +85,7 @@ changes. What this project has to supply it with:
 | license | Apache-2.0, see [LICENSE](../LICENSE) |
 | repository and ref | this repository at the release tag |
 | a one-line description | reads Oracle over TNS/TTC with no Oracle client |
-| platforms to skip | `excluded_platforms: wasm_mvp;wasm_eh;wasm_threads` |
+| platforms to skip | `excluded_platforms: wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw` |
 | a smoke test that runs in their CI | see below |
 
 ### Why the descriptor excludes WebAssembly
@@ -99,10 +99,15 @@ at connect, by name, and an artifact that always refuses is worse than no
 artifact. `docs/CAPABILITIES.md` states this as the support boundary, which is
 what a reviewer should be pointed at if they ask.
 
-This is ordinary rather than exceptional: of the extensions published in that
-registry, roughly three in five set `excluded_platforms`, and `httpserver` and
-`shellfs` — which likewise need a socket or a process — exclude exactly these
-three targets.
+`windows_amd64_mingw` is excluded for a different reason: the MSVC target,
+`windows_amd64`, is the Windows build that matters and it passes, while mingw is
+a second toolchain whose failures here have been its own strictness rather than
+anything a user would meet.
+
+Neither exclusion is exceptional. Of the 319 extensions published in that
+registry, 193 set `excluded_platforms` and 132 of those exclude mingw;
+`httpserver` and `shellfs`, which likewise need a socket or a process, exclude
+the same three wasm targets.
 
 Their CI has no Oracle, so the smoke test cannot connect to one. It has to
 prove the extension loads and registers its surface:

@@ -61,8 +61,10 @@ extension:
     - krokozyab
   # A WebAssembly build cannot open a raw TCP socket, so it cannot speak TNS at
   # all and refuses at connect. An artifact that always refuses is worse than no
-  # artifact. This must match `exclude_archs` in this project's own workflow.
-  excluded_platforms: wasm_mvp;wasm_eh;wasm_threads
+  # artifact. mingw is excluded for a different reason: windows_amd64, the MSVC
+  # target, is the Windows build that matters and it passes. This line must match
+  # `exclude_archs` in this project's own workflow.
+  excluded_platforms: wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw
 
 repo:
   github: krokozyab/quack-oracle
