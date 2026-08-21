@@ -3,10 +3,12 @@
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
+#if !defined(_WIN32)
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
 
 #include <functional>
 #include <thread>
@@ -66,7 +68,9 @@
 #include <condition_variable>
 #include <cstdio>
 #include <csignal>
+#if !defined(_WIN32)
 #include <pthread.h>
+#endif
 #include <cstdlib>
 #include <cstdint>
 #include <exception>
@@ -1239,6 +1243,11 @@ static Identity MakeIdentity(const std::string &common_name, long not_before_sec
 
 // Accepts exactly one connection, completes the handshake, and closes. The
 // client under test only needs the handshake's verdict.
+// The local TLS server and the closed-peer write test are built on POSIX
+// sockets and signals. Porting them to Winsock would be a second
+// implementation of the thing under test, so they are simply not built on
+// Windows — everything else in this suite is portable and still runs there.
+#if !defined(_WIN32)
 class Server {
 public:
     explicit Server(const Identity &identity) {
@@ -1392,6 +1401,7 @@ static void TestLocalTlsCertificateVerification() {
         ExpectProtocolError([&] { (void)OpenSslByteStream::Connect("127.0.0.1", server.Port(), 5, 5, true, tls); });
     }
 }
+#endif // !_WIN32
 
 static void TestDescriptorSecuritySection() {
     const std::string with_dn =
@@ -2965,6 +2975,7 @@ static std::vector<uint8_t> AcceptPacketBytes(bool check_oob) {
     return EncodeTnsPacket(TnsPacketType::ACCEPT, 0, payload, false);
 }
 
+#if !defined(_WIN32)
 // Writing to a peer that has closed returns EPIPE and raises SIGPIPE, whose
 // default action terminates the process. That is not a test concern: an Oracle
 // server closing mid-write would take down the whole DuckDB process instead of
@@ -3021,6 +3032,7 @@ static void TestWriteToClosedPeerDoesNotKillTheProcess() {
     (void)reported;
     stream->Close();
 }
+#endif // !_WIN32
 
 static void TestConnectRunsThroughTheTransportSeam() {
     const std::string redirect_descriptor =
@@ -3415,7 +3427,9 @@ int main() {
     TestTtcExecuteNoBindsCodec();
     TestTtcExecuteNoBindsShape();
     TestTtcExecuteRefCursorBindShape();
+#if !defined(_WIN32)
     TestLocalTlsCertificateVerification();
+#endif
     TestDescriptorSecuritySection();
     TestServerDnComparison();
     TestTtcExecuteArrayDml();
@@ -3450,7 +3464,9 @@ int main() {
     TestPartialLobResponseReadsAsTruncated();
     TestLobRequestLayout();
     TestUtf16BeConversion();
+#if !defined(_WIN32)
     TestWriteToClosedPeerDoesNotKillTheProcess();
+#endif
     TestConnectRunsThroughTheTransportSeam();
     TestTransportWithoutOutOfBandRefusesTheOobProbe();
     TestRepeatedRowsCarryNoValues();
