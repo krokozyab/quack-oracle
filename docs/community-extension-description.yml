@@ -1,27 +1,3 @@
-docs:
-  extended_description: |
-    Reads and writes Oracle Database over Oracle's own TNS/TTC network protocol,
-    implemented directly in C++. It links and loads no Oracle software: no
-    Instant Client, no OCI, no ODPI-C, no ODBC, no JDBC, no Python runtime and
-    no helper process. Installing it is copying one file.
-
-    Verified against live Oracle 19c, Oracle Free 23ai and OCI Autonomous
-    Database. The precise support boundary — every type, every refusal and its
-    reason, and what is not supported — is in
-    https://github.com/krokozyab/quack-oracle/blob/main/docs/CAPABILITIES.md
-  hello_world: |
-    -- One secret per database, then query it by name.
-    CREATE SECRET ora (
-        TYPE oracle, HOST 'db.example.com', PORT 1521,
-        SERVICE_NAME 'ORCLPDB1', USER 'scott', PASSWORD '...'
-    );
-
-    SELECT * FROM oracle_query('ora', 'SELECT id, label FROM app.items');
-
-    -- Or mount the schema and use plain DuckDB SQL against it.
-    ATTACH 'ora' AS o (TYPE oracle_scanner);
-    SELECT count(*) FROM o.ITEMS WHERE id > 100;
-
 extension:
   name: oracle_scanner
   description: Read and write Oracle Database with no Oracle client
@@ -32,11 +8,8 @@ extension:
   maintainers:
     - krokozyab
   excluded_platforms: wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw
+  requires_toolchains: vcpkg
 
 repo:
   github: krokozyab/quack-oracle
-  # The full SHA rather than a tag: a SHA cannot be moved, so what is built is
-  # exactly what was reviewed. Set this to the commit whose full distribution
-  # matrix is green; v0.1.0 tags the same commit, for people rather than for
-  # the build.
-  ref: 6f454dbe00c28fddd0132f49439eba261852e08c
+  ref: v0.1.0
