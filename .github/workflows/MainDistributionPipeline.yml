@@ -42,10 +42,12 @@ jobs:
   duckdb-stable-build:
     name: Build extension binaries
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
-      duckdb_version: v1.5.5
-      ci_tools_version: v1.5-variegata
+      # duckdb-2.0 branch: built against DuckDB main, the way Community's
+      # build_next.yml does, until 2.0 has a tag and a ci-tools track.
+      duckdb_version: main
+      ci_tools_version: main
       extension_name: oracle_scanner
       # A WebAssembly build cannot open a TCP socket, so it cannot connect to
       # Oracle at all — docs/CAPABILITIES.md says so, and the extension refuses
@@ -64,10 +66,12 @@ jobs:
 
   code-quality-check:
     name: Code Quality Check
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@main
     with:
-      duckdb_version: v1.5.5
-      ci_tools_version: v1.5-variegata
+      # duckdb-2.0 branch: built against DuckDB main, the way Community's
+      # build_next.yml does, until 2.0 has a tag and a ci-tools track.
+      duckdb_version: main
+      ci_tools_version: main
       extension_name: oracle_scanner
       # `tidy` only, deliberately. The format check applies duckdb/.clang-format
       # across all of src/, and this tree has two styles on purpose: protocol and
