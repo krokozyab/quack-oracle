@@ -16,6 +16,8 @@
 #include "duckdb/common/exception/conversion_exception.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
 #include "duckdb/planner/filter/optional_filter.hpp"
@@ -424,13 +426,13 @@ void TestQueryTypeMappingAndValues() {
     CHECK(result->RowCount() == 2);
     CHECK(result->ColumnCount() == 6);
 
-    CHECK(result->types[0] == duckdb::LogicalType::BIGINT);
-    CHECK(result->types[1] == duckdb::LogicalType::VARCHAR);
-    CHECK(result->types[2] == duckdb::LogicalType::DECIMAL(10, 2));
-    CHECK(result->types[3] == duckdb::LogicalType::VARCHAR);
-    CHECK(result->types[4] == duckdb::LogicalType::BLOB);
-    CHECK(result->types[5] == duckdb::LogicalType::DOUBLE);
-    CHECK(result->names[0] == "id" && result->names[5] == "ratio");
+    CHECK(result->GetTypes()[0] == duckdb::LogicalType::BIGINT);
+    CHECK(result->GetTypes()[1] == duckdb::LogicalType::VARCHAR);
+    CHECK(result->GetTypes()[2] == duckdb::LogicalType::DECIMAL(10, 2));
+    CHECK(result->GetTypes()[3] == duckdb::LogicalType::VARCHAR);
+    CHECK(result->GetTypes()[4] == duckdb::LogicalType::BLOB);
+    CHECK(result->GetTypes()[5] == duckdb::LogicalType::DOUBLE);
+    CHECK(result->GetNames()[0] == "id" && result->GetNames()[5] == "ratio");
 
     CHECK(result->GetValue(0, 0).ToString() == "42");
     CHECK(result->GetValue(1, 0).ToString() == "first");
@@ -684,9 +686,9 @@ void TestLobColumnsMapToTextAndBlob() {
     TestDatabase database;
     auto result = database.Query("SELECT * FROM oracle_query('ora', 'SELECT doc, ndoc, bin FROM app.items')");
     CHECK(!result->HasError());
-    CHECK(result->types[0] == duckdb::LogicalType::VARCHAR);
-    CHECK(result->types[1] == duckdb::LogicalType::VARCHAR);
-    CHECK(result->types[2] == duckdb::LogicalType::BLOB);
+    CHECK(result->GetTypes()[0] == duckdb::LogicalType::VARCHAR);
+    CHECK(result->GetTypes()[1] == duckdb::LogicalType::VARCHAR);
+    CHECK(result->GetTypes()[2] == duckdb::LogicalType::BLOB);
     CHECK(result->GetValue(0, 0).ToString() == "hi");
     CHECK(result->GetValue(1, 0).ToString() == "\xd0\xbf");
 }
@@ -699,13 +701,24 @@ void TestFilterPushdownTranslatesOnlyTheProvenSubset() {
     std::vector<OracleColumn> columns = {Column("ID", 2), Column("LABEL", 1), Column("TAG", 96)};
     const std::vector<duckdb::column_t> scanned = {0, 1, 2};
 
-    const auto translate = [&](duckdb::idx_t column, duckdb::unique_ptr<duckdb::TableFilter> filter) {
+    // DuckDB 2.0 hands a scan ExpressionFilters only: LogicalGet converts every
+    // legacy filter with ExpressionFilter::FromTableFilter before the scan
+    // sees it. The fixtures below still build the legacy shapes, because they
+    // are the clearest way to say what is being tested, and go through that
+    // same conversion — so this exercises the translator on exactly the input
+    // the planner produces.
+    const auto as_pushed = [&](const std::vector<OracleColumn> &cols, duckdb::idx_t column,
+                               duckdb::unique_ptr<duckdb::TableFilter> filter) {
         duckdb::TableFilterSet filters;
-        filters.filters[column] = std::move(filter);
-        return duckdb::OracleWhereClause(filters, columns, scanned);
+        filters.PushFilter(duckdb::ProjectionIndex(column),
+                           duckdb::ExpressionFilter::FromTableFilter(*filter, duckdb::MappedType(cols[column])));
+        return filters;
+    };
+    const auto translate = [&](duckdb::idx_t column, duckdb::unique_ptr<duckdb::TableFilter> filter) {
+        return duckdb::OracleWhereClause(as_pushed(columns, column, std::move(filter)), columns, scanned);
     };
     const auto constant = [](duckdb::ExpressionType comparison, duckdb::Value value) {
-        return duckdb::make_uniq<duckdb::ConstantFilter>(comparison, std::move(value));
+        return duckdb::make_uniq<duckdb::LegacyConstantFilter>(comparison, std::move(value));
     };
 
     // NUMBER is exact decimal on both sides, so every comparison round-trips.
@@ -720,8 +733,8 @@ void TestFilterPushdownTranslatesOnlyTheProvenSubset() {
            "\"LABEL\" = 'O''Hara'");
 
     // Null tests mean the same thing in both engines.
-    CHECK(translate(1, duckdb::make_uniq<duckdb::IsNullFilter>()) == "\"LABEL\" IS NULL");
-    CHECK(translate(1, duckdb::make_uniq<duckdb::IsNotNullFilter>()) == "\"LABEL\" IS NOT NULL");
+    CHECK(translate(1, duckdb::make_uniq<duckdb::LegacyIsNullFilter>()) == "\"LABEL\" IS NULL");
+    CHECK(translate(1, duckdb::make_uniq<duckdb::LegacyIsNotNullFilter>()) == "\"LABEL\" IS NOT NULL");
 
     const auto refused = [&](duckdb::idx_t column, duckdb::unique_ptr<duckdb::TableFilter> filter,
                              const std::string &reason) {
@@ -753,21 +766,19 @@ void TestFilterPushdownTranslatesOnlyTheProvenSubset() {
     {
         std::vector<OracleColumn> time_columns = {date_column, timestamp_column};
         const auto translate_time = [&](idx_t index, duckdb::unique_ptr<duckdb::TableFilter> filter) {
-            duckdb::TableFilterSet filters;
-            filters.filters[index] = std::move(filter);
-            return duckdb::OracleWhereClause(filters, time_columns, {0, 1});
+            return duckdb::OracleWhereClause(as_pushed(time_columns, index, std::move(filter)), time_columns, {0, 1});
         };
-        CHECK(translate_time(0, duckdb::make_uniq<duckdb::ConstantFilter>(
+        CHECK(translate_time(0, duckdb::make_uniq<duckdb::LegacyConstantFilter>(
                                      duckdb::ExpressionType::COMPARE_EQUAL,
                                      duckdb::Value::TIMESTAMP(duckdb::Timestamp::FromString("2024-03-05 06:07:08", false)))) ==
                "\"WHEN_DATE\" = TO_DATE('2024-03-05 06:07:08', 'YYYY-MM-DD HH24:MI:SS')");
         // Chronological order depends on nothing a session sets, unlike the
         // collation that keeps ordered text comparisons off this list.
-        CHECK(translate_time(0, duckdb::make_uniq<duckdb::ConstantFilter>(
+        CHECK(translate_time(0, duckdb::make_uniq<duckdb::LegacyConstantFilter>(
                                      duckdb::ExpressionType::COMPARE_GREATERTHAN,
                                      duckdb::Value::TIMESTAMP(duckdb::Timestamp::FromString("2024-01-01 00:00:00", false)))) ==
                "\"WHEN_DATE\" > TO_DATE('2024-01-01 00:00:00', 'YYYY-MM-DD HH24:MI:SS')");
-        CHECK(translate_time(1, duckdb::make_uniq<duckdb::ConstantFilter>(
+        CHECK(translate_time(1, duckdb::make_uniq<duckdb::LegacyConstantFilter>(
                                      duckdb::ExpressionType::COMPARE_EQUAL,
                                      duckdb::Value::TIMESTAMPNS(duckdb::timestamp_ns_t(1709618828123456789LL)))) ==
                "\"WHEN_TS\" = TO_TIMESTAMP('2024-03-05 06:07:08.123456789', 'YYYY-MM-DD HH24:MI:SS.FF9')");
@@ -775,7 +786,7 @@ void TestFilterPushdownTranslatesOnlyTheProvenSubset() {
         // equal a sub-second constant and no boundary sits where it says.
         bool sub_second_refused = false;
         try {
-            translate_time(0, duckdb::make_uniq<duckdb::ConstantFilter>(
+            translate_time(0, duckdb::make_uniq<duckdb::LegacyConstantFilter>(
                                   duckdb::ExpressionType::COMPARE_EQUAL,
                                   duckdb::Value::TIMESTAMP(duckdb::Timestamp::FromString("2024-03-05 06:07:08.5", false))));
         } catch (const duckdb::NotImplementedException &error) {
@@ -786,7 +797,7 @@ void TestFilterPushdownTranslatesOnlyTheProvenSubset() {
         // Oracle convert through NLS_DATE_FORMAT.
         bool text_refused = false;
         try {
-            translate_time(0, duckdb::make_uniq<duckdb::ConstantFilter>(duckdb::ExpressionType::COMPARE_EQUAL,
+            translate_time(0, duckdb::make_uniq<duckdb::LegacyConstantFilter>(duckdb::ExpressionType::COMPARE_EQUAL,
                                                                         duckdb::Value("2024-03-05")));
         } catch (const duckdb::NotImplementedException &error) {
             text_refused = std::string(error.what()).find("text comparison") != std::string::npos;
@@ -796,27 +807,27 @@ void TestFilterPushdownTranslatesOnlyTheProvenSubset() {
 
     // An IN list is a disjunction of equalities and carries the same proof.
     duckdb::vector<duckdb::Value> numbers = {duckdb::Value::BIGINT(1), duckdb::Value::BIGINT(3)};
-    CHECK(translate(0, duckdb::make_uniq<duckdb::InFilter>(std::move(numbers))) == "\"ID\" IN (1, 3)");
+    CHECK(translate(0, duckdb::make_uniq<duckdb::LegacyInFilter>(std::move(numbers))) == "\"ID\" IN (1, 3)");
     duckdb::vector<duckdb::Value> labels = {duckdb::Value("beta"), duckdb::Value("gamma")};
-    CHECK(translate(1, duckdb::make_uniq<duckdb::InFilter>(std::move(labels))) == "\"LABEL\" IN ('beta', 'gamma')");
+    CHECK(translate(1, duckdb::make_uniq<duckdb::LegacyInFilter>(std::move(labels))) == "\"LABEL\" IN ('beta', 'gamma')");
 
     // One unprovable value refuses the whole list rather than dropping it, which
     // would apply a weaker predicate than the query asked for.
     duckdb::vector<duckdb::Value> with_empty = {duckdb::Value("beta"), duckdb::Value("")};
-    refused(1, duckdb::make_uniq<duckdb::InFilter>(std::move(with_empty)), "empty string");
+    refused(1, duckdb::make_uniq<duckdb::LegacyInFilter>(std::move(with_empty)), "empty string");
 
     // An optional filter is a hint DuckDB does not need for correctness, so one
     // that cannot be translated is dropped instead of raising — while the same
     // filter arriving as required still raises.
     duckdb::vector<duckdb::Value> optional_values = {duckdb::Value("beta"), duckdb::Value("")};
-    auto optional = duckdb::make_uniq<duckdb::OptionalFilter>(
-        duckdb::make_uniq<duckdb::InFilter>(std::move(optional_values)));
+    auto optional = duckdb::make_uniq<duckdb::LegacyOptionalFilter>(
+        duckdb::make_uniq<duckdb::LegacyInFilter>(std::move(optional_values)));
     CHECK(translate(1, std::move(optional)).empty());
-    auto translatable = duckdb::make_uniq<duckdb::OptionalFilter>(duckdb::make_uniq<duckdb::IsNullFilter>());
+    auto translatable = duckdb::make_uniq<duckdb::LegacyOptionalFilter>(duckdb::make_uniq<duckdb::LegacyIsNullFilter>());
     CHECK(translate(1, std::move(translatable)) == "\"LABEL\" IS NULL");
 
     // A conjunction is only as pushable as its children.
-    auto conjunction = duckdb::make_uniq<duckdb::ConjunctionAndFilter>();
+    auto conjunction = duckdb::make_uniq<duckdb::LegacyConjunctionAndFilter>();
     conjunction->child_filters.push_back(constant(duckdb::ExpressionType::COMPARE_EQUAL, duckdb::Value::BIGINT(1)));
     conjunction->child_filters.push_back(
         constant(duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::Value::BIGINT(0)));
@@ -1316,7 +1327,7 @@ void TestAttachedCatalogAgainstAFakeSession() {
     // BIGINT, a VARCHAR2 stays text.
     auto scanned = database.Query("SELECT ID, LABEL FROM ora.main.ITEMS ORDER BY ID;");
     CHECK(!scanned->HasError() && scanned->RowCount() == 2);
-    CHECK(scanned->types[0] == duckdb::LogicalType::BIGINT && scanned->types[1] == duckdb::LogicalType::VARCHAR);
+    CHECK(scanned->GetTypes()[0] == duckdb::LogicalType::BIGINT && scanned->GetTypes()[1] == duckdb::LogicalType::VARCHAR);
     CHECK(scanned->GetValue(0, 0).ToString() == "1" && scanned->GetValue(1, 1).ToString() == "second");
 
     // NOT NULL and the primary key both come from the dictionary.
