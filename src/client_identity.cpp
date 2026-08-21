@@ -13,6 +13,11 @@
 #elif defined(__linux__)
 #include <unistd.h>
 #elif defined(_WIN32)
+// Same reason as openssl_stream.cpp: these headers define min and max as
+// macros unless told not to.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 

@@ -14,6 +14,12 @@
 #include <utility>
 
 #if defined(_WIN32)
+// Windows headers define min and max as macros, which then eat
+// `std::numeric_limits<int>::max()` and every other qualified call by those
+// names. NOMINMAX has to be set before the headers arrive, not after.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #else
