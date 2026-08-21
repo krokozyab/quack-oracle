@@ -20,7 +20,7 @@ OracleStatementHandle OracleStatementRegistry::Open(OracleSqlKind kind) {
     if (statements.size() == maximum_open_statements) {
         throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "too many open Oracle statements");
     }
-    if (next_statement_id == 0 || next_statement_id == std::numeric_limits<uint32_t>::max()) {
+    if (next_statement_id == 0 || next_statement_id == (std::numeric_limits<uint32_t>::max)()) {
         throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle statement ids are exhausted");
     }
     const OracleStatementHandle handle {next_statement_id++};

@@ -1,3 +1,11 @@
+// Before any include. Windows defines min and max as function-like macros,
+// and the headers this pulls in reach <windows.h> — so `(std::min)(...)` is
+// rewritten by the preprocessor and the file stops compiling, with the brace
+// counting going wrong several lines later as a consequence.
+#if defined(_WIN32) && !defined(NOMINMAX)
+#define NOMINMAX
+#endif
+
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
@@ -426,13 +434,13 @@ public:
         if (read_offset == input.size()) {
             return 0;
         }
-        auto count = std::min({fragment, maximum_size, input.size() - read_offset});
+        auto count = (std::min)({fragment, maximum_size, input.size() - read_offset});
         std::copy(input.begin() + read_offset, input.begin() + read_offset + count, destination);
         read_offset += count;
         return count;
     }
     size_t Write(const uint8_t *source, size_t size) override {
-        auto count = std::min(fragment, size);
+        auto count = (std::min)(fragment, size);
         output.insert(output.end(), source, source + count);
         return count;
     }
@@ -2938,7 +2946,7 @@ public:
         : input(std::move(input_p)), sink(sink_p) {
     }
     size_t Read(uint8_t *destination, size_t maximum_size) override {
-        const auto count = std::min(maximum_size, input.size() - read_offset);
+        const auto count = (std::min)(maximum_size, input.size() - read_offset);
         std::copy(input.begin() + static_cast<std::ptrdiff_t>(read_offset),
                   input.begin() + static_cast<std::ptrdiff_t>(read_offset + count), destination);
         read_offset += count;

@@ -1,14 +1,10 @@
-// DuckDB adapter tests that run against a fake OracleSession.
-//
-// These exercise src/oracle_query.cpp end to end — bind, validation, describe,
-// type mapping, value conversion and vector emission — with no database, no
-// network and no credentials. The seam is OpenOracleSession: installing a
-// factory replaces the session the adapter would otherwise open, so the
-// production code path under test is exactly the shipped one.
-//
-// Installing a factory also replaces the default ValidatedOracleSession
-// wrapper, which is deliberate: these tests are about adapter behavior, and the
-// wrapper has its own coverage in protocol_test.cpp.
+// Before any include. Windows defines min and max as function-like macros,
+// and the headers this pulls in reach <windows.h> — so `(std::min)(...)` is
+// rewritten by the preprocessor and the file stops compiling, with the brace
+// counting going wrong several lines later as a consequence.
+#if defined(_WIN32) && !defined(NOMINMAX)
+#define NOMINMAX
+#endif
 
 #include "oracle_scanner/protocol_error.hpp"
 #include "oracle_scanner/session.hpp"
@@ -188,7 +184,7 @@ static bool ProjectScriptedTable(const FakeScript &script, const std::string &sq
         if (item == "ROWIDTOCHAR(ROWID)") {
             // The scan reads the row identity as ordinary text, so the fake
             // answers with one: the row's position is enough to be unique.
-            selected.push_back(std::numeric_limits<size_t>::max());
+            selected.push_back((std::numeric_limits<size_t>::max)());
             result.columns.push_back(Column("rowid", 1));
         } else {
             const auto name = item.size() >= 2 && item.front() == '"' ? item.substr(1, item.size() - 2) : item;
@@ -212,7 +208,7 @@ static bool ProjectScriptedTable(const FakeScript &script, const std::string &sq
     for (size_t row = 0; row < table->second.rows.size(); row++) {
         WireRow projected;
         for (const auto index : selected) {
-            if (index == std::numeric_limits<size_t>::max()) {
+            if (index == (std::numeric_limits<size_t>::max)()) {
                 projected.push_back(Text("AAAROW" + std::to_string(row)));
             } else {
                 projected.push_back(table->second.rows[row][index]);

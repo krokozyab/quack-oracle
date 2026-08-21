@@ -48,4 +48,21 @@ trap 'rm -rf "${scratch}"' EXIT
     -o "${output}"
 
 echo "scripts/build_protocol_test.sh: built ${output} from ${#sources[@]} sources"
+
+# Second pass: the same sources with the macros <windows.h> defines that collide
+# with ordinary identifiers — min, max, IN, OUT. Those are pure preprocessor, so
+# a compiler here reproduces that Windows breakage exactly, in seconds. This
+# project spent four release-matrix runs discovering them one at a time. Only
+# syntax is checked; nothing is linked or run.
+if ! "${CXX:-c++}" -std=c++17 -fsyntax-only \
+    -include scripts/windows_macros_stub.h \
+    -Isrc/include -Iduckdb/third_party/miniz \
+    test/cpp/protocol_test.cpp "${sources[@]}" \
+    "${openssl_flags[@]}" 2>"${scratch}/windows_macros.log"; then
+    echo "scripts/build_protocol_test.sh: the sources do not survive the Windows min/max/IN/OUT macros:" >&2
+    head -20 "${scratch}/windows_macros.log" >&2
+    exit 1
+fi
+echo "scripts/build_protocol_test.sh: sources also compile with the Windows min/max/IN/OUT macros defined"
+
 exec "${output}"

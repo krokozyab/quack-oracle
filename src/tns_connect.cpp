@@ -27,7 +27,7 @@ void StoreUInt32(std::vector<uint8_t> &target, size_t offset, uint32_t value) {
 } // namespace
 
 std::vector<TnsPacket> BuildTnsConnectPackets(const std::string &descriptor, const TnsConnectOptions &options) {
-    if (descriptor.empty() || descriptor.size() > std::numeric_limits<uint16_t>::max() - TNS_PACKET_HEADER_SIZE - 2 ||
+    if (descriptor.empty() || descriptor.size() > (std::numeric_limits<uint16_t>::max)() - TNS_PACKET_HEADER_SIZE - 2 ||
         options.desired_version < options.minimum_version || options.requested_sdu < 512 ||
         options.requested_tdu < options.requested_sdu) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TNS CONNECT parameters are invalid");

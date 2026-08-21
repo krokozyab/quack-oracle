@@ -136,7 +136,7 @@ std::vector<uint32_t> IterationBufferSizes(const TtcExecuteBindsRequest &request
     }
     for (const auto &iteration : request.additional_iterations) {
         for (size_t index = 0; index < iteration.size(); index++) {
-            sizes[index] = std::max(sizes[index], BindBufferSize(iteration[index]));
+            sizes[index] = (std::max)(sizes[index], BindBufferSize(iteration[index]));
         }
     }
     return sizes;

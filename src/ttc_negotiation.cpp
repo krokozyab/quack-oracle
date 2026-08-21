@@ -77,7 +77,7 @@ TtcProtocolInfo ParseTtcProtocolResponse(const std::vector<uint8_t> &message) {
     result.compile_capabilities = ReadCapabilities(reader);
     if (result.compile_capabilities.size() > TTC_CAPABILITY_FIELD_VERSION_INDEX) {
         result.server_field_version = result.compile_capabilities[TTC_CAPABILITY_FIELD_VERSION_INDEX];
-        result.field_version = std::min(ORACLE_CLIENT_TTC_FIELD_VERSION, result.server_field_version);
+        result.field_version = (std::min)(ORACLE_CLIENT_TTC_FIELD_VERSION, result.server_field_version);
     }
     result.runtime_capabilities = ReadCapabilities(reader);
     // Newer servers can append a small, versioned trailer. Its contents are

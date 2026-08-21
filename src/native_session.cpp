@@ -114,7 +114,7 @@ public:
         OracleBatch result;
         result.columns = columns;
         const auto take_pending = [&] {
-            const auto count = std::min(requested_rows - result.rows.size(), pending.size());
+            const auto count = (std::min)(requested_rows - result.rows.size(), pending.size());
             result.rows.insert(result.rows.end(), std::make_move_iterator(pending.begin()),
                                std::make_move_iterator(pending.begin() + static_cast<std::ptrdiff_t>(count)));
             pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(count));
@@ -345,7 +345,7 @@ uint64_t NativeOracleSession::ExecuteBatch(const std::string &sql, const std::ve
     uint64_t affected_rows = 0;
     for (size_t start = 0; start < rows.size(); start += maximum_iterations_per_execute) {
         const auto call = channel->LockCall();
-        const auto end = std::min(rows.size(), start + maximum_iterations_per_execute);
+        const auto end = (std::min)(rows.size(), start + maximum_iterations_per_execute);
         auto ordered_first = OrderOracleStatementBinds(sql, rows[start], OracleBindUse::DML);
         const auto handle = statements.Open(OracleSqlKind::DML);
         TtcExecuteBindsRequest execute;
@@ -372,7 +372,7 @@ uint64_t NativeOracleSession::ExecuteBatch(const std::string &sql, const std::ve
         }
         channel->CompleteExecute(handle, false, completion.cursor_id);
         channel->Close(handle);
-        if (std::numeric_limits<uint64_t>::max() - affected_rows < completion.row_count) {
+        if ((std::numeric_limits<uint64_t>::max)() - affected_rows < completion.row_count) {
             throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "native Oracle DML batch row count overflows uint64");
         }
         affected_rows += completion.row_count;

@@ -15,7 +15,7 @@ constexpr size_t MAX_TTC_ERROR_TEXT_BYTES = 65535;
 
 std::string PrintableProjection(const std::vector<uint8_t> &message) {
     std::string output;
-    output.reserve(std::min(message.size(), MAX_ERROR_TEXT_BYTES));
+    output.reserve((std::min)(message.size(), MAX_ERROR_TEXT_BYTES));
     bool previous_space = true;
     for (size_t index = 1; index < message.size() && output.size() < MAX_ERROR_TEXT_BYTES; index++) {
         const auto character = message[index];

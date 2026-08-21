@@ -42,7 +42,7 @@ TnsPacket DecodeTnsPacket(const std::vector<uint8_t> &wire, bool large_length, s
 std::vector<uint8_t> EncodeTnsPacket(TnsPacketType type, uint8_t flags, const std::vector<uint8_t> &payload,
                                      bool large_length) {
     auto total_size = TNS_PACKET_HEADER_SIZE + payload.size();
-    if (total_size > MAX_TNS_PACKET_LENGTH || (!large_length && total_size > std::numeric_limits<uint16_t>::max())) {
+    if (total_size > MAX_TNS_PACKET_LENGTH || (!large_length && total_size > (std::numeric_limits<uint16_t>::max)())) {
         throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "TNS packet is too large to encode");
     }
     std::vector<uint8_t> result(total_size, 0);
@@ -72,7 +72,7 @@ std::vector<std::vector<uint8_t>> EncodeTnsDataPackets(const std::vector<uint8_t
     std::vector<std::vector<uint8_t>> result;
     size_t offset = 0;
     do {
-        auto count = std::min(maximum_chunk, ttc_payload.size() - offset);
+        auto count = (std::min)(maximum_chunk, ttc_payload.size() - offset);
         auto last = offset + count == ttc_payload.size();
         auto data_flags = last ? final_flags : uint16_t(0);
         std::vector<uint8_t> payload(2 + count);

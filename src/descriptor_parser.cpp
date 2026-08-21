@@ -203,7 +203,7 @@ uint16_t ParsePort(const std::string &value) {
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle descriptor port is not numeric");
         }
         result = result * 10 + static_cast<uint32_t>(character - '0');
-        if (result > std::numeric_limits<uint16_t>::max()) {
+        if (result > (std::numeric_limits<uint16_t>::max)()) {
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle descriptor port is outside range");
         }
     }

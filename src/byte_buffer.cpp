@@ -219,7 +219,7 @@ ByteWriter &ByteWriter::WriteLengthPrefixed(const std::optional<std::vector<uint
     size_t offset = 0;
     constexpr size_t chunk_size = 0x8000;
     while (offset < value->size()) {
-        auto count = std::min(chunk_size, value->size() - offset);
+        auto count = (std::min)(chunk_size, value->size() - offset);
         WriteUB4(static_cast<uint32_t>(count));
         WriteRaw(value->data() + offset, count);
         offset += count;

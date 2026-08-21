@@ -496,7 +496,7 @@ size_t OpenSslByteStream::Read(uint8_t *destination, size_t maximum_size) {
     if (!implementation || implementation->closed || !destination || maximum_size == 0) {
         return 0;
     }
-    const auto requested = static_cast<int>(std::min(maximum_size, static_cast<size_t>((std::numeric_limits<int>::max)())));
+    const auto requested = static_cast<int>((std::min)(maximum_size, static_cast<size_t>((std::numeric_limits<int>::max)())));
     while (true) {
         const auto count = BIO_read(implementation->bio, destination, requested);
         if (count > 0) {
@@ -517,7 +517,7 @@ size_t OpenSslByteStream::Write(const uint8_t *source, size_t size) {
         return 0;
     }
     const ScopedSigPipeBlock no_sigpipe;
-    const auto requested = static_cast<int>(std::min(size, static_cast<size_t>((std::numeric_limits<int>::max)())));
+    const auto requested = static_cast<int>((std::min)(size, static_cast<size_t>((std::numeric_limits<int>::max)())));
     while (true) {
         const auto count = BIO_write(implementation->bio, source, requested);
         if (count > 0) {
