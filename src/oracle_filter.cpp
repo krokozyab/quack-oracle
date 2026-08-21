@@ -91,7 +91,7 @@ std::string OracleLiteral(const Value &constant, const OracleColumn &column) {
             }
             nanoseconds = remainder;
             const auto micros = timestamp_t(whole);
-            if (!Timestamp::IsFinite(micros)) {
+            if (!micros.IsFinite()) {
                 Refuse("an infinite timestamp");
             }
             date_t date;
@@ -101,7 +101,7 @@ std::string OracleLiteral(const Value &constant, const OracleColumn &column) {
             Time::Convert(time, hour, minute, second, microseconds);
         } else {
             const auto value = TimestampValue::Get(constant);
-            if (!Timestamp::IsFinite(value)) {
+            if (!value.IsFinite()) {
                 Refuse("an infinite timestamp");
             }
             date_t date;

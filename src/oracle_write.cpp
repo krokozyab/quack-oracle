@@ -183,7 +183,7 @@ oracle_scanner::OracleDateTime DateTimeFromValue(const Value &value, const Oracl
     if (value.type().id() == LogicalTypeId::VARCHAR) {
         const auto text = value.GetValue<std::string>();
         timestamp_ns_t parsed;
-        if (Timestamp::TryConvertTimestamp(text.c_str(), text.size(), parsed) != TimestampCastResult::SUCCESS) {
+        if (Timestamp::TryConvertTimestamp(text.c_str(), text.size(), parsed, false) != TimestampCastResult::SUCCESS) {
             RefuseValue(column, "'" + text + "' is not an ISO date or timestamp");
         }
         auto microseconds = parsed.value / 1000;
@@ -216,7 +216,7 @@ oracle_scanner::OracleDateTime DateTimeFromValue(const Value &value, const Oracl
         RefuseBind(column, value,
                    "only DATE, TIMESTAMP, TIMESTAMP_NS and ISO text can be written to a date or timestamp column");
     }
-    if (!Timestamp::IsFinite(timestamp)) {
+    if (!timestamp.IsFinite()) {
         RefuseValue(column, "Oracle has no infinite date");
     }
     date_t date;
@@ -818,7 +818,7 @@ PhysicalOperator &PlanOracleUpdate(ClientContext &, PhysicalPlanGenerator &plann
             throw NotImplementedException("Oracle UPDATE cannot evaluate this SET expression");
         }
         assignments += ":" + std::to_string(set_columns.size() + 1);
-        source_indexes.push_back(op.expressions[index]->Cast<BoundReferenceExpression>().index);
+        source_indexes.push_back(op.expressions[index]->Cast<BoundReferenceExpression>().Index());
         set_columns.push_back(columns[position]);
     }
     if (assignments.empty()) {

@@ -6,6 +6,7 @@
 #include "oracle_adapter.hpp"
 
 #include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
+#include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/default/default_generator.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
@@ -415,15 +416,13 @@ public:
             // views depend on; claiming it and failing breaks them.
             return nullptr;
         }
-        auto info = make_uniq<CreateTableInfo>();
-        info->schema = schema.name;
-        info->table = object_name;
+        auto info = make_uniq<CreateTableInfo>(schema, Identifier(object_name));
         std::unordered_set<std::string> used_names;
         std::unordered_map<std::string, std::string> output_names;
         for (idx_t index = 0; index < oracle_columns.size(); index++) {
             auto output_name = OutputName(oracle_columns[index], index, used_names);
             output_names.emplace(oracle_columns[index].name, output_name);
-            info->columns.AddColumn(ColumnDefinition(std::move(output_name), MappedType(oracle_columns[index])));
+            info->columns.AddColumn(ColumnDefinition(Identifier(output_name), MappedType(oracle_columns[index])));
             if (!oracle_columns[index].nullable) {
                 // USER_TAB_COLUMNS already carries this, so it costs no query.
                 info->constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(index)));
@@ -452,7 +451,7 @@ public:
     TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override {
         auto scan_bind = state->PrepareScan(object_name);
         scan_bind->table_entry = this;
-        scan_bind->catalog_name = catalog.GetAttached().GetName();
+        scan_bind->catalog_name = static_cast<const std::string &>(catalog.GetAttached().GetName());
         bind_data = std::move(scan_bind);
         TableFunction function({}, OracleQueryFunction, nullptr, OracleQueryInit);
         function.name = "oracle_attached_scan";
@@ -534,8 +533,12 @@ public:
         : DefaultGenerator(catalog), schema(schema), state(std::move(state_p)) {
     }
 
-    vector<string> GetDefaultEntries() override {
-        return state->ListObjects();
+    vector<Identifier> GetDefaultEntries() override {
+        vector<Identifier> result;
+        for (auto &name : state->ListObjects()) {
+            result.emplace_back(Identifier(name));
+        }
+        return result;
     }
 
     // GetDefaultEntries enumerates; this answers "is this one name mine?", and
@@ -543,8 +546,8 @@ public:
     // GetDefaultEntries above enumerates the schema; this answers the different
     // question of whether one particular name is ours, and a null answer means
     // it is not.
-    unique_ptr<CatalogEntry> CreateDefaultEntry(ClientContext &, const string &entry_name) override {
-        return OracleAttachedTableEntry::Create(catalog, schema, state, entry_name);
+    unique_ptr<CatalogEntry> CreateDefaultEntry(ClientContext &, const Identifier &entry_name) override {
+        return OracleAttachedTableEntry::Create(catalog, schema, state, static_cast<const std::string &>(entry_name));
     }
 
 private:
@@ -566,20 +569,20 @@ public:
                                  optional_ptr<PhysicalOperator> plan) override {
         auto &table = op.table.Cast<OracleAttachedTableEntry>();
         return PlanOracleInsert(context, planner, op, plan, table.OracleColumns(),
-                                table.WriteTarget(GetAttached().GetName()));
+                                table.WriteTarget(static_cast<const std::string &>(GetAttached().GetName())));
     }
 
     PhysicalOperator &PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
                                  PhysicalOperator &plan) override {
         auto &table = op.table.Cast<OracleAttachedTableEntry>();
-        return PlanOracleDelete(context, planner, op, plan, table.WriteTarget(GetAttached().GetName()));
+        return PlanOracleDelete(context, planner, op, plan, table.WriteTarget(static_cast<const std::string &>(GetAttached().GetName())));
     }
 
     PhysicalOperator &PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
                                  PhysicalOperator &plan) override {
         auto &table = op.table.Cast<OracleAttachedTableEntry>();
         return PlanOracleUpdate(context, planner, op, plan, table.OracleColumns(),
-                                table.WriteTarget(GetAttached().GetName()));
+                                table.WriteTarget(static_cast<const std::string &>(GetAttached().GetName())));
     }
 
     ErrorData SupportsCreateTable(BoundCreateTableInfo &) override {
@@ -588,7 +591,7 @@ public:
     }
 
     optional_ptr<CatalogEntry> CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) override {
-        if (info.schema == DEFAULT_SCHEMA) {
+        if (info.SchemaName() == Identifier(DEFAULT_SCHEMA)) {
             // DuckCatalog::Initialize creates `main` itself, and it may run
             // more than once; that schema is the attached Oracle schema, and it
             // is the only one there is.

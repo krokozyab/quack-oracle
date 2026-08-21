@@ -287,46 +287,46 @@ std::vector<oracle_scanner::OracleBind> PositionalBinds(const Value &value, cons
                 throw BinderException("%s parameter %llu cannot infer an Oracle type for NULL %s", function_name,
                                       index + 1, values[index].type().ToString());
             }
-            binds.push_back({std::to_string(index + 1), *oracle_type, oracle_scanner::BindDirection::BIND_IN, std::nullopt});
+            binds.push_back(oracle_scanner::OracleBind {std::to_string(index + 1), *oracle_type, oracle_scanner::BindDirection::BIND_IN, std::nullopt});
             continue;
         }
         if (type == LogicalTypeId::VARCHAR) {
             const auto text = values[index].GetValue<std::string>();
-            binds.push_back({std::to_string(index + 1), 1, oracle_scanner::BindDirection::BIND_IN,
+            binds.push_back(oracle_scanner::OracleBind {std::to_string(index + 1), 1, oracle_scanner::BindDirection::BIND_IN,
                              std::vector<uint8_t>(text.begin(), text.end())});
         } else if (type == LogicalTypeId::BLOB) {
             const auto bytes = StringValue::Get(values[index]);
-            binds.push_back({std::to_string(index + 1), 23, oracle_scanner::BindDirection::BIND_IN,
+            binds.push_back(oracle_scanner::OracleBind {std::to_string(index + 1), 23, oracle_scanner::BindDirection::BIND_IN,
                              std::vector<uint8_t>(bytes.begin(), bytes.end())});
         } else if (type == LogicalTypeId::FLOAT) {
             const auto number = values[index].GetValue<float>();
             if (!std::isfinite(number)) {
                 throw BinderException("%s parameter %llu cannot be a non-finite FLOAT", function_name, index + 1);
             }
-            binds.push_back({std::to_string(index + 1), 100, oracle_scanner::BindDirection::BIND_IN,
+            binds.push_back(oracle_scanner::OracleBind {std::to_string(index + 1), 100, oracle_scanner::BindDirection::BIND_IN,
                              oracle_scanner::EncodeOracleBinaryFloat(number)});
         } else if (type == LogicalTypeId::DOUBLE) {
             const auto number = values[index].GetValue<double>();
             if (!std::isfinite(number)) {
                 throw BinderException("%s parameter %llu cannot be a non-finite DOUBLE", function_name, index + 1);
             }
-            binds.push_back({std::to_string(index + 1), 101, oracle_scanner::BindDirection::BIND_IN,
+            binds.push_back(oracle_scanner::OracleBind {std::to_string(index + 1), 101, oracle_scanner::BindDirection::BIND_IN,
                              oracle_scanner::EncodeOracleBinaryDouble(number)});
         } else if (type == LogicalTypeId::DATE) {
             const auto date = values[index].GetValue<date_t>();
-            if (!Date::IsFinite(date)) {
+            if (!date.IsFinite()) {
                 throw BinderException("%s parameter %llu cannot be an infinite DATE", function_name, index + 1);
             }
             int32_t year;
             int32_t month;
             int32_t day;
             Date::Convert(date, year, month, day);
-            binds.push_back({std::to_string(index + 1), 12, oracle_scanner::BindDirection::BIND_IN,
+            binds.push_back(oracle_scanner::OracleBind {std::to_string(index + 1), 12, oracle_scanner::BindDirection::BIND_IN,
                              oracle_scanner::EncodeOracleDate({year, static_cast<uint8_t>(month),
                                                                static_cast<uint8_t>(day)})});
         } else if (type == LogicalTypeId::TIMESTAMP) {
             const auto timestamp = values[index].GetValue<timestamp_t>();
-            if (!Timestamp::IsFinite(timestamp)) {
+            if (!timestamp.IsFinite()) {
                 throw BinderException("%s parameter %llu cannot be an infinite TIMESTAMP", function_name, index + 1);
             }
             date_t date;
@@ -341,7 +341,7 @@ std::vector<oracle_scanner::OracleBind> PositionalBinds(const Value &value, cons
             int32_t microseconds;
             Date::Convert(date, year, month, day);
             Time::Convert(time, hour, minute, second, microseconds);
-            binds.push_back({std::to_string(index + 1), 180, oracle_scanner::BindDirection::BIND_IN,
+            binds.push_back(oracle_scanner::OracleBind {std::to_string(index + 1), 180, oracle_scanner::BindDirection::BIND_IN,
                              oracle_scanner::EncodeOracleTimestamp(
                                   {year, static_cast<uint8_t>(month), static_cast<uint8_t>(day),
                                    static_cast<uint8_t>(hour), static_cast<uint8_t>(minute), static_cast<uint8_t>(second),
@@ -349,7 +349,7 @@ std::vector<oracle_scanner::OracleBind> PositionalBinds(const Value &value, cons
         } else if (type == LogicalTypeId::TINYINT || type == LogicalTypeId::SMALLINT || type == LogicalTypeId::INTEGER ||
                    type == LogicalTypeId::BIGINT || type == LogicalTypeId::UTINYINT || type == LogicalTypeId::USMALLINT ||
                    type == LogicalTypeId::UINTEGER || type == LogicalTypeId::UBIGINT || type == LogicalTypeId::DECIMAL) {
-            binds.push_back({std::to_string(index + 1), 2, oracle_scanner::BindDirection::BIND_IN,
+            binds.push_back(oracle_scanner::OracleBind {std::to_string(index + 1), 2, oracle_scanner::BindDirection::BIND_IN,
                              oracle_scanner::EncodeOracleNumber(values[index].ToString())});
         } else {
             throw BinderException("%s parameter %llu has unsupported DuckDB type %s", function_name, index + 1,
@@ -368,53 +368,54 @@ std::vector<oracle_scanner::OracleBind> NamedBinds(const Value &value, const cha
     binds.reserve(values.size());
     for (idx_t index = 0; index < values.size(); index++) {
         const auto &argument = values[index];
-        const auto &name = StructType::GetChildName(value.type(), index);
+        // GetChildName returns an Identifier now; the bind name is its text.
+        const std::string name = static_cast<const std::string &>(StructType::GetChildName(value.type(), index));
         if (argument.IsNull()) {
             const auto oracle_type = OracleInputType(argument.type().id());
             if (!oracle_type) {
                 throw BinderException("%s cannot infer an Oracle type for NULL argument %s of type %s", function_name,
                                       name, argument.type().ToString());
             }
-            binds.push_back({name, *oracle_type, oracle_scanner::BindDirection::BIND_IN, std::nullopt});
+            binds.push_back(oracle_scanner::OracleBind {name, *oracle_type, oracle_scanner::BindDirection::BIND_IN, std::nullopt});
             continue;
         }
         if (argument.type().id() == LogicalTypeId::VARCHAR) {
             const auto text = argument.GetValue<std::string>();
-            binds.push_back({name, 1, oracle_scanner::BindDirection::BIND_IN,
+            binds.push_back(oracle_scanner::OracleBind {name, 1, oracle_scanner::BindDirection::BIND_IN,
                              std::vector<uint8_t>(text.begin(), text.end())});
         } else if (argument.type().id() == LogicalTypeId::BLOB) {
             const auto bytes = StringValue::Get(argument);
-            binds.push_back({name, 23, oracle_scanner::BindDirection::BIND_IN,
+            binds.push_back(oracle_scanner::OracleBind {name, 23, oracle_scanner::BindDirection::BIND_IN,
                              std::vector<uint8_t>(bytes.begin(), bytes.end())});
         } else if (argument.type().id() == LogicalTypeId::FLOAT) {
             const auto number = argument.GetValue<float>();
             if (!std::isfinite(number)) {
                 throw BinderException("%s argument %s cannot be a non-finite FLOAT", function_name, name);
             }
-            binds.push_back({name, 100, oracle_scanner::BindDirection::BIND_IN,
+            binds.push_back(oracle_scanner::OracleBind {name, 100, oracle_scanner::BindDirection::BIND_IN,
                              oracle_scanner::EncodeOracleBinaryFloat(number)});
         } else if (argument.type().id() == LogicalTypeId::DOUBLE) {
             const auto number = argument.GetValue<double>();
             if (!std::isfinite(number)) {
                 throw BinderException("%s argument %s cannot be a non-finite DOUBLE", function_name, name);
             }
-            binds.push_back({name, 101, oracle_scanner::BindDirection::BIND_IN,
+            binds.push_back(oracle_scanner::OracleBind {name, 101, oracle_scanner::BindDirection::BIND_IN,
                              oracle_scanner::EncodeOracleBinaryDouble(number)});
         } else if (argument.type().id() == LogicalTypeId::DATE) {
             const auto date = argument.GetValue<date_t>();
-            if (!Date::IsFinite(date)) {
+            if (!date.IsFinite()) {
                 throw BinderException("%s argument %s cannot be an infinite DATE", function_name, name);
             }
             int32_t year;
             int32_t month;
             int32_t day;
             Date::Convert(date, year, month, day);
-            binds.push_back({name, 12, oracle_scanner::BindDirection::BIND_IN,
+            binds.push_back(oracle_scanner::OracleBind {name, 12, oracle_scanner::BindDirection::BIND_IN,
                              oracle_scanner::EncodeOracleDate({year, static_cast<uint8_t>(month),
                                                                static_cast<uint8_t>(day)})});
         } else if (argument.type().id() == LogicalTypeId::TIMESTAMP) {
             const auto timestamp = argument.GetValue<timestamp_t>();
-            if (!Timestamp::IsFinite(timestamp)) {
+            if (!timestamp.IsFinite()) {
                 throw BinderException("%s argument %s cannot be an infinite TIMESTAMP", function_name, name);
             }
             date_t date;
@@ -429,13 +430,13 @@ std::vector<oracle_scanner::OracleBind> NamedBinds(const Value &value, const cha
             int32_t microseconds;
             Date::Convert(date, year, month, day);
             Time::Convert(time, hour, minute, second, microseconds);
-            binds.push_back({name, 180, oracle_scanner::BindDirection::BIND_IN,
+            binds.push_back(oracle_scanner::OracleBind {name, 180, oracle_scanner::BindDirection::BIND_IN,
                              oracle_scanner::EncodeOracleTimestamp(
                                   {year, static_cast<uint8_t>(month), static_cast<uint8_t>(day),
                                    static_cast<uint8_t>(hour), static_cast<uint8_t>(minute), static_cast<uint8_t>(second),
                                   static_cast<uint32_t>(microseconds) * 1000U}, false)});
         } else if (argument.type().IsNumeric()) {
-            binds.push_back({name, 2, oracle_scanner::BindDirection::BIND_IN,
+            binds.push_back(oracle_scanner::OracleBind {name, 2, oracle_scanner::BindDirection::BIND_IN,
                              oracle_scanner::EncodeOracleNumber(argument.ToString())});
         } else {
             throw BinderException("%s argument %s has unsupported DuckDB type %s", function_name, name,
@@ -492,7 +493,7 @@ std::vector<oracle_scanner::OracleBind> CallArguments(const Value &value) {
 }
 
 unique_ptr<FunctionData> OracleQueryBind(ClientContext &context, TableFunctionBindInput &input,
-                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                         vector<LogicalType> &return_types, vector<Identifier> &names) {
     if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
         throw BinderException("oracle_query secret and SQL cannot be NULL");
     }
@@ -520,7 +521,7 @@ unique_ptr<FunctionData> OracleQueryBind(ClientContext &context, TableFunctionBi
     }
     std::unordered_set<std::string> used_names;
     for (idx_t index = 0; index < result->columns.size(); index++) {
-        names.push_back(OutputName(result->columns[index], index, used_names));
+        names.push_back(Identifier(OutputName(result->columns[index], index, used_names)));
         result->types.push_back(TypeFor(result->columns[index]));
         return_types.push_back(result->types.back());
     }
@@ -530,7 +531,7 @@ unique_ptr<FunctionData> OracleQueryBind(ClientContext &context, TableFunctionBi
 
 
 unique_ptr<FunctionData> OracleExecuteBind(ClientContext &context, TableFunctionBindInput &input,
-                                           vector<LogicalType> &return_types, vector<string> &names) {
+                                           vector<LogicalType> &return_types, vector<Identifier> &names) {
     if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
         throw BinderException("oracle_execute secret and SQL cannot be NULL");
     }
@@ -540,7 +541,7 @@ unique_ptr<FunctionData> OracleExecuteBind(ClientContext &context, TableFunction
     result->config = ConnectionFromSecret(context, input.inputs[0].GetValue<std::string>(), result->password);
     result->binds = ParameterBinds(input, "oracle_execute");
     oracle_scanner::ValidateOracleDml(result->sql, result->binds);
-    names.push_back("affected_rows");
+    names.push_back(Identifier("affected_rows"));
     return_types.push_back(LogicalType::UBIGINT);
     return std::move(result);
 }
@@ -568,7 +569,7 @@ void OracleExecuteFunction(ClientContext &, TableFunctionInput &input, DataChunk
 }
 
 unique_ptr<FunctionData> OracleExecuteManyBind(ClientContext &context, TableFunctionBindInput &input,
-                                               vector<LogicalType> &return_types, vector<string> &names) {
+                                               vector<LogicalType> &return_types, vector<Identifier> &names) {
     if (input.inputs[0].IsNull() || input.inputs[1].IsNull() || input.inputs[2].IsNull()) {
         throw BinderException("oracle_execute_many secret, SQL, and rows cannot be NULL");
     }
@@ -602,7 +603,7 @@ unique_ptr<FunctionData> OracleExecuteManyBind(ClientContext &context, TableFunc
         }
         result->rows.push_back(std::move(binds));
     }
-    names.push_back("affected_rows");
+    names.push_back(Identifier("affected_rows"));
     return_types.push_back(LogicalType::UBIGINT);
     return std::move(result);
 }
@@ -632,14 +633,14 @@ unique_ptr<GlobalTableFunctionState> OracleExecuteManyInit(ClientContext &, Tabl
 }
 
 unique_ptr<FunctionData> OracleCallNumberBind(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
+                                              vector<LogicalType> &return_types, vector<Identifier> &names) {
     if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
         throw BinderException("oracle_call_number secret and function cannot be NULL");
     }
     auto result = make_uniq<OracleCallNumberBindData>();
     result->config = ConnectionFromSecret(context, input.inputs[0].GetValue<std::string>(), result->password);
     result->function = input.inputs[1].GetValue<std::string>();
-    names.push_back("value");
+    names.push_back(Identifier("value"));
     return_types.push_back(LogicalType::VARCHAR);
     return std::move(result);
 }
@@ -669,7 +670,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallNumberInit(ClientContext &, Table
 }
 
 unique_ptr<FunctionData> OracleCallNumberArgsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
     if (input.inputs[0].IsNull() || input.inputs[1].IsNull() || input.inputs[2].IsNull()) {
         throw BinderException("oracle_call_number_args secret, function, and arguments cannot be NULL");
     }
@@ -677,7 +678,7 @@ unique_ptr<FunctionData> OracleCallNumberArgsBind(ClientContext &context, TableF
     result->config = ConnectionFromSecret(context, input.inputs[0].GetValue<std::string>(), result->password);
     result->function = input.inputs[1].GetValue<std::string>();
     result->arguments = NamedBinds(input.inputs[2], "oracle_call_number_args");
-    names.push_back("value");
+    names.push_back(Identifier("value"));
     return_types.push_back(LogicalType::VARCHAR);
     return std::move(result);
 }
@@ -717,7 +718,7 @@ void OracleCallNumberFunction(ClientContext &, TableFunctionInput &input, DataCh
 }
 
 unique_ptr<FunctionData> OracleCallOutNumberBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
     if (input.inputs[0].IsNull() || input.inputs[1].IsNull() || input.inputs[2].IsNull()) {
         throw BinderException("oracle_call_out_number secret, procedure, and output argument cannot be NULL");
     }
@@ -725,7 +726,7 @@ unique_ptr<FunctionData> OracleCallOutNumberBind(ClientContext &context, TableFu
     result->config = ConnectionFromSecret(context, input.inputs[0].GetValue<std::string>(), result->password);
     result->procedure = input.inputs[1].GetValue<std::string>();
     result->argument = input.inputs[2].GetValue<std::string>();
-    names.push_back("value");
+    names.push_back(Identifier("value"));
     return_types.push_back(LogicalType::VARCHAR);
     return std::move(result);
 }
@@ -755,7 +756,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallOutNumberInit(ClientContext &, Ta
 }
 
 unique_ptr<FunctionData> OracleCallOutVarcharBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
     if (input.inputs[0].IsNull() || input.inputs[1].IsNull() || input.inputs[2].IsNull()) {
         throw BinderException("oracle_call_out_varchar secret, procedure, and output argument cannot be NULL");
     }
@@ -763,7 +764,7 @@ unique_ptr<FunctionData> OracleCallOutVarcharBind(ClientContext &context, TableF
     result->config = ConnectionFromSecret(context, input.inputs[0].GetValue<std::string>(), result->password);
     result->procedure = input.inputs[1].GetValue<std::string>();
     result->argument = input.inputs[2].GetValue<std::string>();
-    names.push_back("value");
+    names.push_back(Identifier("value"));
     return_types.push_back(LogicalType::VARCHAR);
     return std::move(result);
 }
@@ -793,7 +794,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallOutVarcharInit(ClientContext &, T
 }
 
 unique_ptr<FunctionData> OracleCallInOutNumberBind(ClientContext &context, TableFunctionBindInput &input,
-                                                    vector<LogicalType> &return_types, vector<string> &names) {
+                                                    vector<LogicalType> &return_types, vector<Identifier> &names) {
     if (input.inputs[0].IsNull() || input.inputs[1].IsNull() || input.inputs[2].IsNull() || input.inputs[3].IsNull()) {
         throw BinderException("oracle_call_inout_number secret, procedure, argument, and value cannot be NULL");
     }
@@ -802,7 +803,7 @@ unique_ptr<FunctionData> OracleCallInOutNumberBind(ClientContext &context, Table
     result->procedure = input.inputs[1].GetValue<std::string>();
     result->argument = input.inputs[2].GetValue<std::string>();
     result->value = oracle_scanner::EncodeOracleNumber(input.inputs[3].GetValue<std::string>());
-    names.push_back("value");
+    names.push_back(Identifier("value"));
     return_types.push_back(LogicalType::VARCHAR);
     return std::move(result);
 }
@@ -832,7 +833,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallInOutNumberInit(ClientContext &, 
 }
 
 unique_ptr<FunctionData> OracleCallInOutVarcharBind(ClientContext &context, TableFunctionBindInput &input,
-                                                     vector<LogicalType> &return_types, vector<string> &names) {
+                                                     vector<LogicalType> &return_types, vector<Identifier> &names) {
     if (input.inputs[0].IsNull() || input.inputs[1].IsNull() || input.inputs[2].IsNull() || input.inputs[3].IsNull()) {
         throw BinderException("oracle_call_inout_varchar secret, procedure, argument, and value cannot be NULL");
     }
@@ -842,7 +843,7 @@ unique_ptr<FunctionData> OracleCallInOutVarcharBind(ClientContext &context, Tabl
     result->argument = input.inputs[2].GetValue<std::string>();
     const auto value = input.inputs[3].GetValue<std::string>();
     result->value = std::vector<uint8_t>(value.begin(), value.end());
-    names.push_back("value");
+    names.push_back(Identifier("value"));
     return_types.push_back(LogicalType::VARCHAR);
     return std::move(result);
 }
@@ -872,7 +873,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallInOutVarcharInit(ClientContext &,
 }
 
 unique_ptr<FunctionData> OracleCallBind(ClientContext &context, TableFunctionBindInput &input,
-                                        vector<LogicalType> &return_types, vector<string> &names) {
+                                        vector<LogicalType> &return_types, vector<Identifier> &names) {
     if (input.inputs[0].IsNull() || input.inputs[1].IsNull() || input.inputs[2].IsNull()) {
         throw BinderException("oracle_call secret, procedure, and cursor argument cannot be NULL");
     }
@@ -880,7 +881,7 @@ unique_ptr<FunctionData> OracleCallBind(ClientContext &context, TableFunctionBin
     result->config = ConnectionFromSecret(context, input.inputs[0].GetValue<std::string>(), result->password);
     result->procedure = input.inputs[1].GetValue<std::string>();
     result->cursor_argument = input.inputs[2].GetValue<std::string>();
-    names.push_back("cursor_handle");
+    names.push_back(Identifier("cursor_handle"));
     return_types.push_back(LogicalType::VARCHAR);
     return std::move(result);
 }
@@ -927,14 +928,14 @@ void OracleCallFunction(ClientContext &, TableFunctionInput &input, DataChunk &o
 }
 
 unique_ptr<FunctionData> OracleCallImplicitBind(ClientContext &context, TableFunctionBindInput &input,
-                                                vector<LogicalType> &return_types, vector<string> &names) {
+                                                vector<LogicalType> &return_types, vector<Identifier> &names) {
     if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
         throw BinderException("oracle_call_implicit secret and procedure cannot be NULL");
     }
     auto result = make_uniq<OracleCallImplicitBindData>();
     result->config = ConnectionFromSecret(context, input.inputs[0].GetValue<std::string>(), result->password);
     result->procedure = input.inputs[1].GetValue<std::string>();
-    names.push_back("cursor_handle");
+    names.push_back(Identifier("cursor_handle"));
     return_types.push_back(LogicalType::VARCHAR);
     return std::move(result);
 }
@@ -968,7 +969,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallImplicitInit(ClientContext &conte
 }
 
 unique_ptr<FunctionData> OracleCallCursorsBind(ClientContext &context, TableFunctionBindInput &input,
-                                               vector<LogicalType> &return_types, vector<string> &names) {
+                                               vector<LogicalType> &return_types, vector<Identifier> &names) {
     if (input.inputs[0].IsNull() || input.inputs[1].IsNull() || input.inputs[2].IsNull()) {
         throw BinderException("oracle_call_cursors secret, procedure, and cursor arguments cannot be NULL");
     }
@@ -988,7 +989,7 @@ unique_ptr<FunctionData> OracleCallCursorsBind(ClientContext &context, TableFunc
     if (result->cursor_arguments.empty()) {
         throw BinderException("oracle_call_cursors requires at least one cursor argument");
     }
-    names.push_back("cursor_handle");
+    names.push_back(Identifier("cursor_handle"));
     return_types.push_back(LogicalType::VARCHAR);
     return std::move(result);
 }
@@ -1026,7 +1027,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallCursorsInit(ClientContext &contex
 }
 
 unique_ptr<FunctionData> OracleCallNamedBind(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
     if (input.inputs[0].IsNull() || input.inputs[1].IsNull() || input.inputs[2].IsNull()) {
         throw BinderException("oracle_call_named secret, procedure, and arguments cannot be NULL");
     }
@@ -1062,7 +1063,7 @@ struct OracleArgumentsGlobalState final : GlobalTableFunctionState {
 // takes for the same argument, and it is NULL exactly when `unsupported_reason`
 // says why the argument cannot be bound at all.
 unique_ptr<FunctionData> OracleArgumentsBind(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
     if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
         throw BinderException("oracle_arguments secret and callable name cannot be NULL");
     }
@@ -1137,7 +1138,7 @@ std::string ResolvedCallableName(const OracleCallableSignature &signature) {
 }
 
 unique_ptr<FunctionData> OracleCallAutoBind(ClientContext &context, TableFunctionBindInput &input,
-                                            vector<LogicalType> &return_types, vector<string> &names) {
+                                            vector<LogicalType> &return_types, vector<Identifier> &names) {
     if (input.inputs[0].IsNull() || input.inputs[1].IsNull() || input.inputs[2].IsNull()) {
         throw BinderException("oracle_call_auto secret, callable name, and values cannot be NULL");
     }
@@ -1355,7 +1356,7 @@ void OracleCallNamedFunction(ClientContext &, TableFunctionInput &input, DataChu
 }
 
 unique_ptr<FunctionData> OracleCallNamedFunctionBind(ClientContext &context, TableFunctionBindInput &input,
-                                                     vector<LogicalType> &return_types, vector<string> &names) {
+                                                     vector<LogicalType> &return_types, vector<Identifier> &names) {
     if (input.inputs[0].IsNull() || input.inputs[1].IsNull() || input.inputs[2].IsNull() || input.inputs[3].IsNull()) {
         throw BinderException("oracle_call_named_function secret, function, return type, and arguments cannot be NULL");
     }
@@ -1480,7 +1481,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallNamedFunctionInit(ClientContext &
 }
 
 unique_ptr<FunctionData> OracleCloseCallBind(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
     if (input.inputs[0].IsNull()) {
         throw BinderException("oracle_close_call handle cannot be NULL");
     }
@@ -1488,7 +1489,7 @@ unique_ptr<FunctionData> OracleCloseCallBind(ClientContext &context, TableFuncti
     auto result = make_uniq<OracleCloseCallBindData>();
     result->state = context.registered_state->GetOrCreate<OracleCallRegistryState>("oracle_scanner.call_registry");
     result->call_id = handle.call_id;
-    names.push_back("closed");
+    names.push_back(Identifier("closed"));
     return_types.push_back(LogicalType::BOOLEAN);
     return std::move(result);
 }
@@ -1508,7 +1509,7 @@ void OracleCloseCallFunction(ClientContext &, TableFunctionInput &input, DataChu
 }
 
 unique_ptr<FunctionData> OracleCursorBind(ClientContext &context, TableFunctionBindInput &input,
-                                          vector<LogicalType> &return_types, vector<string> &names) {
+                                          vector<LogicalType> &return_types, vector<Identifier> &names) {
     if (input.inputs[0].IsNull()) {
         throw BinderException("oracle_cursor handle cannot be NULL");
     }
@@ -1517,7 +1518,7 @@ unique_ptr<FunctionData> OracleCursorBind(ClientContext &context, TableFunctionB
     result->columns = result->cursor->Columns();
     std::unordered_set<std::string> used_names;
     for (idx_t index = 0; index < result->columns.size(); index++) {
-        names.push_back(OutputName(result->columns[index], index, used_names));
+        names.push_back(Identifier(OutputName(result->columns[index], index, used_names)));
         result->types.push_back(TypeFor(result->columns[index]));
         return_types.push_back(result->types.back());
     }
