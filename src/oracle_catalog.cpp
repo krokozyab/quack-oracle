@@ -429,7 +429,7 @@ public:
             }
         }
         auto key_columns = state->PrimaryKeyColumns(object_name);
-        duckdb::vector<std::string> key_names;
+        duckdb::vector<Identifier> key_names;
         for (const auto &key_column : key_columns) {
             const auto named = output_names.find(key_column);
             if (named == output_names.end()) {
@@ -438,7 +438,7 @@ public:
                 key_names.clear();
                 break;
             }
-            key_names.push_back(named->second);
+            key_names.push_back(Identifier(named->second));
         }
         if (!key_names.empty()) {
             info->constraints.push_back(make_uniq<UniqueConstraint>(std::move(key_names), true));

@@ -12,6 +12,11 @@
 
 #include "oracle_adapter.hpp"
 
+#include <optional>
+#include "duckdb/execution/operator/projection/physical_projection.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -709,23 +714,59 @@ PhysicalOperator &PlanOracleInsert(ClientContext &, PhysicalPlanGenerator &plann
     // The columns the statement actually names. Columns the user left out are
     // left out of the statement too, so Oracle applies its own DEFAULT rather
     // than receiving an explicit NULL, which is a different thing entirely.
+    //
+    // How "named" is known changed in DuckDB 2.0. The binder used to leave
+    // op.column_index_map with INVALID_INDEX for an unnamed column; it now
+    // leaves that map empty (plan_insert.cpp calls it deprecated) and instead
+    // puts a projection over the source whose select list has, per physical
+    // column, a reference into the source for a named column and the column's
+    // bound default — a constant NULL for an Oracle table, which has no DuckDB
+    // default — for an unnamed one. So the projection's select list is read:
+    // a column whose expression is not a reference (possibly under a cast,
+    // which GetDefaultExpressionForColumn adds) was not named. The old map is
+    // still honoured when present, for a plan that reaches here some other way.
     std::vector<idx_t> source_indexes;
     std::vector<OracleColumn> bound_columns;
     std::string column_list;
     std::string value_list;
+    const auto *projection =
+        plan->type == PhysicalOperatorType::PROJECTION ? &plan->Cast<PhysicalProjection>() : nullptr;
+    const auto names_column = [&](idx_t physical) -> std::optional<idx_t> {
+        if (!op.column_index_map.empty()) {
+            const auto mapped = op.column_index_map[PhysicalIndex(physical)];
+            if (mapped == DConstants::INVALID_INDEX) {
+                return std::nullopt;
+            }
+            return mapped;
+        }
+        if (!projection || physical >= projection->select_list.size()) {
+            // No projection means the source already matches the table
+            // column for column, so every column is named and in order.
+            return physical;
+        }
+        const Expression *expression = projection->select_list[physical].get();
+        // A cast is a function expression of type OPERATOR_CAST in 2.0;
+        // BoundCastExpression is only the set of helpers that reads one.
+        while (BoundCastExpression::IsCast(*expression)) {
+            expression = &BoundCastExpression::Child(expression->Cast<BoundFunctionExpression>());
+        }
+        if (expression->GetExpressionClass() != ExpressionClass::BOUND_REF) {
+            return std::nullopt;
+        }
+        // The insert operator reads the projection's output, where this
+        // column sits at its own physical position.
+        return physical;
+    };
     for (auto &column : op.table.GetColumns().Physical()) {
         const auto position = column.Physical().index;
         if (position >= columns.size()) {
             throw InternalException("Oracle INSERT column %llu is outside the table's Oracle metadata", position);
         }
-        idx_t source_index = position;
-        if (!op.column_index_map.empty()) {
-            const auto mapped = op.column_index_map[column.Physical()];
-            if (mapped == DConstants::INVALID_INDEX) {
-                continue;
-            }
-            source_index = mapped;
+        const auto named = names_column(position);
+        if (!named) {
+            continue;
         }
+        const idx_t source_index = *named;
         if (!column_list.empty()) {
             column_list += ", ";
             value_list += ", ";
