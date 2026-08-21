@@ -1176,10 +1176,11 @@ static void TestTtcErrorCarriesADmlRowId() {
     CHECK(batched_decoded.bytes_consumed == batched.size());
 }
 
-// A descriptor may name the server certificate's DN, and Oracle writes it
-// double-quoted because it contains commas, spaces and '='. Until the parser
-// accepted a quoted value, such a descriptor did not merely lose the DN — it
-// failed to parse at all, so the whole alias was unusable.
+// The local TLS server and the closed-peer write test are built on POSIX
+// sockets and signals. Porting them to Winsock would be a second
+// implementation of the thing under test, so they are simply not built on
+// Windows — everything else in this suite is portable and still runs there.
+#if !defined(_WIN32)
 // A local TLS server, so certificate verification can be tested against cases
 // no live endpoint offers: an expired certificate, and the wallet-free path
 // where the client presents nothing and trusts an explicit CA. Everything is
@@ -1243,11 +1244,6 @@ static Identity MakeIdentity(const std::string &common_name, long not_before_sec
 
 // Accepts exactly one connection, completes the handshake, and closes. The
 // client under test only needs the handshake's verdict.
-// The local TLS server and the closed-peer write test are built on POSIX
-// sockets and signals. Porting them to Winsock would be a second
-// implementation of the thing under test, so they are simply not built on
-// Windows — everything else in this suite is portable and still runs there.
-#if !defined(_WIN32)
 class Server {
 public:
     explicit Server(const Identity &identity) {
@@ -1403,6 +1399,10 @@ static void TestLocalTlsCertificateVerification() {
 }
 #endif // !_WIN32
 
+// A descriptor may name the server certificate's DN, and Oracle writes it
+// double-quoted because it contains commas, spaces and '='. Until the parser
+// accepted a quoted value, such a descriptor did not merely lose the DN — it
+// failed to parse at all, so the whole alias was unusable.
 static void TestDescriptorSecuritySection() {
     const std::string with_dn =
         "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=db.example.com)(PORT=1522))"

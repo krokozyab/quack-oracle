@@ -91,6 +91,16 @@ jobs:
       - name: Build and run
         run: scripts/build_protocol_test.sh
 
+      # Windows compiles only in the release matrix, so a file that does not
+      # build there used to cost a forty-minute run to discover — three of them,
+      # one defect at a time. This resolves the platform conditionals and
+      # inspects what a Windows compiler would actually see: unbalanced braces
+      # from a guard that excludes an opening or closing token, POSIX headers or
+      # calls that survive into that view, and enumerators named after Windows
+      # macros. It takes under a second and needs no Windows.
+      - name: Check the Windows view of the sources
+        run: python3 scripts/check_windows_view.py
+
   # macOS costs ten billed minutes for every one it runs, and it has never been
   # the lane that found a defect here — the platform-specific bugs this suite
   # caught were all Linux-only, and macOS hid several of them (SIGPIPE, a
