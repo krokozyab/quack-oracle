@@ -1,0 +1,119 @@
+#
+# This workflow calls the main distribution pipeline from DuckDB to build, test and (optionally) release the extension
+#
+name: Main Extension Distribution Pipeline
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
+  cancel-in-progress: true
+
+jobs:
+  duckdb-stable-build:
+    name: Build extension binaries
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
+    with:
+      duckdb_version: v1.5.4
+      ci_tools_version: v1.5-variegata
+      extension_name: oracle_scanner
+
+  code-quality-check:
+    name: Code Quality Check
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata
+    with:
+      duckdb_version: v1.5.4
+      ci_tools_version: v1.5-variegata
+      extension_name: oracle_scanner
+      format_checks: 'format;tidy'
+
+  # The distribution pipeline runs the sqllogictest suite and nothing else, so
+  # the protocol suite — parsers, codecs, session contract, and every bounds and
+  # truncation case — never ran in CI at all. It needs no DuckDB, which is what
+  # makes running it on every push affordable.
+  protocol-tests:
+    name: Protocol tests
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install OpenSSL
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+          else
+            brew install openssl@3 pkg-config
+            echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build and run
+        run: scripts/build_protocol_test.sh
+
+  # One full build carries the two things that need a built artifact: the
+  # adapter suite, which drives the DuckDB adapter against a fake session, and
+  # the clean-machine gate. Neither touches a database or the network.
+  adapter-and-clean-machine:
+    name: Adapter tests and clean-machine check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config ninja-build
+
+      - name: Build
+        run: GEN=ninja make release
+
+      - name: Run the C++ suites
+        run: ctest --test-dir build/release/extension/oracle_scanner --output-on-failure
+
+      - name: Prove no Oracle client is linked or loaded
+        run: scripts/check_no_oracle_client.sh
+
+      - name: Check the capture inventory against PROVENANCE.md
+        run: |
+          scripts/capture_inventory.sh | while read -r digest name rest; do
+            grep -q "$digest" PROVENANCE.md || {
+              echo "capture $name has hash $digest, which PROVENANCE.md does not record" >&2
+              exit 1
+            }
+          done
+
+  # The live lanes need an Oracle nobody outside this repository has, so they
+  # are triggered by hand rather than on every push. The stage list lives in
+  # scripts/run_live_stages.sh: a lane that only exists as something somebody
+  # types is a lane nobody else can reproduce.
+  live-oracle:
+    name: Live Oracle stages
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config ninja-build
+
+      - name: Build
+        run: GEN=ninja make release
+
+      - name: Run the live stages
+        env:
+          ORACLE_SCANNER_LIVE: '1'
+          ORA19C_HOST: ${{ secrets.ORA19C_HOST }}
+          ORA19C_PORT: ${{ secrets.ORA19C_PORT }}
+          ORA19C_SERVICE: ${{ secrets.ORA19C_SERVICE }}
+          ORA19C_USER: ${{ secrets.ORA19C_USER }}
+          ORA19C_PASSWORD: ${{ secrets.ORA19C_PASSWORD }}
+        run: scripts/run_live_stages.sh build/release/extension/oracle_scanner/oracle_scanner_protocol_test

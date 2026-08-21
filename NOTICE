@@ -1,0 +1,11 @@
+oracle_scanner
+Copyright 2026 oracle_scanner contributors
+
+This product is an independent community project. It is not affiliated with,
+endorsed by, or sponsored by Oracle Corporation or DuckDB Labs.
+
+Oracle and Java are registered trademarks of Oracle and/or its affiliates.
+DuckDB is a trademark of DuckDB Foundation.
+
+The implementation may be tested against independently developed open-source
+Oracle clients. No Oracle client software is distributed with this project.

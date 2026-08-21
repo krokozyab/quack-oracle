@@ -1,0 +1,244 @@
+# name: test/sql/oracle_scanner.test
+# description: oracle_scanner bootstrap and secret registration
+# group: [sql]
+
+# Before we load the extension, this will fail
+statement error
+SELECT oracle_scanner_version();
+----
+Catalog Error: Scalar Function with name oracle_scanner_version does not exist!
+
+# Require statement will ensure this test is run with this extension loaded
+require oracle_scanner
+
+# Confirm the extension works
+query I
+SELECT oracle_scanner_version();
+----
+0.1.0-dev
+
+# oracle_query keeps its two required arguments and accepts one optional LIST
+# or named STRUCT parameter collection through DuckDB's table-function
+# varargs mechanism.
+query I
+SELECT count(*)
+FROM duckdb_functions()
+WHERE function_name = 'oracle_query'
+  AND parameter_types = ['VARCHAR', 'VARCHAR']
+  AND varargs = 'ANY';
+----
+1
+
+query I
+SELECT count(*)
+FROM duckdb_functions()
+WHERE function_name IN ('oracle_execute', 'oracle_execute_many', 'oracle_call_number', 'oracle_call_number_args', 'oracle_call_out_number', 'oracle_call_out_varchar',
+                        'oracle_call_inout_number', 'oracle_call_inout_varchar', 'oracle_call', 'oracle_cursor',
+                        'oracle_call_implicit', 'oracle_call_cursors', 'oracle_call_named', 'oracle_call_named_function',
+                        'oracle_close_call');
+----
+15
+
+statement ok
+CREATE TEMPORARY SECRET oracle_test (
+    TYPE oracle,
+    HOST 'localhost',
+    PORT 1521,
+    SERVICE_NAME 'FREEPDB1',
+    USER 'scott',
+    PASSWORD 'tiger',
+    PROTOCOL 'tcp'
+);
+
+# TCPS secret fields are accepted before network I/O. The invalid query keeps
+# this test local while exercising protocol/SNI/wallet-secret parsing.
+statement ok
+CREATE TEMPORARY SECRET oracle_tcps_test (
+    TYPE oracle,
+    HOST 'tcps.example.invalid',
+    PORT 2484,
+    SERVICE_NAME 'FREEPDB1',
+    USER 'scott',
+    PASSWORD 'tiger',
+    PROTOCOL 'tcps',
+    TLS_SERVER_NAME 'oracle.example.invalid',
+    TLS_SNI_NAME 'sni.example.invalid',
+    TLS_CA_FILE '/tmp/ca.pem',
+    WALLET_FILE '/tmp/ewallet.pem',
+    WALLET_PASSWORD 'wallet-secret'
+);
+
+statement error
+SELECT * FROM oracle_query('oracle_tcps_test', 'DELETE FROM app.t');
+----
+Invalid Error: oracle_query accepts only SELECT or WITH queries
+
+# TLS settings on TCP must not be ignored silently.
+statement ok
+CREATE TEMPORARY SECRET oracle_bad_tcp_tls (
+    TYPE oracle,
+    HOST 'localhost',
+    PORT 1521,
+    SERVICE_NAME 'FREEPDB1',
+    USER 'scott',
+    PASSWORD 'tiger',
+    PROTOCOL 'tcp',
+    WALLET_FILE '/tmp/ewallet.pem'
+);
+
+statement error
+SELECT * FROM oracle_query('oracle_bad_tcp_tls', 'DELETE FROM app.t');
+----
+Binder Error: Oracle TLS_* and WALLET_* options require PROTOCOL 'tcps'
+
+# Omitting PROTOCOL is equivalent to TCP and must reject TLS options too.
+statement ok
+CREATE TEMPORARY SECRET oracle_implicit_tcp_tls (
+    TYPE oracle,
+    HOST 'localhost',
+    PORT 1521,
+    SERVICE_NAME 'FREEPDB1',
+    USER 'scott',
+    PASSWORD 'tiger',
+    TLS_SERVER_NAME 'oracle.example.invalid'
+);
+
+statement error
+SELECT * FROM oracle_query('oracle_implicit_tcp_tls', 'DELETE FROM app.t');
+----
+Binder Error: Oracle TLS_* and WALLET_* options require PROTOCOL 'tcps'
+
+# TNS_ALIAS is wallet-backed and must not be mixed with a manual endpoint.
+statement ok
+CREATE TEMPORARY SECRET oracle_tns_alias (
+    TYPE oracle,
+    HOST 'localhost',
+    PORT 1521,
+    SERVICE_NAME 'FREEPDB1',
+    USER 'scott',
+    PASSWORD 'tiger',
+    TNS_ALIAS 'mydb_high'
+);
+
+statement error
+SELECT * FROM oracle_query('oracle_tns_alias', 'DELETE FROM app.t');
+----
+Binder Error: Oracle TNS_ALIAS cannot be combined with HOST, PORT, or SERVICE_NAME
+
+# Isolated Oracle DML owns and commits its native session, so it cannot be
+# presented as part of a DuckDB transaction.
+statement ok
+BEGIN TRANSACTION;
+
+statement error
+SELECT * FROM oracle_execute('oracle_test', 'INSERT INTO app.t VALUES (:n)', [1]);
+----
+Binder Error: oracle_execute cannot run inside an explicit DuckDB transaction
+
+statement ok
+ROLLBACK;
+
+# Parameter validation happens before a network connection. A STRUCT uses its
+# field names as Oracle bind names; typed NULL is supported, but a NULL BOOLEAN
+# still has no Oracle wire type on this surface.
+statement error
+SELECT * FROM oracle_query('oracle_test', 'SELECT :n FROM dual', {n: CAST(NULL AS BOOLEAN)});
+----
+Binder Error: oracle_query cannot infer an Oracle type for NULL argument n of type BOOLEAN
+
+# Descriptor validation is local: a malformed direction must fail before any
+# Oracle connection is attempted.
+statement error
+SELECT *
+FROM oracle_call_named(
+    'oracle_test',
+    'app.p',
+    [{name: 'n', direction: 'sideways', type: 'number', value: '1'}]
+);
+----
+Binder Error: oracle_call_named direction for n must be in, out, or inout
+
+# DATE call inputs are parsed during binding and must use the portable ISO
+# representation rather than a session-dependent Oracle date format.
+statement error
+SELECT *
+FROM oracle_call_named(
+    'oracle_test',
+    'app.p',
+    [{name: 'd', direction: 'in', type: 'date', value: '2024-02-30'}]
+);
+----
+Binder Error: oracle_call_named DATE d must be a valid YYYY-MM-DD value
+
+# Output DATE binds do not accept a client value.
+statement error
+SELECT *
+FROM oracle_call_named(
+    'oracle_test',
+    'app.p',
+    [{name: 'd', direction: 'out', type: 'date', value: '2024-02-29'}]
+);
+----
+Binder Error: oracle_call_named OUT DATE d must have NULL value
+
+# TIMESTAMP input uses DuckDB's strict timezone-free parser before opening an
+# Oracle session.
+statement error
+SELECT *
+FROM oracle_call_named(
+    'oracle_test',
+    'app.p',
+    [{name: 'ts', direction: 'in', type: 'timestamp', value: 'not-a-timestamp'}]
+);
+----
+Binder Error: oracle_call_named TIMESTAMP ts must be a valid timezone-free YYYY-MM-DD HH:MM:SS[.ffffff] value
+
+# RAW values are hex text to keep the generic LIST<STRUCT> contract portable.
+statement error
+SELECT *
+FROM oracle_call_named(
+    'oracle_test',
+    'app.p',
+    [{name: 'r', direction: 'in', type: 'raw', value: '0G'}]
+);
+----
+Binder Error: oracle_call_named RAW r must be an even-length hexadecimal value up to 32767 bytes
+
+# Binary floating-point values retain their dedicated wire codecs and reject
+# NaN/infinity before a session is opened.
+statement error
+SELECT *
+FROM oracle_call_named(
+    'oracle_test',
+    'app.p',
+    [{name: 'f', direction: 'in', type: 'float', value: 'nan'}]
+);
+----
+Binder Error: oracle_call_named FLOAT f must be a finite decimal value
+
+# Batch DML must supply at least one named STRUCT or positional LIST row and
+# is validated before opening an Oracle connection.
+statement error
+SELECT * FROM oracle_execute_many('oracle_test', 'INSERT INTO app.t VALUES (:n)', []);
+----
+Binder Error: oracle_execute_many rows must be a non-empty LIST of STRUCT or LIST bind records
+
+# Positional rows are accepted and receive the same DML validation as named rows.
+statement error
+SELECT * FROM oracle_execute_many('oracle_test', 'SELECT :1 FROM dual', [[1]]);
+----
+Binder Error: oracle_execute_many row 1 is invalid: oracle_execute accepts only INSERT, UPDATE, or DELETE
+
+# The streaming table-function surface is registered. A missing secret must
+# fail during binding, before any network connection is attempted.
+statement error
+SELECT * FROM oracle_query('missing_oracle_secret', 'SELECT 1 FROM dual');
+----
+Binder Error: Oracle secret 'missing_oracle_secret' was not found
+
+# ATTACH receives a secret name as its path and must fail before any network
+# request when that secret does not exist.
+statement error
+ATTACH 'missing_oracle_secret' AS missing_oracle (TYPE oracle_scanner);
+----
+Binder Error: Oracle secret 'missing_oracle_secret' was not found
