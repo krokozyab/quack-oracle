@@ -303,15 +303,26 @@ std::vector<OracleCallableSignature> ResolveOracleCallables(OracleSession &sessi
                          std::vector<uint8_t>(value.begin(), value.end()), 0});
         return ":" + std::to_string(binds.size());
     };
+    // Each bind_text call appends to `binds`, so the calls are sequenced into
+    // named locals rather than left as operands of one `+` chain. The order in
+    // which operands of `+` are evaluated is unspecified, and it really does
+    // differ: clang ran them left to right and GCC did not, which reordered the
+    // bind vector and broke the test that pins it.
     if (components.size() == 1) {
         predicate = "owner = USER AND package_name IS NULL AND object_name = " + bind_text(components[0]);
     } else if (components.size() == 2) {
-        predicate = "(owner = USER AND package_name = " + bind_text(components[0]) +
-                    " AND object_name = " + bind_text(components[1]) + ") OR (owner = " + bind_text(components[0]) +
-                    " AND package_name IS NULL AND object_name = " + bind_text(components[1]) + ")";
+        const auto own_package = bind_text(components[0]);
+        const auto own_object = bind_text(components[1]);
+        const auto other_owner = bind_text(components[0]);
+        const auto other_object = bind_text(components[1]);
+        predicate = "(owner = USER AND package_name = " + own_package + " AND object_name = " + own_object +
+                    ") OR (owner = " + other_owner + " AND package_name IS NULL AND object_name = " + other_object +
+                    ")";
     } else {
-        predicate = "owner = " + bind_text(components[0]) + " AND package_name = " + bind_text(components[1]) +
-                    " AND object_name = " + bind_text(components[2]);
+        const auto owner = bind_text(components[0]);
+        const auto package = bind_text(components[1]);
+        const auto object = bind_text(components[2]);
+        predicate = "owner = " + owner + " AND package_name = " + package + " AND object_name = " + object;
     }
     const auto sql = "SELECT owner, package_name, object_name, overload, position, argument_name, data_type, "
                      "in_out, data_level FROM all_arguments WHERE (" +
@@ -341,13 +352,18 @@ std::vector<OracleCallableSignature> ResolveOracleCallables(OracleSession &sessi
                                        std::vector<uint8_t>(value.begin(), value.end()), 0});
                 return ":" + std::to_string(retry_binds.size());
             };
+            // Sequenced into locals for the same reason as the predicate above.
             std::string retry_predicate;
             if (components.size() == 1) {
-                retry_predicate = "owner = " + bind_retry(synonym_owner) + " AND package_name IS NULL AND object_name = " +
-                                  bind_retry(synonym_object);
+                const auto owner = bind_retry(synonym_owner);
+                const auto object = bind_retry(synonym_object);
+                retry_predicate = "owner = " + owner + " AND package_name IS NULL AND object_name = " + object;
             } else {
-                retry_predicate = "owner = " + bind_retry(synonym_owner) + " AND package_name = " +
-                                  bind_retry(synonym_object) + " AND object_name = " + bind_retry(components[1]);
+                const auto owner = bind_retry(synonym_owner);
+                const auto package = bind_retry(synonym_object);
+                const auto object = bind_retry(components[1]);
+                retry_predicate =
+                    "owner = " + owner + " AND package_name = " + package + " AND object_name = " + object;
             }
             const auto retry_sql =
                 "SELECT owner, package_name, object_name, overload, position, argument_name, data_type, "

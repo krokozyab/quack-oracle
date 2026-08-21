@@ -27,6 +27,7 @@
 #include "duckdb.hpp"
 
 #include <cassert>
+#include <csignal>
 #include <cstdlib>
 #include <cstdint>
 #include <iostream>
@@ -1578,6 +1579,16 @@ void TestParallelScanShardsOneSnapshot() {
 }
 
 int main() {
+    // A failed TLS handshake against the local test server leaves the peer
+    // closed, and the next write returns EPIPE — which on Linux raises SIGPIPE
+    // and kills the process by default, while macOS sockets suppress it. That
+    // made this suite die with no output on one Linux runner and pass on
+    // another. A test binary owns its process, so ignoring the signal here is
+    // proper; the library's own exposure is a separate question.
+#ifndef _WIN32
+    std::signal(SIGPIPE, SIG_IGN);
+#endif
+
     TestQueryTypeMappingAndValues();
     TestProjectedColumns();
     TestProtocolFailuresBecomeTypedDuckDbErrors();
