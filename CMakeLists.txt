@@ -87,8 +87,16 @@ set(EXTENSION_SOURCES
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
-target_compile_features(${EXTENSION_NAME} PUBLIC cxx_std_17)
-target_compile_features(${LOADABLE_EXTENSION_NAME} PUBLIC cxx_std_17)
+# PRIVATE, not PUBLIC. PUBLIC propagates the C++17 requirement to everything
+# that links this static library, and DuckDB's own tools/plan_serializer does.
+# DuckDB itself builds at C++11, so that left one translation unit compiled at
+# 17 against a library compiled at 11 — and since `static constexpr` members are
+# implicitly inline from C++17, the two emitted a weak and a strong definition
+# of duckdb::BufferedFileWriter::DEFAULT_OPEN_FLAGS and the link failed on ELF.
+# Our own sources need the standard; nothing downstream of us does, and the
+# public header uses nothing past C++11.
+target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
+target_compile_features(${LOADABLE_EXTENSION_NAME} PRIVATE cxx_std_17)
 
 # Link OpenSSL in both the static library as the loadable extension
 target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto duckdb_miniz)

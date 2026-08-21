@@ -166,8 +166,25 @@ static std::string WriteWalletArchiveForTest(const std::string &path,
     return path;
 }
 
+// The temporary directory, honouring TMPDIR where a runner sets one. Hardcoding
+// a path is not portable: `/private/tmp` is where macOS actually keeps /tmp, and
+// it does not exist on Linux at all, so a wallet written there could not be
+// reopened and the suite aborted on the first archive test.
+static std::string TemporaryDirectory() {
+    if (const auto *configured = std::getenv("TMPDIR")) {
+        std::string directory(configured);
+        while (directory.size() > 1 && directory.back() == '/') {
+            directory.pop_back();
+        }
+        if (!directory.empty()) {
+            return directory;
+        }
+    }
+    return "/tmp";
+}
+
 static void TestWalletArchive() {
-    const auto base = "/private/tmp/oracle_scanner_wallet_archive_" +
+    const auto base = TemporaryDirectory() + "/oracle_scanner_wallet_archive_" +
                       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     const auto pem_path = base + ".pem";
     const auto zip_path = base + ".zip";
