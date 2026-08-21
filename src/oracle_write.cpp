@@ -251,7 +251,7 @@ OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, c
     OracleBind bind;
     bind.name = name;
     bind.oracle_type = column.oracle_type;
-    bind.direction = BindDirection::IN;
+    bind.direction = BindDirection::BIND_IN;
     if (value.IsNull()) {
         return bind;
     }
@@ -508,7 +508,7 @@ private:
                 OracleBind output;
                 output.name = "r" + std::to_string(column_index + 1);
                 output.oracle_type = returned_columns[column_index].oracle_type;
-                output.direction = BindDirection::OUT;
+                output.direction = BindDirection::BIND_OUT;
                 output.maximum_bytes = 32767;
                 binds.push_back(std::move(output));
             }

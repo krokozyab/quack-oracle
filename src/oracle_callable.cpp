@@ -145,10 +145,10 @@ OracleCallableBind EncodeOracleCallableArgument(const std::string &type_name,
                                                 oracle_scanner::BindDirection direction, const Value &value,
                                                 const std::string &name, const char *function_name) {
     const auto require_out_is_null = [&](const char *upper) {
-        if (direction == BindDirection::OUT && !value.IsNull()) {
+        if (direction == BindDirection::BIND_OUT && !value.IsNull()) {
             throw BinderException("%s OUT %s %s must have NULL value", function_name, upper, name);
         }
-        return direction == BindDirection::OUT;
+        return direction == BindDirection::BIND_OUT;
     };
     const auto require_value = [&](const char *upper) {
         if (value.IsNull()) {
@@ -254,7 +254,7 @@ OracleCallableBind EncodeOracleCallableArgument(const std::string &type_name,
         }
     }
     if (type_name == "cursor") {
-        if (direction != BindDirection::OUT || !value.IsNull()) {
+        if (direction != BindDirection::BIND_OUT || !value.IsNull()) {
             throw BinderException("%s cursor %s must be OUT with NULL value", function_name, name);
         }
         return {oracle_scanner::ORACLE_WIRE_TYPE_CURSOR, 4, std::nullopt};
@@ -299,7 +299,7 @@ std::vector<OracleCallableSignature> ResolveOracleCallables(OracleSession &sessi
     std::string predicate;
     std::vector<OracleBind> binds;
     const auto bind_text = [&](const std::string &value) {
-        binds.push_back({std::to_string(binds.size() + 1), 1, BindDirection::IN,
+        binds.push_back({std::to_string(binds.size() + 1), 1, BindDirection::BIND_IN,
                          std::vector<uint8_t>(value.begin(), value.end()), 0});
         return ":" + std::to_string(binds.size());
     };
@@ -337,7 +337,7 @@ std::vector<OracleCallableSignature> ResolveOracleCallables(OracleSession &sessi
         // the leading component through ALL_SYNONYMS is what turns the name the
         // caller can actually use into the name the dictionary indexes.
         std::vector<OracleBind> synonym_binds {
-            {"1", 1, BindDirection::IN, std::vector<uint8_t>(components[0].begin(), components[0].end()), 0}};
+            {"1", 1, BindDirection::BIND_IN, std::vector<uint8_t>(components[0].begin(), components[0].end()), 0}};
         const auto synonym_rows = ReadMetadataRows(
             session,
             "SELECT table_owner, table_name FROM all_synonyms WHERE synonym_name = :1 AND owner IN (USER, 'PUBLIC') "
@@ -348,7 +348,7 @@ std::vector<OracleCallableSignature> ResolveOracleCallables(OracleSession &sessi
             const auto synonym_object = TextOf(synonym_rows.front()[1]);
             std::vector<OracleBind> retry_binds;
             const auto bind_retry = [&](const std::string &value) {
-                retry_binds.push_back({std::to_string(retry_binds.size() + 1), 1, BindDirection::IN,
+                retry_binds.push_back({std::to_string(retry_binds.size() + 1), 1, BindDirection::BIND_IN,
                                        std::vector<uint8_t>(value.begin(), value.end()), 0});
                 return ":" + std::to_string(retry_binds.size());
             };
@@ -415,14 +415,14 @@ std::vector<OracleCallableSignature> ResolveOracleCallables(OracleSession &sessi
             // Position zero is a function's return value; it is always OUT and
             // it has no name of its own.
             signature.is_function = true;
-            argument.direction = BindDirection::OUT;
+            argument.direction = BindDirection::BIND_OUT;
             argument.name = "return_value";
         } else if (direction == "IN") {
-            argument.direction = BindDirection::IN;
+            argument.direction = BindDirection::BIND_IN;
         } else if (direction == "OUT") {
-            argument.direction = BindDirection::OUT;
+            argument.direction = BindDirection::BIND_OUT;
         } else if (direction == "IN/OUT") {
-            argument.direction = BindDirection::IN_OUT;
+            argument.direction = BindDirection::BIND_IN_OUT;
         } else {
             argument.unsupported_reason = "the dictionary reports direction '" + direction + "'";
         }
@@ -441,7 +441,7 @@ std::vector<OracleCallableSignature> ResolveOracleCallables(OracleSession &sessi
                 argument.maximum_bytes = bindable.maximum_bytes;
                 argument.bind_type_name = bindable.bind_type_name;
                 if (argument.oracle_type == oracle_scanner::ORACLE_WIRE_TYPE_CURSOR &&
-                    argument.direction == BindDirection::IN) {
+                    argument.direction == BindDirection::BIND_IN) {
                     argument.oracle_type = 0;
                     argument.bind_type_name.clear();
                     argument.unsupported_reason = "a REF CURSOR argument can only be OUT";

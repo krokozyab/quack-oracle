@@ -321,7 +321,7 @@ public:
         script->returning_binds.push_back(binds);
         std::vector<OracleBind> outputs;
         for (const auto &bind : binds) {
-            if (bind.direction == oracle_scanner::BindDirection::IN) {
+            if (bind.direction == oracle_scanner::BindDirection::BIND_IN) {
                 continue;
             }
             auto filled = bind;
@@ -539,7 +539,7 @@ void TestQueryParametersReachTheSessionAsBinds() {
     const auto &binds = script->query_binds[0];
     CHECK(binds.size() == 2);
     CHECK(binds[0].name == "id" && binds[0].oracle_type == 2);
-    CHECK(binds[0].direction == oracle_scanner::BindDirection::IN);
+    CHECK(binds[0].direction == oracle_scanner::BindDirection::BIND_IN);
     CHECK(binds[0].value.has_value());
     CHECK(oracle_scanner::DecodeOracleNumber(*binds[0].value) == "7");
     CHECK(binds[1].name == "label" && binds[1].oracle_type == 1);
@@ -868,8 +868,8 @@ void TestExecuteManyBatchesAndCommits() {
 // maps the session's outputs back onto the declared argument names.
 void TestNamedCallRequestAndOutputs() {
     auto script = std::make_shared<FakeScript>();
-    script->call_outputs = {{"n", 2, oracle_scanner::BindDirection::OUT, oracle_scanner::EncodeOracleNumber("7"), 22},
-                            {"t", 1, oracle_scanner::BindDirection::OUT, Text("seven"), 32}};
+    script->call_outputs = {{"n", 2, oracle_scanner::BindDirection::BIND_OUT, oracle_scanner::EncodeOracleNumber("7"), 22},
+                            {"t", 1, oracle_scanner::BindDirection::BIND_OUT, Text("seven"), 32}};
 
     auto factory = InstallFake(script);
     TestDatabase database;
@@ -887,8 +887,8 @@ void TestNamedCallRequestAndOutputs() {
     CHECK(request.kind == oracle_scanner::OracleCallableKind::PROCEDURE);
     CHECK(request.qualified_name == "app.compute");
     CHECK(request.arguments.size() == 3);
-    CHECK(request.arguments[0].direction == oracle_scanner::BindDirection::IN);
-    CHECK(request.arguments[1].direction == oracle_scanner::BindDirection::OUT);
+    CHECK(request.arguments[0].direction == oracle_scanner::BindDirection::BIND_IN);
+    CHECK(request.arguments[1].direction == oracle_scanner::BindDirection::BIND_OUT);
     CHECK(request.arguments[1].oracle_type == 2 && request.arguments[2].oracle_type == 1);
 }
 
@@ -1074,10 +1074,10 @@ void TestCallableSignatureResolution() {
     CHECK(first_bind.has_value() && std::string(first_bind->begin(), first_bind->end()) == "PKG");
 
     CHECK(signature.arguments[0].name == "P_IN" && signature.arguments[0].bind_type_name == "number" &&
-           signature.arguments[0].direction == oracle_scanner::BindDirection::IN);
-    CHECK(signature.arguments[1].direction == oracle_scanner::BindDirection::IN_OUT &&
+           signature.arguments[0].direction == oracle_scanner::BindDirection::BIND_IN);
+    CHECK(signature.arguments[1].direction == oracle_scanner::BindDirection::BIND_IN_OUT &&
            signature.arguments[1].bind_type_name == "varchar");
-    CHECK(signature.arguments[2].direction == oracle_scanner::BindDirection::OUT &&
+    CHECK(signature.arguments[2].direction == oracle_scanner::BindDirection::BIND_OUT &&
            signature.arguments[2].bind_type_name == "cursor");
     CHECK(signature.arguments[3].bind_type_name.empty() &&
            signature.arguments[3].unsupported_reason.find("LOB") != std::string::npos);
@@ -1097,7 +1097,7 @@ void TestCallableSignatureResolution() {
     const auto &function_signature = function_resolved[0];
     CHECK(function_signature.is_function);
     CHECK(function_signature.arguments[0].position == 0 && function_signature.arguments[0].name == "return_value" &&
-           function_signature.arguments[0].direction == oracle_scanner::BindDirection::OUT);
+           function_signature.arguments[0].direction == oracle_scanner::BindDirection::BIND_OUT);
 
     // Overloads all come back: which one the caller means is decided by how
     // many values they pass, and refusing outright would leave them no way to
@@ -1182,8 +1182,8 @@ void TestAutomaticCallBindsFromTheSignature() {
                        Column("DATA_TYPE", 1), Column("IN_OUT", 1),       Column("DATA_LEVEL", 2)};
     script->rows = {argument_row("1", "P_IN", "NUMBER", "IN"), argument_row("2", "P_OUT", "NUMBER", "OUT"),
                     argument_row("3", "P_BOTH", "VARCHAR2", "IN/OUT")};
-    script->call_outputs = {{"P_OUT", 2, oracle_scanner::BindDirection::OUT, Number("70")},
-                            {"P_BOTH", 1, oracle_scanner::BindDirection::IN_OUT, Text("head/tail")}};
+    script->call_outputs = {{"P_OUT", 2, oracle_scanner::BindDirection::BIND_OUT, Number("70")},
+                            {"P_BOTH", 1, oracle_scanner::BindDirection::BIND_IN_OUT, Text("head/tail")}};
 
     auto factory = InstallFake(script);
     TestDatabase database;
@@ -1199,13 +1199,13 @@ void TestAutomaticCallBindsFromTheSignature() {
     CHECK(!request.return_bind.has_value());
     CHECK(request.arguments.size() == 3);
     CHECK(request.arguments[0].name == "P_IN" && request.arguments[0].oracle_type == 2 &&
-           request.arguments[0].direction == oracle_scanner::BindDirection::IN &&
+           request.arguments[0].direction == oracle_scanner::BindDirection::BIND_IN &&
            request.arguments[0].value == oracle_scanner::EncodeOracleNumber("7"));
     // An OUT bind carries no value but must declare the buffer Oracle writes
     // into; taking that from the dictionary is the whole point of this path.
-    CHECK(request.arguments[1].name == "P_OUT" && request.arguments[1].direction == oracle_scanner::BindDirection::OUT &&
+    CHECK(request.arguments[1].name == "P_OUT" && request.arguments[1].direction == oracle_scanner::BindDirection::BIND_OUT &&
            !request.arguments[1].value.has_value() && request.arguments[1].maximum_bytes == 22);
-    CHECK(request.arguments[2].direction == oracle_scanner::BindDirection::IN_OUT &&
+    CHECK(request.arguments[2].direction == oracle_scanner::BindDirection::BIND_IN_OUT &&
            request.arguments[2].oracle_type == 1 &&
            request.arguments[2].value == std::vector<uint8_t>({'h', 'e', 'a', 'd'}));
 
@@ -1431,7 +1431,7 @@ void TestAttachedWritesAgainstAFakeSession() {
     CHECK(script->returning_statements.back() ==
            "INSERT INTO \"ITEMS\" (\"ID\") VALUES (:1) RETURNING \"ID\", \"LABEL\" INTO :r1, :r2");
     CHECK(script->returning_binds.back().size() == 3);
-    CHECK(script->returning_binds.back()[1].direction == oracle_scanner::BindDirection::OUT);
+    CHECK(script->returning_binds.back()[1].direction == oracle_scanner::BindDirection::BIND_OUT);
 
     // Two rows means two statements: the array form of RETURNING has no
     // evidence here, so each row is asked for on its own.
@@ -1502,7 +1502,7 @@ void TestFunctionsCanReturnARefCursor() {
     CHECK(script->calls[0].kind == oracle_scanner::OracleCallableKind::FUNCTION);
     CHECK(script->calls[0].return_bind.has_value());
     CHECK(script->calls[0].return_bind->oracle_type == 102);
-    CHECK(script->calls[0].return_bind->direction == oracle_scanner::BindDirection::OUT);
+    CHECK(script->calls[0].return_bind->direction == oracle_scanner::BindDirection::BIND_OUT);
 
     std::cout << "functions can return a REF CURSOR" << std::endl;
 }

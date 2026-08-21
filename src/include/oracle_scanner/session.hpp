@@ -44,12 +44,17 @@ struct OracleBatch {
     bool exhausted = false;
 };
 
-enum class BindDirection { IN, OUT, IN_OUT };
+// The enumerators carry a BIND_ prefix because Windows defines IN and OUT as
+// macros in its own headers, and an enum class does not protect against the
+// preprocessor: `{ IN, OUT, IN_OUT }` expands to `{ , , IN_OUT }` and the file
+// stops compiling. Undefining them instead would change macro state for every
+// header included after this one, which is not ours to do.
+enum class BindDirection { BIND_IN, BIND_OUT, BIND_IN_OUT };
 
 struct OracleBind {
     std::string name;
     uint16_t oracle_type = 0;
-    BindDirection direction = BindDirection::IN;
+    BindDirection direction = BindDirection::BIND_IN;
     std::optional<std::vector<uint8_t>> value;
     // Required for scalar OUT / IN OUT values when the input value does not
     // establish a buffer size. REF CURSOR has a fixed wire allocation.

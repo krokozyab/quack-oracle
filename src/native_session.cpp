@@ -300,7 +300,7 @@ uint64_t NativeOracleSession::ExecuteWithRowCount(const std::string &sql, const 
         }
         count_name += "_";
     }
-    ordered_binds.push_back({count_name, 2, BindDirection::OUT, std::nullopt, 22});
+    ordered_binds.push_back({count_name, 2, BindDirection::BIND_OUT, std::nullopt, 22});
     const auto block = "BEGIN " + sql + "; :" + count_name + " := SQL%ROWCOUNT; END;";
 
     const auto handle = statements.Open(OracleSqlKind::PLSQL);
@@ -405,7 +405,7 @@ std::vector<OracleBind> NativeOracleSession::ExecuteReturning(const std::string 
 
     std::vector<OracleBind> outputs;
     for (const auto &bind : ordered_binds) {
-        if (bind.direction != BindDirection::IN) {
+        if (bind.direction != BindDirection::BIND_IN) {
             outputs.push_back(bind);
         }
     }
@@ -453,7 +453,7 @@ OracleCallResult NativeOracleSession::Call(const OracleCallRequest &request) {
     OracleCallResult result;
     std::vector<size_t> output_indexes;
     for (size_t index = 0; index < binds.size(); index++) {
-        if (binds[index].direction != BindDirection::IN) {
+        if (binds[index].direction != BindDirection::BIND_IN) {
             output_indexes.push_back(index);
         }
     }

@@ -186,7 +186,7 @@ struct OracleCallableArgument {
     int32_t position = 0; //!< 0 is a function's return value.
     std::string name;
     std::string dictionary_type; //!< ALL_ARGUMENTS.DATA_TYPE, verbatim.
-    oracle_scanner::BindDirection direction = oracle_scanner::BindDirection::IN;
+    oracle_scanner::BindDirection direction = oracle_scanner::BindDirection::BIND_IN;
     uint16_t oracle_type = 0;
     uint32_t maximum_bytes = 0;
     std::string bind_type_name; //!< The oracle_call_named spelling of the type.

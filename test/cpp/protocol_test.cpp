@@ -834,8 +834,8 @@ static void TestTtcIoVector() {
     auto prefixed = writer.Data();
     prefixed.push_back(TTC_MESSAGE_ROW_DATA);
     CHECK(DecodeTtcIoVectorPrefix(prefixed).bytes_consumed == writer.Data().size());
-    const std::vector<OracleBind> binds = {{"c", ORACLE_WIRE_TYPE_CURSOR, BindDirection::OUT, std::nullopt},
-                                           {"id", 2, BindDirection::IN, std::vector<uint8_t> {0xc1, 0x02}}};
+    const std::vector<OracleBind> binds = {{"c", ORACLE_WIRE_TYPE_CURSOR, BindDirection::BIND_OUT, std::nullopt},
+                                           {"id", 2, BindDirection::BIND_IN, std::vector<uint8_t> {0xc1, 0x02}}};
     CHECK(GetTtcOutputBindIndexes(vector, binds) == std::vector<size_t>({0}));
     auto cursor_in_out = vector;
     cursor_in_out.directions = {TTC_BIND_DIRECTION_IN_OUT, TTC_BIND_DIRECTION_IN};
@@ -894,7 +894,7 @@ static void TestTtcOutBindsRow() {
     descriptor.WriteUB4(0).WriteUB4(0).WriteUB4(0).WriteUB4(0).WriteUB4(0).WriteUB4(0).WriteUB2(9);
     ByteWriter row;
     row.WriteByte(TTC_MESSAGE_ROW_DATA).WriteByte(1).WriteRaw(descriptor.Data()).WriteByte(0);
-    const std::vector<OracleBind> binds = {{"c", ORACLE_WIRE_TYPE_CURSOR, BindDirection::OUT, std::nullopt}};
+    const std::vector<OracleBind> binds = {{"c", ORACLE_WIRE_TYPE_CURSOR, BindDirection::BIND_OUT, std::nullopt}};
     const auto decoded = DecodeTtcOutBindsRow(row.Data(), binds, {0});
     CHECK(decoded.cursor_values.size() == 1 && decoded.cursor_values[0] && decoded.cursor_values[0]->cursor_id == 9 &&
            decoded.bytes_consumed == row.Data().size());
@@ -910,7 +910,7 @@ static void TestTtcOutBindsRow() {
 }
 
 static void TestTtcCallResponse() {
-    const std::vector<OracleBind> binds = {{"value", 1, BindDirection::OUT, std::nullopt, 32}};
+    const std::vector<OracleBind> binds = {{"value", 1, BindDirection::BIND_OUT, std::nullopt, 32}};
     ByteWriter response;
     response.WriteByte(TTC_MESSAGE_IO_VECTOR).WriteByte(0).WriteUB2(1).WriteUB4(0).WriteUB4(1).WriteUB2(0);
     response.WriteUB2(0).WriteUB2(0).WriteByte(TTC_BIND_DIRECTION_OUT);
@@ -1025,8 +1025,8 @@ static void TestTtcExecuteRefCursorBindShape() {
     TtcExecuteBindsRequest request;
     request.sql = "BEGIN :out_cur := demo.open_rows(:id); END;";
     request.is_plsql = true;
-    request.binds = {{"out_cur", ORACLE_WIRE_TYPE_CURSOR, BindDirection::OUT, std::nullopt},
-                     {"id", 2, BindDirection::IN, std::vector<uint8_t> {0xc1, 0x02}}};
+    request.binds = {{"out_cur", ORACLE_WIRE_TYPE_CURSOR, BindDirection::BIND_OUT, std::nullopt},
+                     {"id", 2, BindDirection::BIND_IN, std::vector<uint8_t> {0xc1, 0x02}}};
     const auto encoded = EncodeTtcExecuteBindsRequest(request);
     ByteReader reader(encoded);
     CHECK(reader.ReadByte() == TTC_MESSAGE_FUNCTION && reader.ReadByte() == TTC_FUNCTION_EXECUTE && reader.ReadByte() == 1);
@@ -1034,10 +1034,10 @@ static void TestTtcExecuteRefCursorBindShape() {
     const std::vector<uint8_t> cursor_placeholder {TTC_MESSAGE_ROW_DATA, 0, 2, 0xc1, 0x02};
     CHECK(std::search(encoded.begin(), encoded.end(), cursor_placeholder.begin(), cursor_placeholder.end()) != encoded.end());
 
-    request.binds.front().direction = BindDirection::IN;
+    request.binds.front().direction = BindDirection::BIND_IN;
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { EncodeTtcExecuteBindsRequest(request); });
-    request.binds.front().direction = BindDirection::OUT;
-    request.binds[1].direction = BindDirection::OUT;
+    request.binds.front().direction = BindDirection::BIND_OUT;
+    request.binds[1].direction = BindDirection::BIND_OUT;
     request.binds[1].value.reset();
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { EncodeTtcExecuteBindsRequest(request); });
 }
@@ -1049,11 +1049,11 @@ static void TestTtcExecuteRefCursorBindShape() {
 static void TestTtcExecuteArrayDml() {
     TtcExecuteBindsRequest request;
     request.sql = "insert into t (a, b) values (:1, :2)";
-    request.binds = {{"1", 2, BindDirection::IN, std::vector<uint8_t> {0xc1, 0x02}},
-                     {"2", 1, BindDirection::IN, std::vector<uint8_t> {'x'}}};
+    request.binds = {{"1", 2, BindDirection::BIND_IN, std::vector<uint8_t> {0xc1, 0x02}},
+                     {"2", 1, BindDirection::BIND_IN, std::vector<uint8_t> {'x'}}};
     request.additional_iterations = {
-        {{"1", 2, BindDirection::IN, std::vector<uint8_t> {0xc1, 0x03}},
-         {"2", 1, BindDirection::IN, std::vector<uint8_t> {'l', 'o', 'n', 'g', 'e', 'r'}}}};
+        {{"1", 2, BindDirection::BIND_IN, std::vector<uint8_t> {0xc1, 0x03}},
+         {"2", 1, BindDirection::BIND_IN, std::vector<uint8_t> {'l', 'o', 'n', 'g', 'e', 'r'}}}};
     const auto encoded = EncodeTtcExecuteBindsRequest(request);
 
     // The SQL text is the last thing before al8i4, so the execution count is
@@ -1103,9 +1103,9 @@ static void TestTtcExecuteArrayDml() {
     // Every iteration writes into the same OUT buffer, and nothing here has
     // evidence for how Oracle returns the set.
     auto out_bind = request;
-    out_bind.binds[1].direction = BindDirection::OUT;
+    out_bind.binds[1].direction = BindDirection::BIND_OUT;
     out_bind.binds[1].maximum_bytes = 16;
-    out_bind.additional_iterations[0][1].direction = BindDirection::OUT;
+    out_bind.additional_iterations[0][1].direction = BindDirection::BIND_OUT;
     out_bind.additional_iterations[0][1].maximum_bytes = 16;
     ExpectError(ProtocolErrorKind::UNSUPPORTED, [&] { EncodeTtcExecuteBindsRequest(out_bind); });
 }
@@ -1695,14 +1695,14 @@ static void TestCallRegistry() {
 }
 
 static void TestProcedureCallBuilder() {
-    const std::vector<OracleBind> arguments = {{"p_id", 0, BindDirection::IN, std::nullopt},
-                                               {"p_result", 0, BindDirection::OUT, std::nullopt}};
+    const std::vector<OracleBind> arguments = {{"p_id", 0, BindDirection::BIND_IN, std::nullopt},
+                                               {"p_result", 0, BindDirection::BIND_OUT, std::nullopt}};
     CHECK(ParseOracleCallableName("app.billing.process_invoice") == "app.billing.process_invoice");
     CHECK(ParseOracleCallableName("\"App\".\"Do Work\"") == "\"App\".\"Do Work\"");
     CHECK(BuildOracleProcedureCallBlock("app.billing.process_invoice", arguments) ==
            "BEGIN app.billing.process_invoice(p_id => :p_id, p_result => :p_result); END;");
     CHECK(BuildOracleProcedureCallBlock("app.ping", {}) == "BEGIN app.ping; END;");
-    OracleBind return_bind {"return_value", 0, BindDirection::OUT, std::nullopt};
+    OracleBind return_bind {"return_value", 0, BindDirection::BIND_OUT, std::nullopt};
     CHECK(BuildOracleFunctionCallBlock("app.billing.invoice_total", return_bind, arguments) ==
            "BEGIN :return_value := app.billing.invoice_total(p_id => :p_id, p_result => :p_result); END;");
     OracleCallRequest function_request {OracleCallableKind::FUNCTION, "app.answer", return_bind, {}};
@@ -1712,28 +1712,28 @@ static void TestProcedureCallBuilder() {
     ExpectError(ProtocolErrorKind::MALFORMED, [] { ParseOracleCallableName("app.proc; DELETE FROM x"); });
     ExpectError(ProtocolErrorKind::MALFORMED, [] { ParseOracleCallableName("\"unterminated"); });
     ExpectError(ProtocolErrorKind::MALFORMED, [&] {
-        BuildOracleProcedureCallBlock("app.proc", {{"p", 0, BindDirection::IN, std::nullopt},
-                                                     {"P", 0, BindDirection::IN, std::nullopt}});
+        BuildOracleProcedureCallBlock("app.proc", {{"p", 0, BindDirection::BIND_IN, std::nullopt},
+                                                     {"P", 0, BindDirection::BIND_IN, std::nullopt}});
     });
-    return_bind.direction = BindDirection::IN;
+    return_bind.direction = BindDirection::BIND_IN;
     ExpectError(ProtocolErrorKind::MALFORMED,
                 [&] { BuildOracleFunctionCallBlock("app.answer", return_bind, {}); });
 }
 
 static void TestBindValidation() {
-    const std::vector<OracleBind> binds = {{"id", 2, BindDirection::IN, std::vector<uint8_t> {1}},
-                                           {"label", 1, BindDirection::IN, std::nullopt}};
+    const std::vector<OracleBind> binds = {{"id", 2, BindDirection::BIND_IN, std::vector<uint8_t> {1}},
+                                           {"label", 1, BindDirection::BIND_IN, std::nullopt}};
     CHECK(CanonicalOracleBindName("p$name#1") == "P$NAME#1" && CanonicalOracleBindName("1") == "1");
     ValidateOracleBinds(binds, OracleBindUse::QUERY);
-    ValidateOracleBindBatch({binds, {{"ID", 2, BindDirection::IN, std::vector<uint8_t> {2}},
-                                     {"LABEL", 1, BindDirection::IN, std::vector<uint8_t> {'x'}}}});
+    ValidateOracleBindBatch({binds, {{"ID", 2, BindDirection::BIND_IN, std::vector<uint8_t> {2}},
+                                     {"LABEL", 1, BindDirection::BIND_IN, std::vector<uint8_t> {'x'}}}});
     ExpectError(ProtocolErrorKind::MALFORMED, [] { CanonicalOracleBindName("1bad"); });
     ExpectError(ProtocolErrorKind::MALFORMED, [&] {
-        ValidateOracleBinds({{"id", 2, BindDirection::IN, std::nullopt}, {"ID", 2, BindDirection::IN, std::nullopt}},
+        ValidateOracleBinds({{"id", 2, BindDirection::BIND_IN, std::nullopt}, {"ID", 2, BindDirection::BIND_IN, std::nullopt}},
                             OracleBindUse::DML);
     });
     ExpectError(ProtocolErrorKind::MALFORMED, [&] {
-        ValidateOracleBinds({{"out_value", 2, BindDirection::OUT, std::nullopt}}, OracleBindUse::QUERY);
+        ValidateOracleBinds({{"out_value", 2, BindDirection::BIND_OUT, std::nullopt}}, OracleBindUse::QUERY);
     });
 }
 
@@ -1742,22 +1742,22 @@ static void TestSqlBindExtraction() {
                             "from dual /* :block */ where id = :FIRST";
     const auto placeholders = ExtractOracleBindPlaceholders(sql);
     CHECK(placeholders == std::vector<std::string>({"FIRST", "1"}));
-    ValidateOracleStatementBinds(sql, {{"first", 1, BindDirection::IN, std::nullopt},
-                                       {"1", 2, BindDirection::IN, std::nullopt}},
+    ValidateOracleStatementBinds(sql, {{"first", 1, BindDirection::BIND_IN, std::nullopt},
+                                       {"1", 2, BindDirection::BIND_IN, std::nullopt}},
                                 OracleBindUse::QUERY);
     const auto ordered = OrderOracleStatementBinds("select :second, :first from dual",
-                                                   {{"first", 1, BindDirection::IN, std::nullopt},
-                                                    {"second", 2, BindDirection::IN, std::nullopt}},
+                                                   {{"first", 1, BindDirection::BIND_IN, std::nullopt},
+                                                    {"second", 2, BindDirection::BIND_IN, std::nullopt}},
                                                    OracleBindUse::QUERY);
     CHECK(ordered.size() == 2 && ordered[0].name == "second" && ordered[1].name == "first");
     ExpectError(ProtocolErrorKind::MALFORMED, [&] {
-        ValidateOracleStatementBinds(sql, {{"first", 1, BindDirection::IN, std::nullopt}}, OracleBindUse::QUERY);
+        ValidateOracleStatementBinds(sql, {{"first", 1, BindDirection::BIND_IN, std::nullopt}}, OracleBindUse::QUERY);
     });
     ExpectError(ProtocolErrorKind::MALFORMED, [] { ExtractOracleBindPlaceholders("select 'unterminated"); });
 }
 
 static void TestSqlStatementValidation() {
-    const std::vector<OracleBind> binds = {{"id", 2, BindDirection::IN, std::nullopt}};
+    const std::vector<OracleBind> binds = {{"id", 2, BindDirection::BIND_IN, std::nullopt}};
     CHECK(ClassifyOracleSql(" /* leading */ SELECT ':not_a_bind' FROM dual WHERE id = :id") == OracleSqlKind::QUERY);
     CHECK(ClassifyOracleSql("update invoices set state = 'paid' where id = :id") == OracleSqlKind::DML);
     CHECK(ClassifyOracleSql("begin app.ping; end") == OracleSqlKind::PLSQL);
@@ -1853,7 +1853,7 @@ static void TestValidatedSession() {
     auto raw = std::make_unique<TestSession>();
     auto *inner = raw.get();
     ValidatedOracleSession session(std::move(raw));
-    const std::vector<OracleBind> binds = {{"id", 2, BindDirection::IN, std::nullopt}};
+    const std::vector<OracleBind> binds = {{"id", 2, BindDirection::BIND_IN, std::nullopt}};
     session.Query("select * from invoices where id = :id", binds);
     session.Execute("delete from invoices where id = :id", binds);
     session.ExecuteBatch("update invoices set id = :id", {binds});
@@ -2033,7 +2033,7 @@ static void TestTtcExecuteStatementChannel() {
     TtcExecuteBindsRequest bound_request;
     bound_request.sql = "BEGIN demo.set_value(:value); END;";
     bound_request.is_plsql = true;
-    bound_request.binds = {{"value", 1, BindDirection::OUT, std::nullopt, 32}};
+    bound_request.binds = {{"value", 1, BindDirection::BIND_OUT, std::nullopt, 32}};
     bound_statements.ExecuteBinds(bound_handle, bound_request);
     const auto output = bound_statements.ReceivePlsqlOutBindsResponse(bound_handle, bound_request.binds);
     CHECK(output.values.scalar_values[0] == std::optional<std::vector<uint8_t>>({static_cast<uint8_t>('x')}));
@@ -2397,8 +2397,8 @@ static void TestLiveTnsNegotiation() {
     if (stage && std::string(stage) == "native_session_binds") {
         auto native = NativeOracleSession::Connect(config, RequiredEnvironment("ORA19C_PASSWORD"));
         const std::vector<OracleBind> binds = {
-            {"n", 2, BindDirection::IN, EncodeOracleNumber("42")},
-            {"label", 1, BindDirection::IN, std::vector<uint8_t> {'o', 'r', 'a'}},
+            {"n", 2, BindDirection::BIND_IN, EncodeOracleNumber("42")},
+            {"label", 1, BindDirection::BIND_IN, std::vector<uint8_t> {'o', 'r', 'a'}},
         };
         auto cursor = native->Query("SELECT :n AS n, :label AS label FROM dual", binds);
         const auto batch = cursor->Fetch(2);
@@ -2410,7 +2410,7 @@ static void TestLiveTnsNegotiation() {
     }
     if (stage && std::string(stage) == "native_session_numeric_bind") {
         auto native = NativeOracleSession::Connect(config, RequiredEnvironment("ORA19C_PASSWORD"));
-        const std::vector<OracleBind> binds = {{"n", 2, BindDirection::IN, EncodeOracleNumber("42")}};
+        const std::vector<OracleBind> binds = {{"n", 2, BindDirection::BIND_IN, EncodeOracleNumber("42")}};
         auto cursor = native->Query("SELECT :n AS n FROM dual", binds);
         const auto batch = cursor->Fetch(2);
         CHECK(batch.rows.size() == 1 && batch.rows[0].size() == 1 && batch.rows[0][0] &&
@@ -2424,8 +2424,8 @@ static void TestLiveTnsNegotiation() {
         request.kind = OracleCallableKind::PROCEDURE;
         request.qualified_name = RequiredEnvironment("ORACLE_SCANNER_LIVE_CALL_NAME");
         request.arguments = {
-            {"c", ORACLE_WIRE_TYPE_CURSOR, BindDirection::OUT, std::nullopt, 4},
-            {"n", 2, BindDirection::OUT, std::nullopt, 22},
+            {"c", ORACLE_WIRE_TYPE_CURSOR, BindDirection::BIND_OUT, std::nullopt, 4},
+            {"n", 2, BindDirection::BIND_OUT, std::nullopt, 22},
         };
         auto result = native->Call(request);
         CHECK(result.outputs.size() == 1 && result.outputs[0].value && DecodeOracleNumber(*result.outputs[0].value) == "42");
@@ -2441,7 +2441,7 @@ static void TestLiveTnsNegotiation() {
         OracleCallRequest request;
         request.kind = OracleCallableKind::FUNCTION;
         request.qualified_name = RequiredEnvironment("ORACLE_SCANNER_LIVE_CALL_NAME");
-        request.return_bind = {"r", 2, BindDirection::OUT, std::nullopt, 22};
+        request.return_bind = {"r", 2, BindDirection::BIND_OUT, std::nullopt, 22};
         auto result = native->Call(request);
         CHECK(result.outputs.size() == 1 && result.outputs[0].name == "r" && result.outputs[0].value &&
                DecodeOracleNumber(*result.outputs[0].value) == "42");
@@ -2457,7 +2457,7 @@ static void TestLiveTnsNegotiation() {
         // view instead. This also verifies that Query and Execute share one
         // authenticated native session.
         (void)native->Execute("INSERT INTO " + table + " (id) VALUES (:id)",
-                              {{"id", 2, BindDirection::IN, EncodeOracleNumber("1")}});
+                              {{"id", 2, BindDirection::BIND_IN, EncodeOracleNumber("1")}});
         auto inserted = native->Query("SELECT COUNT(*) FROM " + table, {});
         const auto visible = inserted->Fetch(2);
         CHECK(visible.rows.size() == 1 && visible.rows[0].size() == 1 && visible.rows[0][0] &&
@@ -2493,7 +2493,7 @@ static void TestLiveTnsNegotiation() {
         OracleStatementRegistry statements;
         const auto handle = statements.Open(OracleSqlKind::PLSQL);
         TtcStatementChannel channel(connection->Ttc(), statements);
-        const std::vector<OracleBind> binds = {{"c", ORACLE_WIRE_TYPE_CURSOR, BindDirection::OUT, std::nullopt, 4}};
+        const std::vector<OracleBind> binds = {{"c", ORACLE_WIRE_TYPE_CURSOR, BindDirection::BIND_OUT, std::nullopt, 4}};
         TtcExecuteBindsRequest request;
         request.sequence = 3;
         request.sql = "BEGIN OPEN :c FOR SELECT 1 AS value FROM dual; END;";
@@ -2518,7 +2518,7 @@ static void TestLiveTnsNegotiation() {
         OracleStatementRegistry statements;
         const auto handle = statements.Open(OracleSqlKind::PLSQL);
         TtcStatementChannel channel(connection->Ttc(), statements);
-        const std::vector<OracleBind> binds = {{"n", 2, BindDirection::OUT, std::nullopt, 22}};
+        const std::vector<OracleBind> binds = {{"n", 2, BindDirection::BIND_OUT, std::nullopt, 22}};
         TtcExecuteBindsRequest request;
         request.sequence = 3;
         request.sql = "BEGIN :n := 42; END;";
@@ -3281,7 +3281,7 @@ static void TestSessionFactory() {
         CHECK(seen_password == "secret");
 
         // The session the factory produced is the one the caller gets.
-        session->Execute("delete from invoices where id = :id", {{"id", 2, BindDirection::IN, std::nullopt}});
+        session->Execute("delete from invoices where id = :id", {{"id", 2, BindDirection::BIND_IN, std::nullopt}});
         CHECK(static_cast<TestSession *>(session.get())->executes == 1);
 
         // A nested installer wins while it is alive and restores the outer one.

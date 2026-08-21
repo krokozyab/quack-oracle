@@ -170,7 +170,7 @@ std::string BuildOracleProcedureCallBlock(const std::string &qualified_name,
 std::string BuildOracleFunctionCallBlock(const std::string &qualified_name, const OracleBind &return_bind,
                                          const std::vector<OracleBind> &arguments) {
     const auto callable = ParseOracleCallableName(qualified_name);
-    if (return_bind.direction == BindDirection::IN) {
+    if (return_bind.direction == BindDirection::BIND_IN) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle function return bind must be OUT or IN OUT");
     }
     if (arguments.size() > MAX_ARGUMENTS) {

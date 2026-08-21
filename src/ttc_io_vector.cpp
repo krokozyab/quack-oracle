@@ -64,7 +64,7 @@ std::vector<size_t> GetTtcOutputBindIndexes(const TtcIoVector &io_vector, const 
         // values in ROW_DATA. The request's declared mode is authoritative
         // for deciding which slots to decode; the vector is still bounded and
         // validated to one of Oracle's three known direction bytes above.
-        if (binds[index].direction != BindDirection::IN) {
+        if (binds[index].direction != BindDirection::BIND_IN) {
             result.push_back(index);
         }
     }

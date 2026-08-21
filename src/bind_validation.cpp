@@ -50,10 +50,10 @@ void ValidateOracleBinds(const std::vector<OracleBind> &binds, OracleBindUse use
         if (!names.emplace(CanonicalOracleBindName(bind.name)).second) {
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle bind names must be unique");
         }
-        if (use != OracleBindUse::CALL && bind.direction != BindDirection::IN) {
+        if (use != OracleBindUse::CALL && bind.direction != BindDirection::BIND_IN) {
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle query and DML binds must be input-only");
         }
-        if (use == OracleBindUse::CALL && bind.direction != BindDirection::IN && bind.oracle_type == 0) {
+        if (use == OracleBindUse::CALL && bind.direction != BindDirection::BIND_IN && bind.oracle_type == 0) {
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle OUT bind must declare a wire type");
         }
         if (bind.maximum_bytes > MAX_BIND_VALUE_BYTES) {

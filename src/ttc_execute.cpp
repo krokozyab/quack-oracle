@@ -57,7 +57,7 @@ uint32_t BindBufferSize(const OracleBind &bind) {
     if (bind.value) {
         return std::max<uint32_t>(1, static_cast<uint32_t>(bind.value->size()));
     }
-    if (bind.direction != BindDirection::IN) {
+    if (bind.direction != BindDirection::BIND_IN) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "scalar Oracle OUT bind must declare maximum_bytes");
     }
     return 1;
@@ -71,7 +71,7 @@ void ValidateBind(const OracleBind &bind) {
     if (bind.oracle_type == 0 || bind.oracle_type > 255 || (bind.value && bind.value->size() > MAX_BUFFER_BYTES)) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC bind has invalid type or value size");
     }
-    if (bind.oracle_type == ORACLE_WIRE_TYPE_CURSOR && bind.direction == BindDirection::IN) {
+    if (bind.oracle_type == ORACLE_WIRE_TYPE_CURSOR && bind.direction == BindDirection::BIND_IN) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC cursor bind must be OUT or IN OUT");
     }
     (void)BindBufferSize(bind);
@@ -115,7 +115,7 @@ void Validate(const TtcExecuteBindsRequest &request) {
                 throw ProtocolError(ProtocolErrorKind::MALFORMED,
                                     "TTC array DML iteration disagrees with the declared bind metadata");
             }
-            if (iteration[index].direction != BindDirection::IN) {
+            if (iteration[index].direction != BindDirection::BIND_IN) {
                 // Every iteration would write into the same OUT buffer, and
                 // nothing here has evidence for how Oracle returns the set.
                 throw ProtocolError(ProtocolErrorKind::UNSUPPORTED, "TTC array DML supports only IN binds");
