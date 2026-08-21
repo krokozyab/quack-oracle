@@ -75,8 +75,11 @@ Before submitting, three things have to be true:
 2. `EXTENSION_VERSION` in `extension_config.cmake` carries no `-dev` suffix, and
    the extension reports it: `SELECT extension_version FROM duckdb_extensions()
    WHERE extension_name = 'oracle_scanner'`.
-3. A tag exists for that commit, and `repo.ref` names it as `refs/tags/vX.Y.Z`
-   rather than a bare SHA. **Take the descriptor's schema
+3. `repo.ref` names that commit **by its full SHA**, not by a tag. A SHA cannot
+   be moved; a tag can, and the registry builds whatever the ref points at when
+   it builds — so a tag lets the thing that ships differ from the thing that was
+   reviewed. 24 of 25 published descriptors sampled pin a SHA. Tag the release
+   as well, for people rather than for the build. **Take the descriptor's schema
 from that repository's template rather than from here** — it is theirs and it
 changes. What this project has to supply it with:
 

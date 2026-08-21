@@ -35,4 +35,8 @@ extension:
 
 repo:
   github: krokozyab/quack-oracle
-  ref: refs/tags/v0.1.0
+  # The full SHA rather than a tag: a SHA cannot be moved, so what is built is
+  # exactly what was reviewed. Set this to the commit whose full distribution
+  # matrix is green; v0.1.0 tags the same commit, for people rather than for
+  # the build.
+  ref: 6f454dbe00c28fddd0132f49439eba261852e08c
