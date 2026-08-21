@@ -490,7 +490,7 @@ public:
             return SourceResultType::FINISHED;
         }
         source_state.emitted = true;
-        chunk.SetCardinality(1);
+        chunk.SetChildCardinality(1);
         chunk.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(global_state.inserted_rows)));
         return SourceResultType::FINISHED;
     }
@@ -539,7 +539,7 @@ private:
                                        return ValueFor(returned_columns[column_index], values[column_index].value);
                                    }));
             }
-            row_chunk.SetCardinality(row + 1);
+            row_chunk.SetChildCardinality(row + 1);
             global_state.inserted_rows++;
             if (row_chunk.size() == STANDARD_VECTOR_SIZE) {
                 global_state.returned->Append(row_chunk);
@@ -631,7 +631,7 @@ public:
         }
         source_state.emitted = true;
         auto &global_state = sink_state->Cast<OracleInsertGlobalState>();
-        chunk.SetCardinality(1);
+        chunk.SetChildCardinality(1);
         chunk.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(global_state.inserted_rows)));
         return SourceResultType::FINISHED;
     }

@@ -336,7 +336,7 @@ void OracleParallelFunction(ClientContext &context, TableFunctionInput &input, D
                                 }));
             }
         }
-        output.SetCardinality(batch.rows.size());
+        output.SetChildCardinality(batch.rows.size());
         if (batch.exhausted) {
             local_state.cursor->Close();
             local_state.cursor.reset();
@@ -345,7 +345,7 @@ void OracleParallelFunction(ClientContext &context, TableFunctionInput &input, D
             return;
         }
     }
-    output.SetCardinality(0);
+    output.SetChildCardinality(0);
 }
 
 } // namespace
