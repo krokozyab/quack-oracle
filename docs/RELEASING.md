@@ -55,7 +55,27 @@ scripts/run_live_stages.sh
 The submission is a pull request against
 [`duckdb/community-extensions`](https://github.com/duckdb/community-extensions),
 not a change in this repository: a descriptor file under `extensions/` naming
-this repository and the exact commit to build. **Take the descriptor's schema
+this repository and the exact commit to build.
+
+**The descriptor is written and kept here**, at
+[community-extension-description.yml](community-extension-description.yml), so
+that what was submitted stays under version control. Copy it to
+`extensions/oracle_scanner/description.yml` in a fork of their repository. Its
+field names were checked against a published descriptor; the one field it
+deliberately omits is `requires_toolchains`, because this project needs no
+toolchain beyond a C++ compiler and the OpenSSL that vcpkg resolves from
+`vcpkg.json` — which the distribution pipeline confirms by building without
+one.
+
+Before submitting, three things have to be true:
+
+1. The full distribution matrix is green on the commit being named. Run it by
+   hand from the Actions tab, or push the tag, which triggers it.
+2. `EXTENSION_VERSION` in `extension_config.cmake` carries no `-dev` suffix, and
+   the extension reports it: `SELECT extension_version FROM duckdb_extensions()
+   WHERE extension_name = 'oracle_scanner'`.
+3. A tag exists for that commit, and `repo.ref` names it as `refs/tags/vX.Y.Z`
+   rather than a bare SHA. **Take the descriptor's schema
 from that repository's template rather than from here** — it is theirs and it
 changes. What this project has to supply it with:
 
