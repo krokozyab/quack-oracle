@@ -34,6 +34,7 @@ SELECT * FROM oracle_query('ora', 'SELECT id, label FROM app.items');
 10. [Troubleshooting](#10-troubleshooting)
 11. [Build and test from source](#11-build-and-test-from-source)
 12. [Security, limits, further reading](#12-security-limits-further-reading)
+13. [Try it yourself](#13-try-it-yourself)
 
 ---
 
@@ -77,7 +78,7 @@ Two things to know here:
   you ask it to. In a client library, pass the `allow_unsigned_extensions`
   setting instead.
 - **The DuckDB versions must match exactly.** This builds against DuckDB
-  v1.5.4, and v1.5.4 is the only version that will load it.
+  v1.5.5, and v1.5.5 is the only version that will load it.
 
 Check that it worked:
 
@@ -85,6 +86,9 @@ Check that it worked:
 SELECT extension_name, loaded FROM duckdb_extensions()
 WHERE extension_name = 'oracle_scanner';
 ```
+
+No Oracle to point at yet? [§13](#13-try-it-yourself) starts a free one in a
+container, creates a small demo schema, and walks every feature against it.
 
 ---
 
@@ -147,7 +151,8 @@ CREATE SECRET ora_tls (
 | `USER`, `PASSWORD` | Your Oracle credentials |
 | `PROTOCOL` | `tcp` (the default) or `tcps` for TLS |
 | `TNS_ALIAS` | An alias from the `tnsnames.ora` inside the wallet ZIP — use *instead of* HOST/PORT/SERVICE_NAME |
-| `WALLET_FILE`, `WALLET_PASSWORD` | A cloud wallet ZIP, or an `ewallet.pem` bundle |
+| `WALLET_FILE` | A cloud wallet ZIP, or an `ewallet.pem` bundle |
+| `WALLET_PASSWORD` | The password the wallet's encrypted key is locked with — **required** for an OCI wallet, and different from the ADMIN/user password |
 | `TLS_SERVER_NAME` | The name checked against the server certificate |
 | `TLS_SNI_NAME` | Only when the endpoint is an IP or a different virtual host |
 | `TLS_CA_FILE` | An explicit PEM trust list; system roots are then not used |
@@ -444,10 +449,10 @@ you need it. Writing a LOB is not supported.
 
 ## 10. Troubleshooting
 
-### `The file was built specifically for DuckDB version 'v1.5.4'`
+### `The file was built specifically for DuckDB version 'v1.5.5'`
 
 Your DuckDB is a different version. Use the shell this project built
-(`./build/release/duckdb`), or install DuckDB v1.5.4.
+(`./build/release/duckdb`), or install DuckDB v1.5.5.
 
 ### DuckDB refuses the extension as unsigned
 
@@ -509,6 +514,15 @@ a plain `oracle_query`.
 Too many failed logins locked the Oracle account. Ask a DBA to unlock it — and
 check for a stale password in an old secret.
 
+### `OpenSSL could not decrypt the client private key in wallet PEM`
+
+The wallet password is wrong or missing. An OCI wallet's `ewallet.pem` holds an
+encrypted private key, and `WALLET_PASSWORD` must be the password you set when
+you downloaded the wallet — not the database (ADMIN) password. Note that
+SQL\*Plus connects through the passwordless `cwallet.sso` in the same ZIP, so a
+wallet that opens fine there still needs `WALLET_PASSWORD` here. If it is lost,
+download the wallet again and set a new one.
+
 ---
 
 ## 11. Build and test from source
@@ -564,3 +578,331 @@ captures to this repository.
 
 This is an independent community project and is not affiliated with Oracle or
 DuckDB Labs.
+
+---
+
+## 13. Try it yourself
+
+Everything below runs against a demo schema this repository ships, so you can
+follow it end to end without touching a real database. It takes about five
+minutes: get an Oracle, create six demo objects, then walk every feature.
+
+Each example shows what it actually prints — the output here was captured from
+a real run, not written by hand.
+
+### 13.1 Get an Oracle to point at
+
+**A container, free and local.** `gvenzl/oracle-free` needs no Oracle account:
+
+```sh
+docker run -d --name oracle-demo -p 1521:1521 -e ORACLE_PASSWORD=demo_password \
+    gvenzl/oracle-free:slim
+docker logs -f oracle-demo   # wait for "DATABASE IS READY TO USE!"
+```
+
+That gives you service `FREEPDB1` on port 1521, user `system`. Oracle's own
+`container-registry.oracle.com/database/free` works the same way, and a 19c
+image built from [Oracle's docker-images](https://github.com/oracle/docker-images)
+serves `ORCLPDB1` instead.
+
+**Oracle Autonomous Database, free forever.** Create an Always Free ADB in the
+OCI console, then **Database connection → Download wallet**. You get a
+`Wallet_<name>.zip`; keep it somewhere private. Its `tnsnames.ora` holds aliases
+like `<name>_low`, `<name>_medium`, `<name>_high` — you connect by alias, and the
+extension reads the wallet out of the ZIP in memory. Nothing is unpacked to disk.
+
+### 13.2 Create the demo schema
+
+[`examples/demo_setup.sql`](examples/demo_setup.sql) creates six objects and is
+safe to re-run — it drops its own tables first. It works unchanged on 19c, 23ai
+Free and Autonomous, in whatever schema you connect as.
+
+| Object | What it is there for |
+| --- | --- |
+| `QUACK_DEMO_DEPARTMENTS` | 4 rows to scan, filter and read in parallel. `LOCATION` and `HEADCOUNT` are NULL in one row on purpose. |
+| `QUACK_DEMO_LOG` | An IDENTITY key and a `DEFAULT SYSDATE`, to write to. |
+| `QUACK_DEMO_TYPES` | One row holding one column of every type in [§9](#9-which-oracle-types-work). |
+| `QUACK_DEMO_ADD` | A function, for a return value. |
+| `QUACK_DEMO_GREET` | A procedure with an `OUT` argument. |
+| `QUACK_DEMO_LIST` | A procedure returning a `SYS_REFCURSOR`. |
+
+In a container:
+
+```sh
+docker cp examples/demo_setup.sql oracle-demo:/tmp/
+docker exec -i oracle-demo bash -c \
+    'sqlplus -s system/$ORACLE_PASSWORD@localhost:1521/FREEPDB1 @/tmp/demo_setup.sql'
+```
+
+On Autonomous, the easiest route is **Database Actions → SQL** in the OCI
+console: paste the file and run it. With a local SQL\*Plus and the wallet
+unpacked into `$TNS_ADMIN`, `sqlplus admin/<password>@<name>_low @examples/demo_setup.sql`
+does the same.
+
+Either way it ends by listing what it made:
+
+```
+QUACK_DEMO_ADD          FUNCTION    VALID
+QUACK_DEMO_DEPARTMENTS  TABLE       VALID
+QUACK_DEMO_GREET        PROCEDURE   VALID
+QUACK_DEMO_LIST         PROCEDURE   VALID
+QUACK_DEMO_LOG          TABLE       VALID
+QUACK_DEMO_TYPES        TABLE       VALID
+```
+
+### 13.3 Connect
+
+Start DuckDB with the extension loaded ([§1](#1-install)), then create a secret.
+Against the container:
+
+```sql
+CREATE SECRET demo (
+    TYPE oracle, HOST '127.0.0.1', PORT 1521,
+    SERVICE_NAME 'FREEPDB1', USER 'system', PASSWORD 'demo_password'
+);
+```
+
+Against Autonomous — alias instead of host, the wallet ZIP as you downloaded it,
+and the **wallet password you set when you downloaded it**:
+
+```sql
+CREATE SECRET demo (
+    TYPE oracle,
+    TNS_ALIAS 'mydb_low',
+    USER 'ADMIN', PASSWORD '<your ADMIN password>',
+    WALLET_FILE '/secure/Wallet_mydb.zip',
+    WALLET_PASSWORD '<the wallet password, not the ADMIN password>'
+);
+```
+
+The alias carries the host, port, service and TLS settings, so those fields must
+not be repeated — the extension rejects the combination rather than guessing
+which wins.
+
+`WALLET_PASSWORD` is **required** for an OCI wallet, and it is a different secret
+from the ADMIN password. The extension authenticates with the encrypted private
+key in the wallet's `ewallet.pem`, which is locked by the wallet password. (A
+SQL client like SQL\*Plus connects through the wallet's passwordless
+`cwallet.sso` instead, so it never asks for it — which is exactly why a wallet
+that "works in SQL\*Plus" still needs `WALLET_PASSWORD` here.) If you have lost
+it, download the wallet again from **Database connection → Download wallet** and
+set a new one; the error when it is wrong or missing is:
+
+> OpenSSL could not decrypt the client private key in wallet PEM
+
+Check the connection, and that the password is not readable back:
+
+```sql
+SELECT * FROM oracle_query('demo', 'SELECT user FROM DUAL');
+SELECT name, type, secret_string FROM duckdb_secrets();
+```
+```
+┌─────────┐    name=demo;type=oracle;provider=config;serializable=true;scope;
+│  USER   │    host=127.0.0.1;password=redacted;port=1521;
+│ SYSTEM  │    service_name=FREEPDB1;user=system
+└─────────┘
+```
+
+### 13.4 Read
+
+```sql
+SELECT * FROM oracle_query('demo',
+    'SELECT department_id, department_name FROM quack_demo_departments ORDER BY 1');
+```
+```
+┌───────────────┬─────────────────┐
+│ DEPARTMENT_ID │ DEPARTMENT_NAME │
+├───────────────┼─────────────────┤
+│            10 │ ACCOUNTING      │
+│            20 │ RESEARCH        │
+│            30 │ SALES           │
+│            40 │ OPERATIONS      │
+└───────────────┴─────────────────┘
+```
+
+Never paste values into the SQL — bind them, by name or by position:
+
+```sql
+SELECT * FROM oracle_query('demo',
+    'SELECT * FROM quack_demo_departments WHERE headcount > :min', {'min': 20});
+
+SELECT * FROM oracle_query('demo',
+    'SELECT * FROM quack_demo_departments WHERE department_id BETWEEN :1 AND :2', [10, 30]);
+```
+
+### 13.5 Mount the whole schema
+
+```sql
+ATTACH 'demo' AS ora (TYPE oracle_scanner);
+SHOW ALL TABLES;
+SELECT * FROM ora.QUACK_DEMO_DEPARTMENTS WHERE HEADCOUNT > 20;
+```
+
+Nothing is read from Oracle's dictionary until you ask for it: `ATTACH` costs a
+single round trip, a table's columns are fetched when the table is first named,
+and the whole schema's column metadata arrives in one query rather than one per
+table.
+
+The types come back as [§9](#9-which-oracle-types-work) promises — this is what
+`QUACK_DEMO_TYPES` is for:
+
+```sql
+DESCRIBE ora.QUACK_DEMO_TYPES;
+```
+```
+N_INT      bigint        -- NUMBER(5,0)
+N_DECIMAL  decimal(10,5) -- NUMBER(10,5)
+N_ANY      varchar       -- unconstrained NUMBER: exact only as text
+V, C       varchar       -- VARCHAR2, CHAR
+D          timestamp     -- an Oracle DATE carries a time
+TS         timestamp     -- TIMESTAMP(6)
+TS_NS      timestamp_ns  -- TIMESTAMP(9)
+TS_TZ      varchar       -- keeps the offset TIMESTAMPTZ would drop
+R          blob          -- RAW
+BF, BD     float, double -- BINARY_FLOAT, BINARY_DOUBLE
+```
+
+### 13.6 Push the filtering into Oracle
+
+```sql
+SET oracle_filter_pushdown = true;
+
+SELECT DEPARTMENT_NAME, HEADCOUNT FROM ora.QUACK_DEMO_DEPARTMENTS WHERE HEADCOUNT > 20;
+SELECT DEPARTMENT_NAME FROM ora.QUACK_DEMO_DEPARTMENTS WHERE LOCATION IS NULL;
+SELECT DEPARTMENT_NAME FROM ora.QUACK_DEMO_DEPARTMENTS WHERE DEPARTMENT_ID IN (10, 30);
+SELECT DEPARTMENT_NAME FROM ora.QUACK_DEMO_DEPARTMENTS WHERE DEPARTMENT_NAME = 'SALES';
+SELECT D FROM ora.QUACK_DEMO_TYPES WHERE D = TIMESTAMP '2024-03-01 00:00:00';
+```
+
+All five are sent to Oracle. These three are refused, by name, instead of being
+approximated — and the message tells you how to turn pushdown off:
+
+```sql
+SELECT * FROM ora.QUACK_DEMO_DEPARTMENTS WHERE DEPARTMENT_NAME > 'A';
+-- ordered comparison on a column that is not NUMBER, DATE or TIMESTAMP
+--   (text ordering follows NLS_SORT/NLS_COMP, which this client never negotiates)
+
+SELECT * FROM ora.QUACK_DEMO_DEPARTMENTS WHERE DEPARTMENT_NAME = '';
+-- a comparison against an empty string, which Oracle treats as NULL
+
+SELECT D FROM ora.QUACK_DEMO_TYPES WHERE D = TIMESTAMP '2024-03-01 00:00:00.5';
+-- a sub-second constant compared against a DATE column, which stores whole seconds
+```
+
+Note that `= 'SALES'` **is** pushed while `> 'A'` is not: equality does not
+depend on collation, ordering does.
+
+### 13.7 Write, with real transactions
+
+```sql
+BEGIN TRANSACTION;
+INSERT INTO ora.QUACK_DEMO_LOG (LABEL, AMOUNT) VALUES ('first', 10.50);
+SELECT LOG_ID, LABEL, AMOUNT FROM ora.QUACK_DEMO_LOG;   -- sees its own uncommitted row
+ROLLBACK;
+SELECT count(*) FROM ora.QUACK_DEMO_LOG;                -- 0: Oracle rolled back too
+```
+
+Columns you do not name are left out of the statement, so Oracle's `IDENTITY`
+and `DEFAULT` still apply, and `RETURNING` asks Oracle what it actually stored:
+
+```sql
+INSERT INTO ora.QUACK_DEMO_LOG (LABEL) VALUES ('with-defaults')
+RETURNING LOG_ID, LABEL, LOGGED_AT;
+```
+```
+┌────────┬───────────────┬─────────────────────┐
+│ LOG_ID │     LABEL     │      LOGGED_AT      │
+│ 2      │ with-defaults │ 2026-08-22 09:40:53 │
+└────────┴───────────────┴─────────────────────┘
+```
+
+`UPDATE` and `DELETE` find rows by Oracle's ROWID, so the table needs no primary
+key:
+
+```sql
+UPDATE ora.QUACK_DEMO_LOG SET AMOUNT = 99.99 WHERE LABEL = 'with-defaults';
+DELETE FROM ora.QUACK_DEMO_LOG WHERE LABEL = 'with-defaults';
+```
+
+Outside a transaction you can also send one statement, or a whole batch as
+Oracle array DML — one parse, one round trip:
+
+```sql
+SELECT * FROM oracle_execute_many('demo',
+    'INSERT INTO QUACK_DEMO_LOG (LABEL, AMOUNT) VALUES (:label, :amount)',
+    [{'label': 'a', 'amount': 1.5}, {'label': 'b', 'amount': 2.5}]);
+-- affected_rows = 2
+
+SELECT * FROM oracle_execute('demo',
+    'DELETE FROM QUACK_DEMO_LOG WHERE LABEL IN (:1, :2)', ['a', 'b']);
+-- affected_rows = 2
+```
+
+### 13.8 Call the procedures
+
+Ask what the arguments are first — the answer comes from `ALL_ARGUMENTS`,
+resolving synonyms:
+
+```sql
+SELECT position, argument_name, direction, oracle_type
+FROM oracle_arguments('demo', 'QUACK_DEMO_GREET');
+```
+```
+┌──────────┬───────────────┬───────────┬─────────────┐
+│        1 │ P_NAME        │ in        │ VARCHAR2    │
+│        2 │ P_GREETING    │ out       │ VARCHAR2    │
+└──────────┴───────────────┴───────────┴─────────────┘
+```
+
+Then supply one text value per argument, in declaration order, `NULL` for each
+`OUT` slot:
+
+```sql
+SELECT * FROM oracle_call_auto('demo', 'QUACK_DEMO_ADD',   ['2', '3']);
+-- return_value = 5
+SELECT * FROM oracle_call_auto('demo', 'QUACK_DEMO_GREET', ['world', NULL]);
+-- P_GREETING = hello, world
+```
+
+A `SYS_REFCURSOR` comes back as a handle you read once:
+
+```sql
+SELECT * FROM oracle_call_auto('demo', 'QUACK_DEMO_LIST', [NULL]);
+-- P_ROWS  NULL  oracle:1:1
+SELECT * FROM oracle_cursor('oracle:1:1');
+```
+```
+┌───────────────┬─────────────────┐
+│ DEPARTMENT_ID │ DEPARTMENT_NAME │
+├───────────────┼─────────────────┤
+│            10 │ ACCOUNTING      │
+│            20 │ RESEARCH        │
+│            30 │ SALES           │
+│            40 │ OPERATIONS      │
+└───────────────┴─────────────────┘
+```
+
+### 13.9 Read one table through several sessions
+
+```sql
+SELECT count(*) FROM oracle_scan_parallel('demo',
+    'QUACK_DEMO_DEPARTMENTS', 'DEPARTMENT_ID', shards := 4);
+```
+
+Four rows through four sessions is pointless in itself — the point is that every
+shard reads `AS OF SCN` at one change number taken before any of them start, so
+the result is one snapshot. Against a real table, compare it with
+`SELECT count(*) FROM ora.QUACK_DEMO_DEPARTMENTS`: the numbers must agree.
+
+This needs `EXECUTE` on `SYS.DBMS_FLASHBACK` and `FLASHBACK` on the table. If
+the database will not give out a change number, the scan is refused rather than
+run unpinned.
+
+### 13.10 Clean up
+
+```sh
+docker exec -i oracle-demo bash -c \
+    'sqlplus -s system/$ORACLE_PASSWORD@localhost:1521/FREEPDB1' < examples/demo_teardown.sql
+```
+
+Or, in DuckDB, just `DETACH ora; DROP SECRET demo;` and stop the container.
