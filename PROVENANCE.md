@@ -11,7 +11,7 @@ evidence itself.
 | Source | What is taken | Terms |
 | --- | --- | --- |
 | DuckDB extension template and `extension-ci-tools` | the build system, the loadable-extension scaffolding, and the CI distribution pipeline | MIT |
-| DuckDB itself (submodule, pinned `v1.5.4`) | linked as a library; `duckdb_miniz` is compiled from its vendored copy for bounded in-memory wallet ZIP reading | MIT |
+| DuckDB itself (submodule, pinned `v1.5.5`) | linked as a library; `duckdb_miniz` is compiled from its vendored copy for bounded in-memory wallet ZIP reading | MIT |
 | OpenSSL | linked, not vendored: TLS transport and the digest and cipher primitives O5LOGON needs | Apache-2.0 |
 | python-oracledb Thin | **reasoning and invariants, not code and not bytes.** It is the upstream of the protocol invariants recorded in comments throughout `src/`: which field, bit or length a client sends, and what breaks otherwise. | Apache-2.0 / UPL |
 
