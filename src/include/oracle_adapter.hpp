@@ -12,6 +12,8 @@
 #include "oracle_scanner/value_codec.hpp"
 
 #include "duckdb.hpp"
+
+#include <cstdint>
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/planner/table_filter.hpp"

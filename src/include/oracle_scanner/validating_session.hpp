@@ -2,6 +2,7 @@
 
 #include "oracle_scanner/session.hpp"
 
+#include <cstdint>
 #include <memory>
 
 namespace oracle_scanner {

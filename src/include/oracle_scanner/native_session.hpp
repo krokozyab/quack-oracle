@@ -5,6 +5,7 @@
 #include "oracle_scanner/tns_client.hpp"
 #include "oracle_scanner/ttc_statement_channel.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <vector>
 

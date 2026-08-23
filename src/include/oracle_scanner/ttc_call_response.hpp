@@ -6,6 +6,7 @@
 #include "oracle_scanner/ttc_out_binds.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <vector>
 

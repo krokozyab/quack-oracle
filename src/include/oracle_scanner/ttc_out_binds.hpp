@@ -5,6 +5,7 @@
 #include "oracle_scanner/ttc_io_vector.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <vector>
 
