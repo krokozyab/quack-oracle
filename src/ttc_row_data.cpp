@@ -28,7 +28,7 @@ TtcRowDataPrefix DecodeTtcRowDataPrefix(const std::vector<uint8_t> &message, con
         const auto locator_size = reader.ReadUB4();
         if (locator_size == 0) {
             // A NULL LOB, framed like any other NULL.
-            result.push_back(std::nullopt);
+            result.emplace_back(std::nullopt);
             continue;
         }
         if (locator_size > MAX_LOB_LOCATOR_BYTES) {
@@ -44,7 +44,7 @@ TtcRowDataPrefix DecodeTtcRowDataPrefix(const std::vector<uint8_t> &message, con
         if (!locator || locator->size() != locator_size) {
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC LOB locator length disagrees with its prefix");
         }
-        result.push_back(std::move(*locator));
+        result.push_back(std::move(locator));
     }
     return {std::move(result), reader.Position()};
 }

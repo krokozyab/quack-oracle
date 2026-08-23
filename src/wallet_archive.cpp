@@ -13,7 +13,17 @@ namespace oracle_scanner {
 
 namespace {
 
-using namespace duckdb_miniz;
+using duckdb_miniz::mz_free;
+using duckdb_miniz::mz_uint;
+using duckdb_miniz::mz_zip_archive;
+using duckdb_miniz::mz_zip_archive_file_stat;
+using duckdb_miniz::mz_zip_reader_end;
+using duckdb_miniz::mz_zip_reader_extract_to_heap;
+using duckdb_miniz::mz_zip_reader_file_stat;
+using duckdb_miniz::mz_zip_reader_get_num_files;
+using duckdb_miniz::mz_zip_reader_init_mem;
+using duckdb_miniz::mz_zip_is_zip64;
+using duckdb_miniz::mz_zip_zero_struct;
 
 constexpr size_t MAX_WALLET_ARCHIVE_BYTES = 16U << 20U;
 constexpr size_t MAX_WALLET_ARCHIVE_ENTRIES = 32;

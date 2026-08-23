@@ -172,7 +172,7 @@ void WriteBindValues(ByteWriter &writer, const std::vector<OracleBind> &binds) {
             // OUT SYS_REFCURSOR has metadata but no client-side value.
             writer.WriteByte(0);
         } else if (bind.value) {
-            writer.WriteLengthPrefixed(*bind.value);
+            writer.WriteLengthPrefixed(bind.value);
         } else {
             writer.WriteByte(0);
         }

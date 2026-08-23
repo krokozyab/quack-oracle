@@ -471,7 +471,7 @@ OracleCallResult NativeOracleSession::Call(const OracleCallRequest &request) {
                 }
                 const auto cursor_handle = statements.Open(OracleSqlKind::QUERY);
                 channel->CompleteExecute(cursor_handle, true, descriptor->cursor_id);
-                result.explicit_cursors.push_back(std::make_unique<NativeOracleCursor>(
+                result.explicit_cursors.emplace_back(std::make_unique<NativeOracleCursor>(
                     *channel, next_sequence, lifetime, cursor_handle, descriptor->columns, std::vector<TtcRowData> {}, false,
                     connection->TtcServerFieldVersion()));
             } else {
@@ -483,7 +483,7 @@ OracleCallResult NativeOracleSession::Call(const OracleCallRequest &request) {
     for (const auto &descriptor : decoded.implicit_cursors) {
         const auto cursor_handle = statements.Open(OracleSqlKind::QUERY);
         channel->CompleteExecute(cursor_handle, true, descriptor.cursor_id);
-        result.implicit_cursors.push_back(std::make_unique<NativeOracleCursor>(
+        result.implicit_cursors.emplace_back(std::make_unique<NativeOracleCursor>(
             *channel, next_sequence, lifetime, cursor_handle, descriptor.columns, std::vector<TtcRowData> {}, false,
             connection->TtcServerFieldVersion()));
     }

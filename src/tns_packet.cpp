@@ -78,7 +78,8 @@ std::vector<std::vector<uint8_t>> EncodeTnsDataPackets(const std::vector<uint8_t
         std::vector<uint8_t> payload(2 + count);
         payload[0] = static_cast<uint8_t>(data_flags >> 8U);
         payload[1] = static_cast<uint8_t>(data_flags);
-        std::copy(ttc_payload.begin() + offset, ttc_payload.begin() + offset + count, payload.begin() + 2);
+        const auto chunk_begin = ttc_payload.begin() + static_cast<std::ptrdiff_t>(offset);
+        std::copy(chunk_begin, chunk_begin + static_cast<std::ptrdiff_t>(count), payload.begin() + 2);
         result.push_back(EncodeTnsPacket(TnsPacketType::DATA, 0, payload, large_length));
         offset += count;
     } while (offset < ttc_payload.size());

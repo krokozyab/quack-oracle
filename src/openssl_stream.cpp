@@ -122,7 +122,7 @@ static void RequireOpenSsl(int result, const char *operation) {
 
 static std::string DrainOpenSslErrors() {
     std::string result;
-    for (unsigned long error = ERR_get_error(); error != 0; error = ERR_get_error()) {
+    for (auto error = ERR_get_error(); error != 0; error = ERR_get_error()) {
         char text[256];
         ERR_error_string_n(error, text, sizeof(text));
         if (!result.empty()) {
@@ -156,6 +156,11 @@ static PemInfoPtr ReadPemInfo(const std::string &pem, const std::string &passwor
     if (!bio) {
         throw ProtocolError(ProtocolErrorKind::INVALID_STATE, std::string("OpenSSL could not allocate PEM BIO while ") + operation);
     }
+    // OpenSSL's password callback takes the user datum as `void *`, so the
+    // const has to come off to pass it. PemPasswordCallback only reads it, and
+    // copying the password to a non-const buffer would put a second copy of a
+    // secret in memory for no gain.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
     auto *info = PEM_X509_INFO_read_bio(bio.get(), nullptr, PemPasswordCallback, const_cast<std::string *>(&password));
     if (!info) {
         ERR_clear_error();
@@ -196,7 +201,9 @@ static void LoadClientIdentityFromPem(SSL_CTX *context, const std::string &pem, 
     if (!key_bio) {
         throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "OpenSSL could not allocate wallet key BIO");
     }
+    // Same reason as above: the callback datum is a `void *` in OpenSSL's API.
     auto private_key = PrivateKeyPtr(PEM_read_bio_PrivateKey(key_bio.get(), nullptr, PemPasswordCallback,
+                                                             // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
                                                              const_cast<std::string *>(&password)),
                                       EVP_PKEY_free);
     X509 *certificate = nullptr;
@@ -232,7 +239,11 @@ static void LoadClientIdentityFromPem(SSL_CTX *context, const std::string &pem, 
             ERR_clear_error();
             throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "OpenSSL failed while loading client certificate chain");
         }
-        chain_certificate.release(); // SSL_CTX owns successfully added chain certificates.
+        // SSL_CTX owns successfully added chain certificates, so the unique_ptr
+        // has to stop owning this one. The released pointer is deliberately
+        // dropped: ownership moved, it was not leaked.
+        // NOLINTNEXTLINE(bugprone-unused-return-value)
+        chain_certificate.release();
     }
     RequireOpenSsl(SSL_CTX_check_private_key(context), "checking client private key");
 }
@@ -410,7 +421,7 @@ std::unique_ptr<OpenSslByteStream> OpenSslByteStream::Connect(const std::string 
             }
             char *subject_data = nullptr;
             const auto subject_size = BIO_get_mem_data(rendered.get(), &subject_data);
-            const std::string subject(subject_data, subject_data + std::max<long>(subject_size, 0));
+            const std::string subject(subject_data, subject_data + std::max<decltype(subject_size)>(subject_size, 0));
             if (!OracleServerDnMatches(tls.expected_server_dn, subject)) {
                 // The DN is never reported back: it is the thing being checked,
                 // and echoing it turns a failed check into an oracle for it.

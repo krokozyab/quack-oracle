@@ -77,7 +77,12 @@ TtcPlsqlOutBindsResponse DecodeTtcPlsqlOutBindsResponse(const std::vector<uint8_
     const std::vector<uint8_t> row_message(message.begin() + static_cast<std::ptrdiff_t>(io_vector.bytes_consumed),
                                            message.end());
     auto values = DecodeTtcOutBindsRow(row_message, binds, output_indexes, ttc_field_version);
-    return {io_vector, output_indexes, std::move(values), io_vector.bytes_consumed + values.bytes_consumed};
+    // Read the count before the move: a braced initializer is evaluated left to
+    // right, so `values` is already moved from by the time the last element is
+    // computed, and reading a moved-from member is unspecified even where a
+    // trivially copyable one happens to survive.
+    const auto row_bytes = values.bytes_consumed;
+    return {io_vector, output_indexes, std::move(values), io_vector.bytes_consumed + row_bytes};
 }
 
 } // namespace oracle_scanner

@@ -77,7 +77,7 @@ OracleClientIdentity CurrentOracleClientIdentity(const std::string &program) {
         throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "could not determine Oracle client host name");
     }
     result.machine = hostname;
-    result.process_id = std::to_string(static_cast<unsigned long>(getpid()));
+    result.process_id = std::to_string(static_cast<int64_t>(getpid()));
 #elif defined(_WIN32)
     char hostname[256] = {};
     DWORD hostname_size = sizeof(hostname);

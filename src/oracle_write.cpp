@@ -93,6 +93,7 @@ struct OracleWriteState final : ClientContextState {
     std::vector<std::shared_ptr<OracleSession>> TakeAll() noexcept {
         std::lock_guard<std::mutex> guard(lock);
         std::vector<std::shared_ptr<OracleSession>> sessions;
+        sessions.reserve(pinned.size());
         for (auto &entry : pinned) {
             sessions.push_back(std::move(entry.second));
         }

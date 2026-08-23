@@ -37,15 +37,17 @@ public:
 
 private:
     Node ParseNode(size_t depth) {
-        if (depth > 16 || position >= input.size() || input[position++] != '(') {
+        if (depth > 16 || position >= input.size() || input[position] != '(') {
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle descriptor nesting is invalid");
         }
+        position++;
         SkipWhitespace();
         auto key = ParseAtom('=');
         SkipWhitespace();
-        if (position >= input.size() || input[position++] != '=') {
+        if (position >= input.size() || input[position] != '=') {
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle descriptor key has no value");
         }
+        position++;
         SkipWhitespace();
         Node result;
         result.key = Upper(key);
@@ -58,9 +60,10 @@ private:
             result.value = ParseAtom(')');
         }
         SkipWhitespace();
-        if (position >= input.size() || input[position++] != ')') {
+        if (position >= input.size() || input[position] != ')') {
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle descriptor node is unterminated");
         }
+        position++;
         return result;
     }
 
@@ -309,7 +312,8 @@ std::string FindTnsAliasDescriptor(const std::string &tnsnames, const std::strin
             while (cursor < end && std::isspace(static_cast<unsigned char>(tnsnames[cursor]))) {
                 cursor++;
             }
-            if (Upper(name) == expected && cursor < end && tnsnames[cursor++] == '=') {
+            if (Upper(name) == expected && cursor < end && tnsnames[cursor] == '=') {
+                cursor++;
                 while (cursor < tnsnames.size() && std::isspace(static_cast<unsigned char>(tnsnames[cursor]))) {
                     cursor++;
                 }

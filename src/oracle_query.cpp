@@ -901,7 +901,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallInit(ClientContext &context, Tabl
         std::vector<std::unique_ptr<oracle_scanner::OracleCursor>> owned;
         owned.reserve(1);
         for (auto &cursor : result.explicit_cursors) {
-            owned.push_back(std::make_unique<SessionOwningCursor>(session, std::move(cursor)));
+            owned.emplace_back(std::make_unique<SessionOwningCursor>(session, std::move(cursor)));
         }
         const auto handles = CallRegistryFor(context).Register(std::move(owned));
         std::vector<std::string> formatted;
@@ -953,7 +953,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallImplicitInit(ClientContext &conte
         std::vector<std::unique_ptr<oracle_scanner::OracleCursor>> owned;
         owned.reserve(result.implicit_cursors.size());
         for (auto &cursor : result.implicit_cursors) {
-            owned.push_back(std::make_unique<SessionOwningCursor>(session, std::move(cursor)));
+            owned.emplace_back(std::make_unique<SessionOwningCursor>(session, std::move(cursor)));
         }
         const auto handles = CallRegistryFor(context).Register(std::move(owned));
         std::vector<std::string> formatted;
@@ -1011,7 +1011,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallCursorsInit(ClientContext &contex
         std::vector<std::unique_ptr<oracle_scanner::OracleCursor>> owned;
         owned.reserve(result.explicit_cursors.size());
         for (auto &cursor : result.explicit_cursors) {
-            owned.push_back(std::make_unique<SessionOwningCursor>(session, std::move(cursor)));
+            owned.emplace_back(std::make_unique<SessionOwningCursor>(session, std::move(cursor)));
         }
         const auto handles = CallRegistryFor(context).Register(std::move(owned));
         std::vector<std::string> formatted;
@@ -1149,7 +1149,7 @@ unique_ptr<FunctionData> OracleCallAutoBind(ClientContext &context, TableFunctio
     }
     for (const auto &child : ListValue::GetChildren(input.inputs[2])) {
         if (child.IsNull()) {
-            result->values.push_back(Value(LogicalType::VARCHAR));
+            result->values.emplace_back(LogicalType::VARCHAR);
             continue;
         }
         if (child.type().id() != LogicalTypeId::VARCHAR) {
@@ -1232,7 +1232,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallAutoInit(ClientContext &context, 
                 if (result.explicit_cursors.empty()) {
                     throw BinderException("oracle_call_auto expected a REF CURSOR return value");
                 }
-                owned.push_back(
+                owned.emplace_back(
                     std::make_unique<SessionOwningCursor>(session, std::move(result.explicit_cursors[cursor_index++])));
                 cursor_rows.push_back(rows.size());
             } else {
@@ -1256,7 +1256,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallAutoInit(ClientContext &context, 
                 if (cursor_index >= result.explicit_cursors.size()) {
                     throw BinderException("oracle_call_auto cursor output count disagrees with Oracle response");
                 }
-                owned.push_back(
+                owned.emplace_back(
                     std::make_unique<SessionOwningCursor>(session, std::move(result.explicit_cursors[cursor_index++])));
                 cursor_rows.push_back(rows.size());
             } else {
@@ -1313,7 +1313,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallNamedInit(ClientContext &context,
                 if (cursor_index >= result.explicit_cursors.size()) {
                     throw BinderException("oracle_call_named cursor output count disagrees with Oracle response");
                 }
-                owned.push_back(std::make_unique<SessionOwningCursor>(session, std::move(result.explicit_cursors[cursor_index++])));
+                owned.emplace_back(std::make_unique<SessionOwningCursor>(session, std::move(result.explicit_cursors[cursor_index++])));
                 cursor_rows.push_back(rows.size());
             } else {
                 if (scalar_index >= result.outputs.size() || result.outputs[scalar_index].oracle_type != argument.oracle_type) {
@@ -1434,7 +1434,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallNamedFunctionInit(ClientContext &
             if (result.explicit_cursors.empty()) {
                 throw BinderException("oracle_call_named_function expected a REF CURSOR return value");
             }
-            owned.push_back(
+            owned.emplace_back(
                 std::make_unique<SessionOwningCursor>(session, std::move(result.explicit_cursors[cursor_index++])));
             cursor_rows.push_back(rows.size());
         } else if (result.outputs[0].value) {
@@ -1451,7 +1451,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallNamedFunctionInit(ClientContext &
                 if (cursor_index >= result.explicit_cursors.size()) {
                     throw BinderException("oracle_call_named_function cursor output count disagrees with Oracle response");
                 }
-                owned.push_back(std::make_unique<SessionOwningCursor>(session, std::move(result.explicit_cursors[cursor_index++])));
+                owned.emplace_back(std::make_unique<SessionOwningCursor>(session, std::move(result.explicit_cursors[cursor_index++])));
                 cursor_rows.push_back(rows.size());
             } else {
                 if (scalar_index >= result.outputs.size() || result.outputs[scalar_index].oracle_type != argument.oracle_type) {
@@ -1572,6 +1572,7 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
     std::vector<OracleColumn> columns;
     OpenProjectedScan(context, bind, selected, session, cursor, columns);
     std::vector<LogicalType> types;
+    types.reserve(columns.size());
     for (const auto &column : columns) {
         types.push_back(TypeFor(column));
     }

@@ -47,7 +47,7 @@ struct OracleParallelBindData final : TableFunctionData {
 };
 
 struct OracleParallelGlobalState final : GlobalTableFunctionState {
-    OracleParallelGlobalState(idx_t shards_p) : shards(shards_p) {
+    explicit OracleParallelGlobalState(idx_t shards_p) : shards(shards_p) {
     }
 
     idx_t MaxThreads() const override {
@@ -146,7 +146,7 @@ unique_ptr<FunctionData> OracleParallelBind(ClientContext &context, TableFunctio
     if (key_parts.size() != 1) {
         throw BinderException("oracle_scan_parallel takes one key column");
     }
-    const auto key_name = key_parts[0];
+    const auto &key_name = key_parts[0];
     const auto key = KeywordHelper::WriteQuoted(key_name, '"');
 
     idx_t shards = 0;
@@ -341,7 +341,7 @@ void OracleParallelFunction(ClientContext &context, TableFunctionInput &input, D
             local_state.cursor->Close();
             local_state.cursor.reset();
         }
-        if (batch.rows.size() != 0) {
+        if (!batch.rows.empty()) {
             return;
         }
     }

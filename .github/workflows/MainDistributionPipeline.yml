@@ -63,8 +63,31 @@ jobs:
       # exclude it, so this is the ordinary choice rather than a retreat.
       exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw'
 
+  # clang-tidy over this project's own sources. Not the reusable code-quality
+  # workflow: its tidy target filters translation units with the regex
+  # `$(PROJ_DIR)src/.*/`, which requires a slash after `src/`. Every source here
+  # is `src/*.cpp`, so the filter matched nothing and the job passed having
+  # checked no files — green, and meaningless. scripts/tidy.sh runs the same
+  # check list from duckdb/.clang-tidy against the files that actually exist,
+  # needs no compile database, and does not configure DuckDB, so it takes about
+  # a minute.
+  tidy:
+    name: clang-tidy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install clang-tidy and OpenSSL
+        run: sudo apt-get update && sudo apt-get install -y clang-tidy libssl-dev pkg-config
+
+      - name: Run clang-tidy
+        run: scripts/tidy.sh
+
   code-quality-check:
     name: Code Quality Check
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata
     with:
       duckdb_version: v1.5.5
