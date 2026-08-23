@@ -20,8 +20,53 @@ SELECT * FROM oracle_query('ora', 'SELECT id, label FROM app.items');
 
 ---
 
+## If you know Oracle but not DuckDB
+
+Most people who need this extension arrive from the Oracle side, so here is the
+part that is usually assumed.
+
+**DuckDB is not a server.** There is no listener, no instance to start, no
+tnsnames on its side, nothing to administer. It is a library that runs inside
+whatever process opened it — think SQLite, but columnar and built for analytical
+SQL. You open it, you query, you close it. A database can even live entirely in
+memory and leave nothing behind.
+
+**An extension is a plugin for it.** `oracle_scanner` is a single file that
+DuckDB loads at runtime, after which DuckDB itself speaks Oracle's TNS/TTC
+protocol. Nothing else is installed on the machine, and nothing is installed on
+your Oracle server — from the database's point of view, another client
+connected.
+
+**Why put it between you and Oracle at all?** Because once Oracle is one source
+among many, joining `APP.ORDERS` to a Parquet file, a CSV export, or a
+PostgreSQL table is one `SELECT`, and moving rows between them is one `INSERT`.
+That is what a small analytical engine buys you here — not faster access to
+Oracle alone.
+
+Terms you will meet below, in Oracle terms:
+
+| In DuckDB | The closest thing you already know |
+| --- | --- |
+| `duckdb` shell | `sqlplus` / SQLcl — the client you type SQL into |
+| secret | stored credentials for a connection; the Oracle equivalent of what you keep in a wallet or a connect string |
+| `TNS_ALIAS` in a secret | an alias from `tnsnames.ora` — the extension reads it out of the wallet ZIP itself |
+| table function (`oracle_query(...)`) | a pipelined table function: something you `SELECT` *from* |
+| `ATTACH` | closest to a database link, but pointing the other way: DuckDB mounts your Oracle schema, not the reverse |
+| catalog | one attached database; its schema and tables keep their Oracle names |
+| filter pushdown | predicate sent to Oracle instead of being evaluated after the fetch |
+| vector / chunk | a batch of rows, like `arraysize` in SQL\*Plus, but columnar |
+
+**What this does not replace.** Data Pump and GoldenGate — this is not export,
+import, or replication. `ora2pg` — that converts schemas and PL/SQL, this moves
+data. A database link inside Oracle — that lets Oracle reach out, this lets you
+reach in without installing anything on the server. RMAN — no backup here of any
+kind.
+
+---
+
 ## Contents
 
+0. [If you know Oracle but not DuckDB](#if-you-know-oracle-but-not-duckdb)
 1. [Install](#1-install)
 2. [Connect to a database](#2-connect-to-a-database)
 3. [Read data](#3-read-data)
@@ -159,6 +204,19 @@ CREATE SECRET ora_tls (
 | `TLS_SERVER_CERT_DN` | Require this exact certificate subject, in addition to the hostname |
 | `CONNECT_TIMEOUT`, `READ_TIMEOUT` | Socket timeouts in seconds |
 
+**A service name, not a SID.** The connect descriptor this client builds always
+uses `(CONNECT_DATA=(SERVICE_NAME=...))`; there is no `SID` field. On an older
+non-CDB instance where you are used to connecting by SID, ask the database for a
+service name it also answers to:
+
+```sql
+SELECT value FROM v$parameter WHERE name = 'service_names';
+```
+
+or read them off the listener with `lsnrctl services`. Every supported Oracle
+version registers at least one service name, so this is a lookup, not a
+migration.
+
 **Certificate and hostname verification are always on and cannot be turned
 off.** That is deliberate: there is no insecure mode to fall back to. TLS
 fields combined with plain `tcp` are rejected rather than quietly ignored, so a
@@ -234,10 +292,23 @@ SELECT count(*) FROM o.ORDERS;
 
 The thing in quotes is the **secret name**, not a connection string.
 
-You get the tables and views of the user you connected as. Names come back as
-Oracle stores them, which is upper case unless they were created quoted — so
-`o.ITEMS`, not `o.items`. `DESCRIBE` works, and `NOT NULL` columns and primary
-keys show up in `duckdb_constraints()`.
+You get the tables and views of the user you connected as — the same set
+`USER_TABLES` and `USER_VIEWS` would give you, resolved lazily as you name them
+rather than all at once. Names come back as Oracle stores them, which is upper
+case unless they were created quoted — so `o.ITEMS`, not `o.items`. `DESCRIBE`
+works, and `NOT NULL` columns and primary keys show up in
+`duckdb_constraints()`.
+
+The dictionary queries you would reach for have local equivalents here, so you
+can stay in one SQL dialect:
+
+| Instead of | Use |
+| --- | --- |
+| `SELECT table_name FROM user_tables` | `SHOW ALL TABLES` |
+| `DESC APP.ITEMS` | `DESCRIBE o.ITEMS` |
+| `SELECT * FROM user_tab_columns` | `SELECT * FROM duckdb_columns()` |
+| `SELECT * FROM user_constraints` | `SELECT * FROM duckdb_constraints()` |
+| `SELECT * FROM all_arguments` | `SELECT * FROM oracle_arguments('ora', 'APP.PROC')` |
 
 You can also `INSERT`, `UPDATE` and `DELETE` here — see the next section.
 
