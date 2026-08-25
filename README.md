@@ -636,6 +636,10 @@ cannot inspect the binary.
   a Community Extensions submission needs.
 - **[PROVENANCE.md](PROVENANCE.md)** — what this project reuses and from where,
   plus every byte of recorded wire traffic in the tree with its SHA-256.
+- **[Moving Oracle to PostgreSQL with a Single `INSERT`](https://medium.com/@rudenko.s/moving-oracle-to-postgresql-with-a-single-insert-no-oracle-client-no-python-3efc99baaa40)**
+  — a worked write-up of the whole pattern: the load as one statement, sharding
+  the read across sessions under one snapshot, and reconciling both databases
+  without dragging the tables across the network.
 
 Guarantees that hold by construction: no Oracle client is linked or loaded (CI
 checks the shipped binary on every build); no password, wallet password, key or
