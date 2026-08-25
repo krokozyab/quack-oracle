@@ -13,10 +13,10 @@ CREATE SECRET ora (TYPE oracle, HOST 'db.example.com', PORT 1521,
 SELECT * FROM oracle_query('ora', 'SELECT id, label FROM app.items');
 ```
 
-> **Status:** version 0.1.0-dev, and honest about it. Reads, writes, procedure
-> calls and TLS are verified against live Oracle 19c, Oracle Free 23ai, and OCI
-> Autonomous Database. It is not yet published to DuckDB Community Extensions,
-> so today you build it yourself — see [Install](#1-install).
+> **Status:** version 0.2.0, published to DuckDB Community Extensions — one
+> `INSTALL` and you are done, see [Install](#1-install). Reads, writes,
+> procedure calls and TLS are verified against live Oracle 19c, Oracle Free
+> 23ai, and OCI Autonomous Database.
 
 ---
 
@@ -85,45 +85,35 @@ kind.
 
 ## 1. Install
 
-The extension is not on DuckDB Community Extensions yet, so there is no
-`INSTALL oracle_scanner` yet. Build it once:
+The extension is in DuckDB Community Extensions, so installing it is two
+statements:
+
+```sql
+INSTALL oracle_scanner FROM community;
+LOAD oracle_scanner;
+```
+
+A signed binary for your platform is downloaded once and stays installed; no
+`-unsigned` flag, no build, and nothing from an Oracle client comes with it.
+Version 0.2.0 targets **DuckDB v1.5.5**, which is the DuckDB version that will
+load it.
+
+Prefer to build from source — to hack on it, or to run against a DuckDB you
+built yourself? That path still works:
 
 ```sh
 git clone --recurse-submodules https://github.com/krokozyab/quack-oracle.git
 cd quack-oracle
 make release
-```
-
-You need a C++17 compiler, CMake, and OpenSSL. The first build compiles DuckDB
-itself and takes a while — twenty to forty minutes is normal. Later builds are
-much faster.
-
-That produces two things you can use:
-
-**The simplest way — use the DuckDB shell it just built.** The extension is
-already inside it:
-
-```sh
 ./build/release/duckdb -unsigned
 ```
 
-**Or load it into your own DuckDB.** The extension file is at
-`build/release/extension/oracle_scanner/oracle_scanner.duckdb_extension`:
-
-```sh
-duckdb -unsigned
-```
-```sql
-LOAD '/path/to/quack-oracle/build/release/extension/oracle_scanner/oracle_scanner.duckdb_extension';
-```
-
-Two things to know here:
-
-- **`-unsigned` is required.** DuckDB only loads extensions it did not sign if
-  you ask it to. In a client library, pass the `allow_unsigned_extensions`
-  setting instead.
-- **The DuckDB versions must match exactly.** This builds against DuckDB
-  v1.5.5, and v1.5.5 is the only version that will load it.
+You need a C++17 compiler, CMake, and OpenSSL. The first build compiles DuckDB
+itself and takes twenty to forty minutes; later builds are much faster. A
+locally built extension is unsigned, so loading it into another DuckDB needs
+`duckdb -unsigned` (or the `allow_unsigned_extensions` setting in a client
+library) and the file at
+`build/release/extension/oracle_scanner/oracle_scanner.duckdb_extension`.
 
 Check that it worked:
 
@@ -525,8 +515,9 @@ you need it. Writing a LOB is not supported.
 
 ### `The file was built specifically for DuckDB version 'v1.5.5'`
 
-Your DuckDB is a different version. Use the shell this project built
-(`./build/release/duckdb`), or install DuckDB v1.5.5.
+Your DuckDB is a different version. Install DuckDB v1.5.5 and run
+`INSTALL oracle_scanner FROM community` again, or, if you built from source,
+use the shell this project produced (`./build/release/duckdb`).
 
 ### DuckDB refuses the extension as unsigned
 
