@@ -1190,11 +1190,10 @@ static void TestTtcErrorCarriesADmlRowId() {
 // sockets and signals. Porting them to Winsock would be a second
 // implementation of the thing under test, so they are simply not built on
 // Windows — everything else in this suite is portable and still runs there.
-#if !defined(_WIN32)
-// A local TLS server, so certificate verification can be tested against cases
-// no live endpoint offers: an expired certificate, and the wallet-free path
-// where the client presents nothing and trusts an explicit CA. Everything is
-// loopback and in-memory; nothing here talks to Oracle.
+// A throwaway certificate and key, used both by the local TLS server below and
+// by the wallet tests. It is pure OpenSSL with no sockets in it, so it lives
+// outside the !_WIN32 guard: the server needs loopback and does not build on
+// Windows, while the wallet tests do build there and need an identity.
 namespace local_tls {
 
 struct Identity {
@@ -1251,6 +1250,16 @@ static Identity MakeIdentity(const std::string &common_name, long not_before_sec
         [&](BIO *bio) { return PEM_write_bio_PrivateKey(bio, key.get(), nullptr, nullptr, 0, nullptr, nullptr); });
     return identity;
 }
+
+} // namespace local_tls
+
+#if !defined(_WIN32)
+// A local TLS server, so certificate verification can be tested against cases
+// no live endpoint offers: an expired certificate, and the wallet-free path
+// where the client presents nothing and trusts an explicit CA. Everything is
+// loopback and in-memory; nothing here talks to Oracle.
+namespace local_tls {
+
 
 // Accepts exactly one connection, completes the handshake, and closes. The
 // client under test only needs the handshake's verdict.
@@ -3571,7 +3580,8 @@ static void TestSsoWallet() {
 
     // And the archive path: a wallet ZIP holding only cwallet.sso resolves
     // without a password, exactly as it does for SQL*Plus and JDBC.
-    const auto base = TemporaryDirectory() + "/oracle_scanner_sso_" + std::to_string(::getpid());
+    const auto base = TemporaryDirectory() + "/oracle_scanner_sso_" +
+                      std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     const auto sso_only_path = base + "_sso.zip";
     WriteWalletArchiveForTest(sso_only_path, {{"cwallet.sso", wallet}, {"tnsnames.ora", "unit_low = (description=)"}});
     CHECK(ReadWalletIdentityPem(sso_only_path, false) == pem);
