@@ -73,6 +73,7 @@
 #include "miniz.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
