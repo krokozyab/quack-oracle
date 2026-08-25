@@ -196,7 +196,7 @@ std::unique_ptr<NativeOracleSession> NativeOracleSession::Connect(const Connecti
             tls.ca_pem_contents = ReadPemFile(config.tls_ca_file);
         }
         if (!config.wallet_pem_file.empty()) {
-            tls.client_pem_contents = ReadWalletPemFile(config.wallet_pem_file);
+            tls.client_pem_contents = ReadWalletIdentityPem(config.wallet_pem_file, !config.wallet_password.empty());
         }
         tls.client_pem_password = config.wallet_password;
         tls.expected_server_dn = config.tls_server_cert_dn;

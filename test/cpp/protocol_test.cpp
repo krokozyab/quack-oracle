@@ -8,6 +8,7 @@
 
 #include <openssl/evp.h>
 #include <openssl/pem.h>
+#include <openssl/pkcs12.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
@@ -66,6 +67,7 @@
 #include "oracle_scanner/session_factory.hpp"
 #include "oracle_scanner/session_pool.hpp"
 #include "oracle_scanner/value_codec.hpp"
+#include "oracle_scanner/sso_wallet.hpp"
 #include "oracle_scanner/wallet_archive.hpp"
 
 #include "miniz.hpp"
@@ -2087,13 +2089,33 @@ static void TestLiveTnsNegotiation() {
         return;
     }
     ConnectionConfig config;
-    config.host = RequiredEnvironment("ORA19C_HOST");
-    config.service_name = RequiredEnvironment("ORA19C_SERVICE");
+    // An Autonomous endpoint is normally reached through its wallet's
+    // tnsnames.ora rather than a hand-written host/port/service, so the lane
+    // accepts an alias and resolves it the same way the adapter does.
+    const auto live_alias = std::getenv("ORACLE_SCANNER_LIVE_TNS_ALIAS");
+    if (live_alias && live_alias[0] != '\0') {
+        const auto descriptor =
+            FindTnsAliasDescriptor(ReadWalletTnsNamesArchive(RequiredEnvironment("ORACLE_SCANNER_LIVE_WALLET_FILE")),
+                                   live_alias);
+        const auto parsed = ParseConnectDescriptor(descriptor);
+        if (parsed.endpoints.size() != 1) {
+            throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                                "ORACLE_SCANNER_LIVE_TNS_ALIAS must resolve to exactly one ADDRESS");
+        }
+        config.host = parsed.endpoints[0].host;
+        config.port = parsed.endpoints[0].port;
+        config.service_name = parsed.service_name;
+        config.protocol = parsed.endpoints[0].protocol;
+        config.tls_server_cert_dn = parsed.server_cert_dn;
+    } else {
+        config.host = RequiredEnvironment("ORA19C_HOST");
+        config.service_name = RequiredEnvironment("ORA19C_SERVICE");
+    }
     if (const auto user = std::getenv("ORA19C_USER")) {
         config.user = user;
     }
-    const auto port_text = RequiredEnvironment("ORA19C_PORT");
-    const auto port = std::strtoul(port_text, nullptr, 10);
+    const auto port_text = live_alias && live_alias[0] != '\0' ? nullptr : RequiredEnvironment("ORA19C_PORT");
+    const auto port = port_text ? std::strtoul(port_text, nullptr, 10) : config.port;
     if (port == 0 || port > 65535) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "ORA19C_PORT is invalid");
     }
@@ -2106,12 +2128,22 @@ static void TestLiveTnsNegotiation() {
                                 "ORACLE_SCANNER_LIVE_PROTOCOL must be tcps when it is set");
         }
         config.protocol = TransportProtocol::TCPS;
-        config.tls_server_name = RequiredEnvironment("ORACLE_SCANNER_LIVE_TLS_SERVER_NAME");
+        // Optional, as it is in a secret: an empty server name verifies against
+        // the host being connected to, which is what an alias-resolved
+        // Autonomous endpoint wants.
+        if (const auto tls_server_name = std::getenv("ORACLE_SCANNER_LIVE_TLS_SERVER_NAME")) {
+            config.tls_server_name = tls_server_name;
+        }
         if (const auto tls_sni_name = std::getenv("ORACLE_SCANNER_LIVE_TLS_SNI_NAME")) {
             config.tls_sni_name = tls_sni_name;
         }
         config.wallet_pem_file = RequiredEnvironment("ORACLE_SCANNER_LIVE_WALLET_FILE");
-        config.wallet_password = RequiredEnvironment("ORACLE_SCANNER_LIVE_WALLET_PASSWORD");
+        // Optional since the wallet's cwallet.sso opens without one. Leaving it
+        // unset is what exercises the auto-login path against a real database;
+        // setting it selects the encrypted ewallet.pem instead.
+        if (const auto wallet_password = std::getenv("ORACLE_SCANNER_LIVE_WALLET_PASSWORD")) {
+            config.wallet_password = wallet_password;
+        }
     }
     if (const auto client_program = std::getenv("ORACLE_SCANNER_LIVE_CLIENT_PROGRAM")) {
         config.client_program = client_program;
@@ -2121,7 +2153,8 @@ static void TestLiveTnsNegotiation() {
         tls.server_name = config.tls_server_name;
         tls.sni_name = config.tls_sni_name.empty() ? config.host : config.tls_sni_name;
         if (!config.wallet_pem_file.empty()) {
-            tls.client_pem_contents = ReadWalletPemFile(config.wallet_pem_file);
+            tls.client_pem_contents =
+                ReadWalletIdentityPem(config.wallet_pem_file, !config.wallet_password.empty());
         }
         tls.client_pem_password = config.wallet_password;
     }
@@ -3405,6 +3438,167 @@ static void TestAuthCrypto() {
                 [&] { BuildO5LogonResponse("password", challenge, client_key, password_salt, speedy_key_salt); });
 }
 
+// Builds a wallet in the shape Oracle's auto-login store has, from a throwaway
+// identity generated here. Nothing in this suite may carry real wallet bytes:
+// a cwallet.sso is credential material, so the only honest fixture is one the
+// test makes itself.
+static std::string BuildAutoLoginWallet(const local_tls::Identity &identity, const std::string &store_password,
+                                        unsigned char flavour = '6') {
+    std::unique_ptr<BIO, decltype(&BIO_free)> certificate_bio(
+        BIO_new_mem_buf(identity.certificate_pem.data(), static_cast<int>(identity.certificate_pem.size())), BIO_free);
+    std::unique_ptr<X509, decltype(&X509_free)> certificate(
+        PEM_read_bio_X509(certificate_bio.get(), nullptr, nullptr, nullptr), X509_free);
+    std::unique_ptr<BIO, decltype(&BIO_free)> key_bio(
+        BIO_new_mem_buf(identity.key_pem.data(), static_cast<int>(identity.key_pem.size())), BIO_free);
+    std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> key(
+        PEM_read_bio_PrivateKey(key_bio.get(), nullptr, nullptr, nullptr), EVP_PKEY_free);
+    CHECK(certificate && key);
+
+    std::unique_ptr<PKCS12, decltype(&PKCS12_free)> store(
+        PKCS12_create(store_password.c_str(), "oracle_scanner test", key.get(), certificate.get(), nullptr, 0, 0, 0, 0,
+                      0),
+        PKCS12_free);
+    CHECK(store);
+    unsigned char *encoded = nullptr;
+    const auto encoded_size = i2d_PKCS12(store.get(), &encoded);
+    CHECK(encoded_size > 0 && encoded != nullptr);
+    const std::string pkcs12(reinterpret_cast<const char *>(encoded), static_cast<size_t>(encoded_size));
+    OPENSSL_free(encoded);
+
+    // The header wraps the store password with AES-128-CBC under a key kept in
+    // the file itself and the fixed IV the format uses.
+    const std::string wrapping_key(16, '\x11');
+    const std::array<unsigned char, 16> iv = {0xC0, 0x34, 0xD8, 0x31, 0x1C, 0x02, 0xCE, 0xF8,
+                                              0x51, 0xF0, 0x14, 0x4B, 0x81, 0xED, 0x4B, 0xF2};
+    std::string padded = store_password;
+    const auto padding = static_cast<size_t>(16 - (padded.size() % 16));
+    padded.append(padding, static_cast<char>(padding));
+    std::string wrapped(padded.size(), '\0');
+    std::unique_ptr<EVP_CIPHER_CTX, decltype(&EVP_CIPHER_CTX_free)> cipher(EVP_CIPHER_CTX_new(), EVP_CIPHER_CTX_free);
+    CHECK(cipher);
+    CHECK(EVP_EncryptInit_ex(cipher.get(), EVP_aes_128_cbc(), nullptr,
+                             reinterpret_cast<const unsigned char *>(wrapping_key.data()), iv.data()) == 1);
+    EVP_CIPHER_CTX_set_padding(cipher.get(), 0);
+    int produced = 0;
+    CHECK(EVP_EncryptUpdate(cipher.get(), reinterpret_cast<unsigned char *>(wrapped.data()), &produced,
+                            reinterpret_cast<const unsigned char *>(padded.data()),
+                            static_cast<int>(padded.size())) == 1);
+    int final_produced = 0;
+    CHECK(EVP_EncryptFinal_ex(cipher.get(), reinterpret_cast<unsigned char *>(wrapped.data()) + produced,
+                              &final_produced) == 1);
+    wrapped.resize(static_cast<size_t>(produced) + static_cast<size_t>(final_produced));
+
+    const auto header_size = static_cast<uint32_t>(1 + wrapping_key.size() + wrapped.size());
+    std::string wallet;
+    wallet.push_back(static_cast<char>(0xA1));
+    wallet.push_back(static_cast<char>(0xF8));
+    wallet.push_back(static_cast<char>(0x4E));
+    wallet.push_back(static_cast<char>(flavour));
+    const auto append_big_endian = [&wallet](uint32_t value) {
+        wallet.push_back(static_cast<char>((value >> 24U) & 0xFFU));
+        wallet.push_back(static_cast<char>((value >> 16U) & 0xFFU));
+        wallet.push_back(static_cast<char>((value >> 8U) & 0xFFU));
+        wallet.push_back(static_cast<char>(value & 0xFFU));
+    };
+    append_big_endian(6);
+    append_big_endian(header_size);
+    wallet.push_back(static_cast<char>(0x06));
+    wallet.append(wrapping_key);
+    wallet.append(wrapped);
+    wallet.append(pkcs12);
+    return wallet;
+}
+
+static void TestSsoWallet() {
+    const auto identity = local_tls::MakeIdentity("sso.example.com", -3600, 3600);
+    const auto wallet = BuildAutoLoginWallet(identity, "store-password");
+
+    CHECK(HasSsoWalletMagic(wallet));
+    CHECK(!HasSsoWalletMagic("not a wallet"));
+
+    // The whole point: the identity comes back without anyone supplying the
+    // store password, because the header carried it.
+    const auto pem = SsoWalletToPem(wallet);
+    CHECK(pem.find("-----BEGIN PRIVATE KEY-----") != std::string::npos);
+    CHECK(pem.find("-----BEGIN CERTIFICATE-----") != std::string::npos);
+
+    // And the recovered identity is the one that went in, not merely something
+    // that parses: the certificate must match the private key.
+    std::unique_ptr<BIO, decltype(&BIO_free)> pem_bio(BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size())),
+                                                      BIO_free);
+    std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> recovered_key(
+        PEM_read_bio_PrivateKey(pem_bio.get(), nullptr, nullptr, nullptr), EVP_PKEY_free);
+    std::unique_ptr<X509, decltype(&X509_free)> recovered_certificate(
+        PEM_read_bio_X509(pem_bio.get(), nullptr, nullptr, nullptr), X509_free);
+    CHECK(recovered_key && recovered_certificate);
+    CHECK(X509_check_private_key(recovered_certificate.get(), recovered_key.get()) == 1);
+
+    // A wallet locked to the machine that made it is refused by name rather
+    // than failing later inside OpenSSL with nothing to act on.
+    const auto local_wallet = BuildAutoLoginWallet(identity, "store-password", '8');
+    ExpectError(ProtocolErrorKind::UNSUPPORTED, [&] { (void)SsoWalletToPem(local_wallet); });
+
+    auto foreign_magic = wallet;
+    foreign_magic[1] = static_cast<char>(0x00);
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)SsoWalletToPem(foreign_magic); });
+
+    auto unknown_version = wallet;
+    unknown_version[3] = '9';
+    ExpectError(ProtocolErrorKind::UNSUPPORTED, [&] { (void)SsoWalletToPem(unknown_version); });
+
+    auto unknown_header_version = wallet;
+    unknown_header_version[7] = static_cast<char>(0x07);
+    ExpectError(ProtocolErrorKind::UNSUPPORTED, [&] { (void)SsoWalletToPem(unknown_header_version); });
+
+    auto unknown_password_kind = wallet;
+    unknown_password_kind[12] = static_cast<char>(0x42);
+    ExpectError(ProtocolErrorKind::UNSUPPORTED, [&] { (void)SsoWalletToPem(unknown_password_kind); });
+
+    ExpectError(ProtocolErrorKind::TRUNCATED, [&] { (void)SsoWalletToPem(wallet.substr(0, 10)); });
+    ExpectError(ProtocolErrorKind::TRUNCATED, [&] { (void)SsoWalletToPem(wallet.substr(0, 13)); });
+    ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [] { (void)SsoWalletToPem(std::string()); });
+
+    // Header claims more wrapped password than the file holds.
+    auto oversized_header = wallet;
+    oversized_header[10] = static_cast<char>(0x40);
+    ExpectError(ProtocolErrorKind::TRUNCATED, [&] { (void)SsoWalletToPem(oversized_header); });
+
+    // A payload that is no longer a PKCS#12 store, with the header intact.
+    auto broken_payload = wallet;
+    broken_payload[wallet.size() - 1] = static_cast<char>(~broken_payload[wallet.size() - 1]);
+    broken_payload[45] = static_cast<char>(0x00);
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)SsoWalletToPem(broken_payload); });
+
+    // And the archive path: a wallet ZIP holding only cwallet.sso resolves
+    // without a password, exactly as it does for SQL*Plus and JDBC.
+    const auto base = TemporaryDirectory() + "/oracle_scanner_sso_" + std::to_string(::getpid());
+    const auto sso_only_path = base + "_sso.zip";
+    WriteWalletArchiveForTest(sso_only_path, {{"cwallet.sso", wallet}, {"tnsnames.ora", "unit_low = (description=)"}});
+    CHECK(ReadWalletIdentityPem(sso_only_path, false) == pem);
+    CHECK(ReadWalletIdentityPem(sso_only_path, true) == pem);
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)ReadWalletPemArchive(sso_only_path); });
+
+    // With both members present the password decides which one is used.
+    const auto both_path = base + "_both.zip";
+    const auto plain_pem = identity.certificate_pem + identity.key_pem;
+    WriteWalletArchiveForTest(both_path, {{"cwallet.sso", wallet}, {"ewallet.pem", plain_pem}});
+    CHECK(ReadWalletIdentityPem(both_path, false) == pem);
+    CHECK(ReadWalletIdentityPem(both_path, true) == plain_pem);
+
+    // A wallet path pointing straight at cwallet.sso works too.
+    const auto sso_file_path = base + ".sso";
+    {
+        std::ofstream output(sso_file_path, std::ios::binary);
+        CHECK(output);
+        output.write(wallet.data(), static_cast<std::streamsize>(wallet.size()));
+    }
+    CHECK(ReadWalletIdentityPem(sso_file_path, false) == pem);
+
+    std::remove(sso_only_path.c_str());
+    std::remove(both_path.c_str());
+    std::remove(sso_file_path.c_str());
+}
+
 int main() {
 
     TestUniversalIntegers();
@@ -3483,6 +3677,7 @@ int main() {
     TestEndOfResponseNegotiation();
     TestSessionFactory();
     TestSessionPool();
+    TestSsoWallet();
     std::cout << "oracle_scanner protocol tests passed\n";
     return 0;
 }

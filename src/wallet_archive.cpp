@@ -1,6 +1,7 @@
 #include "oracle_scanner/wallet_archive.hpp"
 
 #include "oracle_scanner/protocol_error.hpp"
+#include "oracle_scanner/sso_wallet.hpp"
 
 #include "miniz.hpp"
 
@@ -96,6 +97,49 @@ void ValidatePemContents(const std::string &pem, const char *description) {
     }
 }
 
+// Extracts one member of an already-bounded wallet ZIP, or returns an empty
+// string when the archive does not carry it. A member that is present but
+// unusable is still an error: a wallet with, say, an encrypted cwallet.sso
+// entry is broken rather than absent.
+std::string ExtractOptionalMember(const std::string &contents, const char *member, size_t maximum_size) {
+    ZipReader reader(contents);
+    const auto count = mz_zip_reader_get_num_files(&reader.archive);
+    if (count == 0 || count > MAX_WALLET_ARCHIVE_ENTRIES || mz_zip_is_zip64(&reader.archive)) {
+        throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle wallet ZIP has unsupported bounds");
+    }
+    int member_index = -1;
+    for (mz_uint index = 0; index < count; index++) {
+        mz_zip_archive_file_stat entry {};
+        if (!mz_zip_reader_file_stat(&reader.archive, index, &entry)) {
+            throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle wallet ZIP directory is malformed");
+        }
+        if (entry.m_is_directory || std::string(entry.m_filename) != member) {
+            continue;
+        }
+        if (member_index != -1 || entry.m_is_encrypted || !entry.m_is_supported || entry.m_uncomp_size == 0 ||
+            entry.m_uncomp_size > maximum_size) {
+            throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                                std::string("Oracle wallet ZIP has an invalid ") + member + " entry");
+        }
+        member_index = static_cast<int>(index);
+    }
+    if (member_index == -1) {
+        return {};
+    }
+    size_t extracted_size = 0;
+    auto *extracted = static_cast<char *>(
+        mz_zip_reader_extract_to_heap(&reader.archive, static_cast<mz_uint>(member_index), &extracted_size, 0));
+    if (!extracted || extracted_size == 0 || extracted_size > maximum_size) {
+        if (extracted) {
+            mz_free(extracted);
+        }
+        throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                            std::string("Oracle wallet ZIP could not extract ") + member);
+    }
+    std::unique_ptr<char, decltype(&mz_free)> owned(extracted, mz_free);
+    return std::string(extracted, extracted_size);
+}
+
 } // namespace
 
 std::string ReadWalletPemArchive(const std::string &path) {
@@ -151,6 +195,38 @@ std::string ReadWalletPemFile(const std::string &path) {
         return ReadWalletPemArchive(path);
     }
     return ReadPemFile(path);
+}
+
+std::string ReadWalletIdentityPem(const std::string &path, bool have_wallet_password) {
+    if (HasZipSignature(path)) {
+        const auto contents = ReadWalletFile(path, MAX_WALLET_ARCHIVE_BYTES, "Oracle wallet archive");
+        // With a password the encrypted ewallet.pem is what the caller asked
+        // for; without one the auto-login store is the only member that can be
+        // opened at all, so it is tried first.
+        if (!have_wallet_password) {
+            const auto sso = ExtractOptionalMember(contents, "cwallet.sso", MAX_WALLET_PEM_BYTES);
+            if (!sso.empty()) {
+                return SsoWalletToPem(sso);
+            }
+        }
+        const auto pem = ExtractOptionalMember(contents, "ewallet.pem", MAX_WALLET_PEM_BYTES);
+        if (!pem.empty()) {
+            ValidatePemContents(pem, "Oracle wallet ZIP ewallet.pem");
+            return pem;
+        }
+        const auto sso = ExtractOptionalMember(contents, "cwallet.sso", MAX_WALLET_PEM_BYTES);
+        if (!sso.empty()) {
+            return SsoWalletToPem(sso);
+        }
+        throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                            "Oracle wallet ZIP contains neither ewallet.pem nor cwallet.sso");
+    }
+    const auto contents = ReadWalletFile(path, MAX_WALLET_PEM_BYTES, "Oracle wallet file");
+    if (HasSsoWalletMagic(contents)) {
+        return SsoWalletToPem(contents);
+    }
+    ValidatePemContents(contents, "Oracle wallet PEM");
+    return contents;
 }
 
 std::string ReadPemFile(const std::string &path) {

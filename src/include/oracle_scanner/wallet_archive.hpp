@@ -19,6 +19,14 @@ std::string ReadWalletPemFile(const std::string &path);
 // dedicated CA trust file distinct from a wallet archive.
 std::string ReadPemFile(const std::string &path);
 
+// Returns the client identity PEM for a wallet path, accepting every shape an
+// OCI wallet arrives in: a ZIP, a plain ewallet.pem, or an auto-login
+// cwallet.sso. Without a wallet password the auto-login store is preferred,
+// because it is the only member that opens without one; with a password
+// ewallet.pem wins, since that is what the password belongs to. The conversion
+// happens in memory — nothing is unpacked to disk.
+std::string ReadWalletIdentityPem(const std::string &path, bool have_wallet_password);
+
 // Returns tnsnames.ora from the same bounded ZIP. It is only used when a
 // caller explicitly requests a TNS_ALIAS.
 std::string ReadWalletTnsNamesArchive(const std::string &path);

@@ -14,10 +14,18 @@ void RegisterOracleAttachedCatalog(ExtensionLoader &loader);
 void RegisterOracleSessionPool(ExtensionLoader &loader);
 void RegisterOracleParallelScan(ExtensionLoader &loader);
 
+// Supplied by CMake from EXTENSION_VERSION in extension_config.cmake, so this
+// answer cannot drift from the version the artifact is stamped with. The
+// fallback only ever applies to a build that bypasses this project's CMake.
+#ifndef ORACLE_SCANNER_VERSION_STRING
+#define ORACLE_SCANNER_VERSION_STRING "0.0.0-unknown"
+#endif
+
 static void OracleScannerVersion(DataChunk &args, ExpressionState &, Vector &result) {
 	result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	ConstantVector::SetNull(result, false);
-	ConstantVector::GetData<string_t>(result)[0] = StringVector::AddString(result, "0.1.0-dev");
+	ConstantVector::GetData<string_t>(result)[0] =
+	    StringVector::AddString(result, ORACLE_SCANNER_VERSION_STRING);
 }
 
 static void LoadInternal(ExtensionLoader &loader) {

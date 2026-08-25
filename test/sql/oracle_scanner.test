@@ -11,11 +11,12 @@ Catalog Error: Scalar Function with name oracle_scanner_version does not exist!
 # Require statement will ensure this test is run with this extension loaded
 require oracle_scanner
 
-# Confirm the extension works
+# Confirm the extension works. The version comes from EXTENSION_VERSION in
+# extension_config.cmake, so this expectation moves with a release.
 query I
 SELECT oracle_scanner_version();
 ----
-0.1.0-dev
+0.2.0
 
 # oracle_query keeps its two required arguments and accepts one optional LIST
 # or named STRUCT parameter collection through DuckDB's table-function

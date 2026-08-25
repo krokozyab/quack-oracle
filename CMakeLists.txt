@@ -26,6 +26,19 @@ project(${TARGET_NAME})
 
 include_directories(src/include)
 
+# The version `oracle_scanner_version()` reports is read out of
+# extension_config.cmake rather than written a second time here. It used to be a
+# literal in the source, and a release that bumped EXTENSION_VERSION left it
+# behind: the published 0.1.0 answered "0.1.0-dev". One source, no drift.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/extension_config.cmake" ORACLE_SCANNER_EXTENSION_CONFIG)
+string(REGEX MATCH "EXTENSION_VERSION[ \t\r\n]+([0-9A-Za-z.+-]+)" ORACLE_SCANNER_VERSION_MATCH
+       "${ORACLE_SCANNER_EXTENSION_CONFIG}")
+if(NOT CMAKE_MATCH_1)
+  message(FATAL_ERROR "oracle_scanner: EXTENSION_VERSION not found in extension_config.cmake")
+endif()
+set(ORACLE_SCANNER_VERSION "${CMAKE_MATCH_1}")
+message(STATUS "oracle_scanner version ${ORACLE_SCANNER_VERSION}")
+
 set(EXTENSION_SOURCES
     src/oracle_scanner_extension.cpp
     src/oracle_secret.cpp
@@ -33,6 +46,7 @@ set(EXTENSION_SOURCES
     src/byte_buffer.cpp
     src/byte_stream.cpp
     src/wallet_archive.cpp
+    src/sso_wallet.cpp
     src/openssl_stream.cpp
     src/tns_packet.cpp
     src/tns_connect.cpp
@@ -98,6 +112,11 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
 target_compile_features(${LOADABLE_EXTENSION_NAME} PRIVATE cxx_std_17)
 
+target_compile_definitions(${EXTENSION_NAME} PRIVATE
+                           ORACLE_SCANNER_VERSION_STRING="${ORACLE_SCANNER_VERSION}")
+target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE
+                           ORACLE_SCANNER_VERSION_STRING="${ORACLE_SCANNER_VERSION}")
+
 # Link OpenSSL in both the static library as the loadable extension
 target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto duckdb_miniz)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto duckdb_miniz)
@@ -113,6 +132,7 @@ if(ORACLE_SCANNER_BUILD_TESTS)
                  src/byte_buffer.cpp
                  src/byte_stream.cpp
                  src/wallet_archive.cpp
+                 src/sso_wallet.cpp
                  src/openssl_stream.cpp
                  src/tns_packet.cpp
                  src/tns_connect.cpp

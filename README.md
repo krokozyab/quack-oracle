@@ -173,10 +173,13 @@ CREATE SECRET ora_cloud (
     PASSWORD '...',
     PROTOCOL 'tcps',
     TLS_SERVER_NAME 'adb.<your-region>.oraclecloud.com',
-    WALLET_FILE '/secure/Wallet_mydb.zip',
-    WALLET_PASSWORD '...'
+    WALLET_FILE '/secure/Wallet_mydb.zip'
 );
 ```
+
+The wallet ZIP needs no password: its `cwallet.sso` is an auto-login store, the
+same one SQL\*Plus and JDBC open. Add `WALLET_PASSWORD` only for a bare
+`ewallet.pem` whose key is encrypted.
 
 ### Encrypted connection without a wallet
 
@@ -196,8 +199,8 @@ CREATE SECRET ora_tls (
 | `USER`, `PASSWORD` | Your Oracle credentials |
 | `PROTOCOL` | `tcp` (the default) or `tcps` for TLS |
 | `TNS_ALIAS` | An alias from the `tnsnames.ora` inside the wallet ZIP — use *instead of* HOST/PORT/SERVICE_NAME |
-| `WALLET_FILE` | A cloud wallet ZIP, or an `ewallet.pem` bundle |
-| `WALLET_PASSWORD` | The password the wallet's encrypted key is locked with — **required** for an OCI wallet, and different from the ADMIN/user password |
+| `WALLET_FILE` | A cloud wallet ZIP, an `ewallet.pem` bundle, or an auto-login `cwallet.sso` |
+| `WALLET_PASSWORD` | The password the wallet's encrypted `ewallet.pem` is locked with. Not needed when the wallet carries `cwallet.sso` — every wallet OCI hands out does |
 | `TLS_SERVER_NAME` | The name checked against the server certificate |
 | `TLS_SNI_NAME` | Only when the endpoint is an IP or a different virtual host |
 | `TLS_CA_FILE` | An explicit PEM trust list; system roots are then not used |
@@ -587,12 +590,16 @@ check for a stale password in an old secret.
 
 ### `OpenSSL could not decrypt the client private key in wallet PEM`
 
-The wallet password is wrong or missing. An OCI wallet's `ewallet.pem` holds an
-encrypted private key, and `WALLET_PASSWORD` must be the password you set when
-you downloaded the wallet — not the database (ADMIN) password. Note that
-SQL\*Plus connects through the passwordless `cwallet.sso` in the same ZIP, so a
-wallet that opens fine there still needs `WALLET_PASSWORD` here. If it is lost,
-download the wallet again and set a new one.
+You set `WALLET_PASSWORD` and it is not the password that `ewallet.pem` was
+encrypted with — it is the one you chose when downloading the wallet, not the
+database (ADMIN) password.
+
+If you no longer have it, drop `WALLET_PASSWORD` entirely: the extension then
+opens the wallet's `cwallet.sso` instead, which is the auto-login store SQL\*Plus,
+SQLcl and JDBC use, and it needs no password at all. That works for every wallet
+OCI hands out. The one wallet it cannot open is an *auto-login local* store,
+which is tied to the machine and account that created it; that case is refused
+by name.
 
 ---
 
@@ -733,11 +740,34 @@ CREATE SECRET demo (
 );
 ```
 
-Against Autonomous — alias instead of host, the wallet ZIP as you downloaded it,
-and the **wallet password you set when you downloaded it**:
+Against Autonomous — alias instead of host, and the wallet ZIP exactly as you
+downloaded it:
 
 ```sql
 CREATE SECRET demo (
+    TYPE oracle,
+    TNS_ALIAS 'mydb_low',
+    USER 'ADMIN', PASSWORD '<your ADMIN password>',
+    WALLET_FILE '/secure/Wallet_mydb.zip'
+);
+```
+
+The alias carries the host, port, service and TLS settings, so those fields must
+not be repeated — the extension rejects the combination rather than guessing
+which wins.
+
+No wallet password appears there, and none is needed: the extension opens the
+wallet's `cwallet.sso`, the auto-login store SQL\*Plus, SQLcl and JDBC use, whose
+key is unlocked by the file itself. Nothing is unpacked to disk — the ZIP is read
+in memory and the identity goes straight into the TLS context.
+
+`WALLET_PASSWORD` remains for the other case: a wallet you hold as a bare
+`ewallet.pem`, whose private key is encrypted. It is the password you chose when
+downloading the wallet, never the ADMIN password. Supply it and `ewallet.pem` is
+used instead of the auto-login store:
+
+```sql
+CREATE SECRET demo_pem (
     TYPE oracle,
     TNS_ALIAS 'mydb_low',
     USER 'ADMIN', PASSWORD '<your ADMIN password>',
@@ -746,18 +776,7 @@ CREATE SECRET demo (
 );
 ```
 
-The alias carries the host, port, service and TLS settings, so those fields must
-not be repeated — the extension rejects the combination rather than guessing
-which wins.
-
-`WALLET_PASSWORD` is **required** for an OCI wallet, and it is a different secret
-from the ADMIN password. The extension authenticates with the encrypted private
-key in the wallet's `ewallet.pem`, which is locked by the wallet password. (A
-SQL client like SQL\*Plus connects through the wallet's passwordless
-`cwallet.sso` instead, so it never asks for it — which is exactly why a wallet
-that "works in SQL\*Plus" still needs `WALLET_PASSWORD` here.) If you have lost
-it, download the wallet again from **Database connection → Download wallet** and
-set a new one; the error when it is wrong or missing is:
+If that password is wrong, the error is:
 
 > OpenSSL could not decrypt the client private key in wallet PEM
 
