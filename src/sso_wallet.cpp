@@ -309,6 +309,8 @@ std::string SsoWalletToPem(const std::string &bytes) {
     }
 
     const auto *payload = reinterpret_cast<const unsigned char *>(bytes.data()) + payload_offset;
+    // d2i_PKCS12 takes a long by definition; the cast is the API, not a choice.
+    // NOLINTNEXTLINE(google-runtime-int)
     const auto payload_size = static_cast<long>(bytes.size() - payload_offset);
     auto store = Pkcs12Ptr(d2i_PKCS12(nullptr, &payload, payload_size), PKCS12_free);
     if (!store) {

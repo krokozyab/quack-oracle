@@ -209,7 +209,7 @@ std::string ReadWalletIdentityPem(const std::string &path, bool have_wallet_pass
                 return SsoWalletToPem(sso);
             }
         }
-        const auto pem = ExtractOptionalMember(contents, "ewallet.pem", MAX_WALLET_PEM_BYTES);
+        auto pem = ExtractOptionalMember(contents, "ewallet.pem", MAX_WALLET_PEM_BYTES);
         if (!pem.empty()) {
             ValidatePemContents(pem, "Oracle wallet ZIP ewallet.pem");
             return pem;
@@ -221,7 +221,7 @@ std::string ReadWalletIdentityPem(const std::string &path, bool have_wallet_pass
         throw ProtocolError(ProtocolErrorKind::MALFORMED,
                             "Oracle wallet ZIP contains neither ewallet.pem nor cwallet.sso");
     }
-    const auto contents = ReadWalletFile(path, MAX_WALLET_PEM_BYTES, "Oracle wallet file");
+    auto contents = ReadWalletFile(path, MAX_WALLET_PEM_BYTES, "Oracle wallet file");
     if (HasSsoWalletMagic(contents)) {
         return SsoWalletToPem(contents);
     }
