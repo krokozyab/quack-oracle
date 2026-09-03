@@ -18,6 +18,34 @@ namespace {
 constexpr size_t MAX_RESPONSE_FRAGMENTS = 4096;
 constexpr size_t MAX_RESPONSE_BYTES = 64U << 20U;
 
+template <typename Decoder>
+std::vector<uint8_t> ReceiveResponseFragments(TtcChannel &channel, Decoder decoder) {
+    auto accumulated = channel.Receive();
+    for (size_t fragments = 1;; fragments++) {
+        bool complete = false;
+        try {
+            complete = decoder(accumulated);
+        } catch (const ProtocolError &error) {
+            if (error.Kind() != ProtocolErrorKind::TRUNCATED) {
+                throw;
+            }
+        }
+        if (complete) {
+            return accumulated;
+        }
+        if (fragments == MAX_RESPONSE_FRAGMENTS) {
+            throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED,
+                                "Oracle response spans more fragments than this client will join");
+        }
+        const auto next = channel.Receive();
+        if (next.size() > MAX_RESPONSE_BYTES || accumulated.size() > MAX_RESPONSE_BYTES - next.size()) {
+            throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED,
+                                "Oracle response exceeds the configured reassembly limit");
+        }
+        accumulated.insert(accumulated.end(), next.begin(), next.end());
+    }
+}
+
 } // namespace
 
 TtcStatementChannel::TtcStatementChannel(TtcChannel &channel_p, OracleStatementRegistry &statements_p)
@@ -118,10 +146,36 @@ std::vector<uint8_t> TtcStatementChannel::ReceiveExecuteResponse(OracleStatement
     }
 }
 
+TtcExecuteResponse TtcStatementChannel::ReceiveDecodedExecuteResponse(OracleStatementHandle handle,
+                                                                        uint8_t ttc_field_version,
+                                                                        uint8_t server_field_version) {
+    try {
+        std::optional<TtcExecuteResponse> decoded;
+        (void)ReceiveResponseFragments(channel, [&](const std::vector<uint8_t> &message) {
+            decoded.reset();
+            if (IsTtcErrorMessage(message)) {
+                (void)DecodeTtcErrorPrefix(message, server_field_version);
+                ThrowTtcServerError(message);
+            }
+            decoded = DecodeTtcExecuteResponse(message, ttc_field_version, server_field_version);
+            return decoded->completed;
+        });
+        return std::move(*decoded);
+    } catch (...) {
+        if (statements.State(handle) != OracleStatementState::POISONED) {
+            statements.Poison(handle);
+        }
+        throw;
+    }
+}
+
 TtcErrorInfo TtcStatementChannel::ReceiveDmlResponse(OracleStatementHandle handle, uint8_t server_field_version) {
     try {
-        const auto response = channel.Receive();
-        const auto completion = DecodeTtcExecuteCompletion(response, server_field_version);
+        TtcErrorInfo completion;
+        (void)ReceiveResponseFragments(channel, [&](const std::vector<uint8_t> &message) {
+            completion = DecodeTtcExecuteCompletion(message, server_field_version);
+            return true;
+        });
         if (completion.error_number != 0) {
             statements.Poison(handle);
             throw OracleDmlError(completion.current_row,
@@ -157,12 +211,12 @@ TtcPlsqlOutBindsResponse TtcStatementChannel::ReceivePlsqlOutBindsResponse(Oracl
 TtcCallResponse TtcStatementChannel::ReceiveCallResponse(OracleStatementHandle handle, const std::vector<OracleBind> &binds,
                                                           uint8_t ttc_field_version, uint8_t server_field_version) {
     try {
-        auto response = channel.Receive();
-        if (IsTtcErrorMessage(response)) {
-            statements.Poison(handle);
-            ThrowTtcServerError(response);
-        }
-        return DecodeTtcCallResponse(response, binds, ttc_field_version, server_field_version);
+        std::optional<TtcCallResponse> decoded;
+        (void)ReceiveResponseFragments(channel, [&](const std::vector<uint8_t> &message) {
+            decoded = DecodeTtcCallResponse(message, binds, ttc_field_version, server_field_version);
+            return decoded->completed;
+        });
+        return std::move(*decoded);
     } catch (...) {
         if (statements.State(handle) != OracleStatementState::POISONED) {
             statements.Poison(handle);

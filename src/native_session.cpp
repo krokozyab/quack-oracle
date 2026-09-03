@@ -240,8 +240,8 @@ std::unique_ptr<OracleCursor> NativeOracleSession::Query(const std::string &sql,
         request.is_query = true;
         channel->ExecuteBinds(handle, request);
     }
-    const auto response = DecodeTtcExecuteResponse(channel->ReceiveExecuteResponse(handle), connection->TtcFieldVersion(),
-                                 connection->TtcServerFieldVersion());
+    const auto response = channel->ReceiveDecodedExecuteResponse(handle, connection->TtcFieldVersion(),
+                                                                  connection->TtcServerFieldVersion());
     if (!response.completion || response.completion->cursor_id == 0) {
         statements.Poison(handle);
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle query response has no cursor completion");

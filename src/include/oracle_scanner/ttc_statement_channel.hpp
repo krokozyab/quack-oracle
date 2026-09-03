@@ -4,6 +4,7 @@
 #include "oracle_scanner/ttc_channel.hpp"
 #include "oracle_scanner/ttc_call_response.hpp"
 #include "oracle_scanner/ttc_execute.hpp"
+#include "oracle_scanner/ttc_execute_response.hpp"
 #include "oracle_scanner/ttc_lob.hpp"
 #include "oracle_scanner/ttc_fetch_response.hpp"
 #include "oracle_scanner/ttc_out_binds.hpp"
@@ -32,6 +33,8 @@ public:
     void ExecuteNoBinds(OracleStatementHandle handle, const TtcExecuteNoBindsRequest &request);
     void ExecuteBinds(OracleStatementHandle handle, const TtcExecuteBindsRequest &request);
     std::vector<uint8_t> ReceiveExecuteResponse(OracleStatementHandle handle);
+    TtcExecuteResponse ReceiveDecodedExecuteResponse(OracleStatementHandle handle, uint8_t ttc_field_version = 12,
+                                                     uint8_t server_field_version = 12);
     TtcErrorInfo ReceiveDmlResponse(OracleStatementHandle handle, uint8_t server_field_version = 12);
     TtcPlsqlOutBindsResponse ReceivePlsqlOutBindsResponse(OracleStatementHandle handle,
                                                            const std::vector<OracleBind> &binds,
