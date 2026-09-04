@@ -16,6 +16,7 @@ struct TtcExecuteResponse {
     std::vector<TtcRowData> rows;
     std::optional<TtcErrorInfo> completion;
     bool exhausted = false;
+    bool completed = false;
     size_t bytes_consumed = 0;
 };
 

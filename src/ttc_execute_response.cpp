@@ -32,6 +32,7 @@ TtcExecuteResponse DecodeTtcExecuteResponse(const std::vector<uint8_t> &message,
     result.rows = fetch.rows;
     result.completion = fetch.completion;
     result.exhausted = fetch.exhausted;
+    result.completed = fetch.completed;
     result.bytes_consumed = describe.bytes_consumed + fetch.bytes_consumed;
     return result;
 }

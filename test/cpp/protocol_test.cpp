@@ -626,6 +626,57 @@ static void TestStatementChannelJoinsFragmentedResponse() {
     CHECK(DecodeOracleNumber(*decoded.rows[0][0]) == "7");
 }
 
+static void TestStatementChannelJoinsFragmentedExecuteResponse() {
+    ByteWriter describe;
+    describe.WriteByte(16).WriteLengthPrefixed(std::nullopt).WriteUB4(0).WriteUB4(1).WriteByte(0);
+    describe.WriteByte(2).WriteByte(0).WriteByte(0).WriteByte(0);
+    describe.WriteUB4(22).WriteUB4(0).WriteUB8(0).WriteUB4(0);
+    describe.WriteUB2(0).WriteUB2(0).WriteByte(0).WriteUB4(0).WriteUB4(0);
+    describe.WriteByte(0).WriteByte(0).WriteUB4(0).WriteUB4(0).WriteUB4(0);
+    describe.WriteUB2(0).WriteUB4(0);
+    describe.WriteUB4(0).WriteUB4(0).WriteUB4(0).WriteUB4(0).WriteUB4(0).WriteUB4(0);
+
+    ByteWriter response;
+    response.WriteRaw(describe.Data());
+    response.WriteByte(6).WriteByte(0).WriteUB2(0).WriteUB4(0).WriteUB4(1);
+    response.WriteUB2(0).WriteUB4(0).WriteUB4(0);
+    response.WriteByte(TTC_MESSAGE_ROW_DATA).WriteLengthPrefixed(EncodeOracleNumber("7"));
+    response.WriteByte(TTC_MESSAGE_ERROR).WriteUB4(0).WriteUB2(0).WriteUB4(0);
+    response.WriteUB2(0).WriteUB2(0).WriteUB2(0).WriteUB4(42).WriteUB4(0);
+    response.WriteByte(0).WriteByte(0).WriteByte(0).WriteByte(0).WriteByte(0).WriteByte(0);
+    response.WriteUB4(0).WriteUB2(0).WriteByte(0).WriteUB4(0).WriteUB2(0);
+    response.WriteUB4(0).WriteByte(0).WriteByte(0).WriteUB2(0).WriteUB4(0).WriteByte(0);
+    response.WriteUB2(0).WriteUB4(0).WriteUB2(0).WriteUB4(0).WriteUB8(1);
+
+    const auto split = describe.Data().size();
+    const auto first = std::vector<uint8_t>(response.Data().begin(),
+                                            response.Data().begin() + static_cast<std::ptrdiff_t>(split));
+    const auto second = std::vector<uint8_t>(response.Data().begin() + static_cast<std::ptrdiff_t>(split),
+                                             response.Data().end());
+    std::vector<uint8_t> inbound;
+    for (const auto &packet : EncodeTnsDataPackets(first, true, 512, 0)) {
+        inbound.insert(inbound.end(), packet.begin(), packet.end());
+    }
+    for (const auto &packet : EncodeTnsDataPackets(second, true, 512, 0)) {
+        inbound.insert(inbound.end(), packet.begin(), packet.end());
+    }
+
+    FragmentedStream stream(inbound, 7);
+    TnsPacketStream packets(stream, true, 512);
+    TtcChannel channel(packets, 512, 1U << 20U);
+    OracleStatementRegistry statements;
+    const auto handle = statements.Open(OracleSqlKind::QUERY);
+    TtcStatementChannel statement_channel(channel, statements);
+    TtcExecuteNoBindsRequest request;
+    request.sql = "select 7 from dual";
+    request.is_query = true;
+    statement_channel.ExecuteNoBinds(handle, request);
+
+    const auto decoded = statement_channel.ReceiveDecodedExecuteResponse(handle);
+    CHECK(decoded.columns.size() == 1 && decoded.rows.size() == 1 && decoded.completion &&
+          decoded.completion->cursor_id == 42 && DecodeOracleNumber(*decoded.rows[0][0]) == "7");
+}
+
 static void TestTtcCancellation() {
     std::vector<uint8_t> inbound = EncodeTnsPacket(TnsPacketType::MARKER, 0, {0x01, 0x00, 0x02}, true);
     const auto terminal = EncodeTnsDataPackets({29}, true, 64);
@@ -2068,12 +2119,20 @@ static void TestTtcExecuteStatementChannel() {
     dml_response.WriteUB4(0).WriteByte(0).WriteByte(0).WriteUB2(0).WriteUB4(0).WriteByte(0);
     dml_response.WriteUB2(0).WriteUB4(0).WriteUB2(0).WriteUB4(0).WriteUB8(1);
     std::vector<uint8_t> dml_inbound;
-    for (const auto &packet : EncodeTnsDataPackets(dml_response.Data(), true, 64)) {
+    const auto dml_split = dml_response.Data().size() - 1;
+    const auto dml_first = std::vector<uint8_t>(dml_response.Data().begin(),
+                                                dml_response.Data().begin() + static_cast<std::ptrdiff_t>(dml_split));
+    const auto dml_last = std::vector<uint8_t>(dml_response.Data().begin() + static_cast<std::ptrdiff_t>(dml_split),
+                                               dml_response.Data().end());
+    for (const auto &packet : EncodeTnsDataPackets(dml_first, true, 512, 0)) {
+        dml_inbound.insert(dml_inbound.end(), packet.begin(), packet.end());
+    }
+    for (const auto &packet : EncodeTnsDataPackets(dml_last, true, 512, 0)) {
         dml_inbound.insert(dml_inbound.end(), packet.begin(), packet.end());
     }
     FragmentedStream dml_stream(dml_inbound, 3);
-    TnsPacketStream dml_packets(dml_stream, true, 64);
-    TtcChannel dml_channel(dml_packets, 64);
+    TnsPacketStream dml_packets(dml_stream, true, 512);
+    TtcChannel dml_channel(dml_packets, 512);
     OracleStatementRegistry dml_registry;
     const auto dml_handle = dml_registry.Open(OracleSqlKind::DML);
     TtcStatementChannel dml_statements(dml_channel, dml_registry);
@@ -2084,6 +2143,26 @@ static void TestTtcExecuteStatementChannel() {
     CHECK(dml_completion.error_number == 0 && dml_completion.row_count == 1);
     dml_statements.CompleteExecute(dml_handle, false, 0);
     CHECK(dml_registry.State(dml_handle) == OracleStatementState::EXHAUSTED);
+
+    std::vector<uint8_t> call_inbound;
+    for (const auto &packet : EncodeTnsDataPackets(dml_first, true, 512, 0)) {
+        call_inbound.insert(call_inbound.end(), packet.begin(), packet.end());
+    }
+    for (const auto &packet : EncodeTnsDataPackets(dml_last, true, 512, 0)) {
+        call_inbound.insert(call_inbound.end(), packet.begin(), packet.end());
+    }
+    FragmentedStream call_stream(call_inbound, 3);
+    TnsPacketStream call_packets(call_stream, true, 512);
+    TtcChannel call_channel(call_packets, 512);
+    OracleStatementRegistry call_registry;
+    const auto call_handle = call_registry.Open(OracleSqlKind::PLSQL);
+    TtcStatementChannel call_statements(call_channel, call_registry);
+    TtcExecuteNoBindsRequest call_request;
+    call_request.sql = "BEGIN NULL; END;";
+    call_request.is_plsql = true;
+    call_statements.ExecuteNoBinds(call_handle, call_request);
+    const auto call_response = call_statements.ReceiveCallResponse(call_handle, {}, 12, 12);
+    CHECK(call_response.completed && call_response.completion && call_response.completion->error_number == 0);
 }
 
 static const char *RequiredEnvironment(const char *name) {
@@ -2221,8 +2300,8 @@ static void TestLiveTnsNegotiation() {
         request.sql = test_fetch ? "select level from dual connect by level <= 3" : "select 1 from dual";
         request.is_query = true;
         channel.ExecuteNoBinds(handle, request);
-        const auto response = channel.ReceiveExecuteResponse(handle);
-        const auto decoded = DecodeTtcExecuteResponse(response, connection->TtcFieldVersion(), connection->TtcServerFieldVersion());
+        const auto decoded = channel.ReceiveDecodedExecuteResponse(handle, connection->TtcFieldVersion(),
+                                        connection->TtcServerFieldVersion());
         CHECK(decoded.columns.size() == 1 && !decoded.rows.empty() && decoded.completion &&
                decoded.completion->cursor_id != 0);
         channel.CompleteExecute(handle, true, decoded.completion->cursor_id);
@@ -2249,7 +2328,8 @@ static void TestLiveTnsNegotiation() {
         first_request.sql = "select level from dual connect by level <= 3";
         first_request.is_query = true;
         channel.ExecuteNoBinds(first, first_request);
-        const auto first_response = DecodeTtcExecuteResponse(channel.ReceiveExecuteResponse(first), connection->TtcFieldVersion(), connection->TtcServerFieldVersion());
+        const auto first_response = channel.ReceiveDecodedExecuteResponse(first, connection->TtcFieldVersion(),
+                                           connection->TtcServerFieldVersion());
         CHECK(first_response.completion && first_response.completion->cursor_id != 0);
         channel.CompleteExecute(first, true, first_response.completion->cursor_id);
         CHECK(channel.Close(first));
@@ -2263,7 +2343,8 @@ static void TestLiveTnsNegotiation() {
         next_request.sql = "select 1 from dual";
         next_request.is_query = true;
         channel.ExecuteNoBinds(next, next_request);
-        const auto next_response = DecodeTtcExecuteResponse(channel.ReceiveExecuteResponse(next), connection->TtcFieldVersion(), connection->TtcServerFieldVersion());
+        const auto next_response = channel.ReceiveDecodedExecuteResponse(next, connection->TtcFieldVersion(),
+                                           connection->TtcServerFieldVersion());
         CHECK(next_response.completion && next_response.completion->cursor_id != 0);
         channel.CompleteExecute(next, true, next_response.completion->cursor_id);
     }
@@ -2291,7 +2372,8 @@ static void TestLiveTnsNegotiation() {
         verification_request.sql = "SELECT COUNT(*) FROM " + table;
         verification_request.is_query = true;
         channel.ExecuteNoBinds(verification, verification_request);
-        const auto verification_response = DecodeTtcExecuteResponse(channel.ReceiveExecuteResponse(verification), connection->TtcFieldVersion(), connection->TtcServerFieldVersion());
+        const auto verification_response = channel.ReceiveDecodedExecuteResponse(verification, connection->TtcFieldVersion(),
+                                             connection->TtcServerFieldVersion());
         CHECK(verification_response.rows.size() == 1 && verification_response.rows[0].size() == 1 &&
                verification_response.rows[0][0] && DecodeOracleNumber(*verification_response.rows[0][0]) == "1");
         CHECK(verification_response.completion && verification_response.completion->cursor_id != 0);
@@ -2398,7 +2480,8 @@ static void TestLiveTnsNegotiation() {
                       "'e' AS c6, 'f' AS c7, 'g' AS c8, 'h' AS c9 FROM dual CONNECT BY level <= 50";
         request.is_query = true;
         channel.ExecuteNoBinds(handle, request);
-        const auto initial = DecodeTtcExecuteResponse(channel.ReceiveExecuteResponse(handle), connection->TtcFieldVersion(), connection->TtcServerFieldVersion());
+        const auto initial = channel.ReceiveDecodedExecuteResponse(handle, connection->TtcFieldVersion(),
+                                       connection->TtcServerFieldVersion());
         CHECK(initial.rows.size() == 2 && initial.completion && initial.completion->cursor_id != 0);
         channel.CompleteExecute(handle, true, initial.completion->cursor_id);
         channel.Fetch(handle, 2, 48);
@@ -3626,6 +3709,7 @@ int main() {
     TestTtcChannel();
     TestTtcChannelShortPacketBoundary();
     TestStatementChannelJoinsFragmentedResponse();
+    TestStatementChannelJoinsFragmentedExecuteResponse();
     TestTtcCancellation();
     TestTtcErrorDiagnostics();
     TestTtcParameters();
