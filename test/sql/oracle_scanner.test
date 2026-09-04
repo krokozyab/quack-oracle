@@ -16,7 +16,7 @@ require oracle_scanner
 query I
 SELECT oracle_scanner_version();
 ----
-0.2.1-dev
+0.2.1
 
 # oracle_query keeps its two required arguments and accepts one optional LIST
 # or named STRUCT parameter collection through DuckDB's table-function
