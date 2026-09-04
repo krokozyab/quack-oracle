@@ -18,6 +18,22 @@ namespace {
 constexpr size_t MAX_RESPONSE_FRAGMENTS = 4096;
 constexpr size_t MAX_RESPONSE_BYTES = 64U << 20U;
 
+// Reads a response that Oracle may split across DATA fragments, which it does
+// not delimit for this client: a legacy 19c session never sets
+// END_OF_RESPONSE, and an oversized response is not padded to the SDU, so no
+// packet boundary says "this is the end". The decoder is the only thing that
+// knows, so decode what has arrived and read more only when it says it ran
+// out — either by reporting TRUNCATED or by finishing without a terminator.
+//
+// A consequence worth knowing: a genuinely malformed response also decodes as
+// TRUNCATED, and this then waits for a fragment that never comes, so it
+// surfaces as a read timeout rather than immediately. The alternative — give
+// up on the first TRUNCATED — is what made every wide table unreadable, since
+// a DESCRIBE_INFO past ~120 columns simply does not fit one packet.
+//
+// The whole accumulated buffer is decoded again on each round rather than
+// resumed from an offset: a fragment can split any field, so there is no safe
+// point to resume from, and a response is a handful of packets.
 template <typename Decoder>
 std::vector<uint8_t> ReceiveResponseFragments(TtcChannel &channel, Decoder decoder) {
     auto accumulated = channel.Receive();
