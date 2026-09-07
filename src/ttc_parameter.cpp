@@ -36,9 +36,16 @@ std::string ReadTwoLengths(ByteReader &reader) {
     if (declared_size == 0) {
         return {};
     }
+    // The declared size is an upper bound, not a length. It is stated in the
+    // character set this client asked for, so on a database that is not AL32UTF8
+    // the server sizes it for the worst case — "AUTH_SESSKEY" is announced as 36
+    // bytes, three per character, and then sent as its twelve ASCII ones.
+    // Requiring the two to agree is what made every non-UTF-8 database fail to
+    // authenticate. Oracle's own thin clients take what arrives and only trim it
+    // when it overruns what was declared.
     const auto encoded = reader.ReadLengthPrefixed(declared_size);
-    if (!encoded || encoded->size() != declared_size) {
-        throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC parameter byte counts disagree");
+    if (!encoded) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC parameter is missing its value");
     }
     return {encoded->begin(), encoded->end()};
 }

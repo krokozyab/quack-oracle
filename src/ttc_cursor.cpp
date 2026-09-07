@@ -19,8 +19,11 @@ std::string ReadString(ByteReader &reader, size_t declared_size) {
     if (declared_size == 0) {
         return {};
     }
+    // The declared size bounds the name, it does not state its length: on a
+    // database whose character set is not AL32UTF8 the server sizes it for the
+    // set this client asked for and then sends fewer bytes. See ttc_parameter.cpp.
     const auto value = reader.ReadLengthPrefixed(declared_size);
-    if (!value || value->size() != declared_size) {
+    if (!value) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC cursor descriptor name length disagrees with payload");
     }
     return {value->begin(), value->end()};

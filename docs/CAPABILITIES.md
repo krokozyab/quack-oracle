@@ -64,6 +64,32 @@ The wasm targets are excluded from the distribution matrix regardless, because a
 build that links would still refuse at connect for the reason above, and an
 artifact that always refuses is worse than no artifact.
 
+### Database character set
+
+Any. The client asks Oracle for AL32UTF8 during TTC negotiation and the server
+converts, so a database in `TR8MSWIN1254`, `WE8MSWIN1252`, `ZHS16GBK` or
+anything else hands over UTF-8 and takes UTF-8 back. Nothing has to be
+configured, and the database's own character set is never a reason to refuse a
+connection.
+
+Verified live by creating a database in each and running the full protocol
+lane against it — 18 stages each — plus reading and writing text that only
+exists in that character set, checked from an independent session so that what
+landed in the table is the database's own encoding rather than UTF-8 poured into
+its columns:
+
+| Database | Stored as | On the wire | Round trip |
+| --- | --- | --- | --- |
+| `TR8MSWIN1254` | 1 byte per character | UTF-8, 2 bytes | `ışğüöçİĞŞÇ` |
+| `WE8MSWIN1252` | 1 byte per character | UTF-8, 2 bytes | `äöüßéàçñ`, `Größe: Straße` |
+| `ZHS16GBK` | 2 bytes per character | UTF-8, 3 bytes | `数据库连接测试` |
+| `AL32UTF8` | UTF-8 | UTF-8 | — |
+
+Two limits remain, and neither depends on the database character set:
+`NCHAR`/`NVARCHAR2` are refused because their values travel as UTF-16 in the row
+(see §3), and characters outside the Basic Multilingual Plane — emoji, rare
+ideographs — are untested, since none of the character sets above can hold one.
+
 ### Secrets
 
 A connection is a DuckDB secret. There is no connection string and no `TNS_ADMIN`
@@ -193,7 +219,7 @@ homogeneous, so `[1, 'one', DATE '2026-01-02']` cannot even be constructed. A
 | `NUMBER(p,0)`, p ≤ 18 | `BIGINT` | |
 | `NUMBER(p,s)`, p ≤ 38, 1 ≤ s ≤ p | `DECIMAL(p,s)` | |
 | `NUMBER` otherwise | `VARCHAR` | Unconstrained NUMBER is exact only as text |
-| `VARCHAR2`, `CHAR` | `VARCHAR` | Database character set, UTF-8 here |
+| `VARCHAR2`, `CHAR` | `VARCHAR` | Arrives as UTF-8 whatever the database character set is |
 | `DATE` | `TIMESTAMP` | An Oracle `DATE` carries a time; it is not a DuckDB `DATE` |
 | `TIMESTAMP(n)` | `TIMESTAMP`, or `TIMESTAMP_NS` when n > 6 | |
 | `TIMESTAMP WITH TIME ZONE` | `VARCHAR` | The value carries its own offset, which `TIMESTAMPTZ` would drop |

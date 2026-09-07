@@ -761,6 +761,30 @@ static void TestTtcParameters() {
     decoded.push_back(decoded.front());
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { O5LogonChallengeFromParameters(decoded); });
     ExpectError(ProtocolErrorKind::MALFORMED, [] { DecodeTtcParameters({7, 0}); });
+
+    // A parameter's declared size is an upper bound, not its length. A database
+    // that is not AL32UTF8 announces a name sized for the character set this
+    // client asked for — "AUTH_SESSKEY" as 36 bytes, three per character — and
+    // then sends its twelve ASCII ones. Requiring the two to agree is what made
+    // every such database fail before it could authenticate.
+    ByteWriter oversized;
+    oversized.WriteByte(TTC_MESSAGE_PARAMETER).WriteUB4(1);
+    oversized.WriteUB4(36).WriteLengthPrefixed(std::vector<uint8_t>(12, 'A'));
+    oversized.WriteUB4(96).WriteLengthPrefixed(std::vector<uint8_t>(32, 'B'));
+    oversized.WriteUB4(0);
+    const auto understated = DecodeTtcParameters(oversized.Take());
+    CHECK(understated.size() == 1);
+    CHECK(understated[0].key == std::string(12, 'A') && understated[0].value == std::string(32, 'B'));
+
+    // Longer than declared is the other direction, and there the declaration
+    // does bound the value: the reader refuses it rather than trusting it.
+    ByteWriter overrun;
+    overrun.WriteByte(TTC_MESSAGE_PARAMETER).WriteUB4(1);
+    overrun.WriteUB4(4).WriteLengthPrefixed(std::vector<uint8_t>(4, 'A'));
+    overrun.WriteUB4(2).WriteLengthPrefixed(std::vector<uint8_t>(6, 'B'));
+    overrun.WriteUB4(0);
+    const auto overrun_message = overrun.Take();
+    ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [&] { (void)DecodeTtcParameters(overrun_message); });
 }
 
 static void TestTtcAuthEncoding() {
@@ -1035,6 +1059,8 @@ static void TestTtcNegotiation() {
 
     ByteWriter server;
     server.WriteByte(TTC_MESSAGE_PROTOCOL).WriteByte(6).WriteByte(0).WriteNullTerminated("Oracle Database");
+    // 873 is AL32UTF8; the negotiation accepts whatever the server reports,
+    // which is checked below with a database character set that is not UTF-8.
     server.WriteUInt16LE(ORACLE_CHARSET_AL32UTF8).WriteByte(0).WriteUInt16LE(0).WriteUInt16BE(0);
     server.WriteByte(0).WriteByte(0);
     const auto protocol_response = server.Take();
@@ -1054,6 +1080,28 @@ static void TestTtcNegotiation() {
     CHECK(info.charset_id == ORACLE_CHARSET_AL32UTF8);
     ExpectError(ProtocolErrorKind::UNSUPPORTED,
                 [] { ParseTtcProtocolResponse({0xde, 0xad, 0xbe, 0xef}); });
+
+    // The character set the server reports is its own, not a negotiated one:
+    // this client asks for AL32UTF8 in TTIDTY and Oracle converts on its side.
+    // Requiring 873 here refused every database in another character set before
+    // it could authenticate, which is how a TR8MSWIN1254 database surfaced as
+    // "Oracle server selected an unsupported character set".
+    ByteWriter turkish_server;
+    turkish_server.WriteByte(TTC_MESSAGE_PROTOCOL).WriteByte(6).WriteByte(0).WriteNullTerminated("Oracle Database");
+    turkish_server.WriteUInt16LE(873 + 1).WriteByte(0).WriteUInt16LE(0).WriteUInt16BE(0);
+    turkish_server.WriteByte(0).WriteByte(0);
+    std::vector<uint8_t> turkish_inbound;
+    for (const auto &packet : EncodeTnsDataPackets(turkish_server.Take(), true, 64)) {
+        turkish_inbound.insert(turkish_inbound.end(), packet.begin(), packet.end());
+    }
+    for (const auto &packet : EncodeTnsDataPackets(data_type_response, true, 64)) {
+        turkish_inbound.insert(turkish_inbound.end(), packet.begin(), packet.end());
+    }
+    FragmentedStream turkish_stream(turkish_inbound, 5);
+    TnsPacketStream turkish_packets(turkish_stream, true, 64);
+    TtcChannel turkish_channel(turkish_packets, 64);
+    const auto turkish_info = RunTtcNegotiation(turkish_channel, options);
+    CHECK(turkish_info.charset_id == 874);
 }
 
 static void TestTtcExecuteNoBindsShape() {
@@ -2285,7 +2333,9 @@ static void TestLiveTnsNegotiation() {
         return;
     }
     const auto protocol = connection->Negotiate();
-    CHECK(protocol.charset_id == ORACLE_CHARSET_AL32UTF8);
+    // The server reports its own character set, which is not required to be
+    // AL32UTF8: this lane runs against TR8MSWIN1254 databases too.
+    CHECK(protocol.charset_id != 0);
     if (stage && std::string(stage) == "auth") {
         connection->AuthenticateO5Logon(RequiredEnvironment("ORA19C_USER"), RequiredEnvironment("ORA19C_PASSWORD"));
         CHECK(connection->State() == OracleConnectionState::AUTHENTICATED);

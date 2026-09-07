@@ -120,9 +120,11 @@ TtcProtocolInfo RunTtcNegotiation(TtcChannel &channel, const TtcNegotiationOptio
         ThrowTtcServerError(protocol_response);
     }
     auto protocol = ParseTtcProtocolResponse(protocol_response);
-    if (protocol.charset_id != ORACLE_CHARSET_AL32UTF8) {
-        throw ProtocolError(ProtocolErrorKind::UNSUPPORTED, "Oracle server selected an unsupported character set");
-    }
+    // The server reports its own character set here; it is not a negotiation.
+    // This client asks for AL32UTF8 in TTIDTY and Oracle converts on the server
+    // side, so a database in any character set is readable — refusing anything
+    // but AL32UTF8 turned "your database is not UTF-8" into "unsupported", which
+    // is neither true nor actionable.
     channel.Send(BuildTtcDataTypesRequest(options));
     auto data_types_response = channel.Receive();
     if (IsTtcErrorMessage(data_types_response)) {

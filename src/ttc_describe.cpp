@@ -21,8 +21,9 @@ void ReadDeclaredBytes(ByteReader &reader) {
     if (declared > MAX_METADATA_BYTES) {
         throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "TTC describe metadata field is too large");
     }
+    // Bounded, not stated: see ReadDeclaredText below and ttc_parameter.cpp.
     const auto value = reader.ReadLengthPrefixed(declared);
-    if (!value || value->size() != declared) {
+    if (!value) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC describe metadata field length disagrees with payload");
     }
 }
@@ -35,8 +36,12 @@ std::string ReadDeclaredText(ByteReader &reader) {
     if (declared > MAX_METADATA_BYTES) {
         throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "TTC describe identifier is too large");
     }
+    // As in ttc_parameter.cpp, the declared size is an upper bound stated in the
+    // character set this client requested, not the length of what follows: on a
+    // database that is not AL32UTF8 the server sizes a column name for three
+    // bytes per character and then sends its actual ones.
     const auto value = reader.ReadLengthPrefixed(declared);
-    if (!value || value->size() != declared) {
+    if (!value) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC describe identifier length disagrees with payload");
     }
     return {value->begin(), value->end()};

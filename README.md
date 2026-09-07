@@ -197,6 +197,13 @@ CREATE SECRET ora_tls (
 | `TLS_SERVER_CERT_DN` | Require this exact certificate subject, in addition to the hostname |
 | `CONNECT_TIMEOUT`, `READ_TIMEOUT` | Socket timeouts in seconds |
 
+**The database's character set does not matter.** There is nothing to configure
+and nothing to convert on your side: the client asks Oracle for AL32UTF8 and the
+server converts, so text arrives as UTF-8 and is taken back as UTF-8 whatever
+the database is stored in. Verified live against `TR8MSWIN1254`,
+`WE8MSWIN1252`, `ZHS16GBK` and `AL32UTF8`, reading and writing text that only
+exists in each of those character sets.
+
 **A service name, not a SID.** The connect descriptor this client builds always
 uses `(CONNECT_DATA=(SERVICE_NAME=...))`; there is no `SID` field. On an older
 non-CDB instance where you are used to connecting by SID, ask the database for a
@@ -488,7 +495,7 @@ handshake and an authentication round trip: against a cloud endpoint that was
 | `NUMBER(p,0)`, p ≤ 18 | `BIGINT` | |
 | `NUMBER(p,s)` | `DECIMAL(p,s)` | up to p = 38 |
 | `NUMBER` (unconstrained) | `VARCHAR` | exact only as text |
-| `VARCHAR2`, `CHAR` | `VARCHAR` | |
+| `VARCHAR2`, `CHAR` | `VARCHAR` | UTF-8, whatever the database character set is |
 | `DATE` | `TIMESTAMP` | an Oracle `DATE` carries a time, so it is not a DuckDB `DATE` |
 | `TIMESTAMP(0–6)` | `TIMESTAMP` | |
 | `TIMESTAMP(7–9)` | `TIMESTAMP_NS` | |
