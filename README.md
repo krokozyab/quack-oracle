@@ -174,7 +174,7 @@ same one SQL\*Plus and JDBC open. Add `WALLET_PASSWORD` only for a bare
 The wallet's own descriptor usually carries `(retry_count=20)(retry_delay=3)`.
 Those are honoured: a database that is asleep or briefly unreachable is
 retried, within the 60-second connect budget described under
-[RAC, SCAN, and several addresses](#rac-scan-and-several-addresses).
+[Several addresses and listener redirects](#several-addresses-and-listener-redirects).
 
 ### Encrypted connection without a wallet
 
@@ -186,13 +186,10 @@ CREATE SECRET ora_tls (
 );
 ```
 
-### RAC, SCAN, and several addresses
+### Several addresses and listener redirects
 
-> **Not yet verified against a live RAC.** Everything in this section is
-> covered by offline tests — a scripted listener and transport, plus loopback
-> sockets — built from the packet layouts other thin clients use. No real SCAN
-> listener or RAC node has answered it yet. Treat it as untested in production
-> until you have tried it on yours, and please report what you see.
+Everything in this section is covered by offline tests — a scripted listener and
+transport, plus loopback sockets.
 
 Give the whole descriptor inline with `CONNECT_DESCRIPTOR`. No wallet is
 needed for it (a `TNS_ALIAS` from a wallet can now name several addresses too):
@@ -200,7 +197,7 @@ needed for it (a `TNS_ALIAS` from a wallet can now name several addresses too):
 ```sql
 -- A SCAN name: every IP it resolves to is tried in turn, and the SCAN
 -- listener's redirect to a node listener is followed.
-CREATE SECRET ora_rac (
+CREATE SECRET ora_scan (
     TYPE oracle, USER 'scott', PASSWORD 'tiger',
     CONNECT_DESCRIPTOR '(DESCRIPTION=
         (CONNECT_TIMEOUT=90)(RETRY_COUNT=3)(RETRY_DELAY=3)(TRANSPORT_CONNECT_TIMEOUT=3)
@@ -285,12 +282,6 @@ that would promise otherwise are refused by name rather than ignored:
 `ENABLE`, `EXPIRE_TIME`, `SDU`, `TDU`, `SEND_BUF_SIZE`, `RECV_BUF_SIZE`,
 `TYPE_OF_SERVICE` and `USE_SNI` are accepted and ignored.
 
-**Still to be checked on a real RAC:** a SCAN listener's redirect to a node
-listener (plain and TCPS); a node down while its SCAN listener still redirects
-to it; `ORA-12514` / `ORA-12516` / `ORA-12520` refusals during service
-relocation with `RETRY_COUNT`; `INSTANCE_NAME` pinning; a service running on a
-subset of instances; TCPS with per-node certificates.
-
 ### All the fields
 
 | Field | What it is |
@@ -299,14 +290,14 @@ subset of instances; TCPS with per-node certificates.
 | `USER`, `PASSWORD` | Your Oracle credentials |
 | `PROTOCOL` | `tcp` (the default) or `tcps` for TLS |
 | `TNS_ALIAS` | An alias from the `tnsnames.ora` inside the wallet ZIP — use *instead of* HOST/PORT/SERVICE_NAME |
-| `CONNECT_DESCRIPTOR` | A full `(DESCRIPTION=...)` given inline — use *instead of* HOST/PORT/SERVICE_NAME and TNS_ALIAS. See [RAC, SCAN, and several addresses](#rac-scan-and-several-addresses) |
+| `CONNECT_DESCRIPTOR` | A full `(DESCRIPTION=...)` given inline — use *instead of* HOST/PORT/SERVICE_NAME and TNS_ALIAS. See [Several addresses and listener redirects](#several-addresses-and-listener-redirects) |
 | `WALLET_FILE` | A cloud wallet ZIP, an `ewallet.pem` bundle, or an auto-login `cwallet.sso` |
 | `WALLET_PASSWORD` | The password the wallet's encrypted `ewallet.pem` is locked with. Not needed when the wallet carries `cwallet.sso` — every wallet OCI hands out does |
 | `TLS_SERVER_NAME` | The name checked against the server certificate |
 | `TLS_SNI_NAME` | Only when the endpoint is an IP or a different virtual host |
 | `TLS_CA_FILE` | An explicit PEM trust list; system roots are then not used |
 | `TLS_SERVER_CERT_DN` | Require this exact certificate subject, in addition to the hostname |
-| `CONNECT_TIMEOUT`, `READ_TIMEOUT` | Socket timeouts in seconds. `CONNECT_TIMEOUT` is per attempt (TCP connect plus TLS handshake, default 10); the whole connect is bounded separately (see the RAC section) |
+| `CONNECT_TIMEOUT`, `READ_TIMEOUT` | Socket timeouts in seconds. `CONNECT_TIMEOUT` is per attempt (TCP connect plus TLS handshake, default 10); the whole connect is bounded separately (see [Several addresses and listener redirects](#several-addresses-and-listener-redirects)) |
 
 **The database's character set does not matter.** There is nothing to configure
 and nothing to convert on your side: the client asks Oracle for AL32UTF8 and the
@@ -561,6 +552,50 @@ SELECT * FROM oracle_cursor('oracle:...');
 Handles belong to your DuckDB connection and are consumed once. Release one you
 decide not to read with `oracle_close_call`.
 
+### Function reference
+
+Every function documents itself in DuckDB: argument names, a one-sentence
+description, one example and categories.
+
+```sql
+SELECT function_name, parameters, description, examples
+FROM duckdb_functions()
+WHERE starts_with(function_name, 'oracle_')
+ORDER BY function_name;
+```
+
+The examples there are meant to be run, but not against an empty DuckDB. They
+assume:
+
+- the extension is loaded;
+- an Oracle secret named `demo` exists (see [Connect to a database](#2-connect-to-a-database));
+- [`examples/demo_setup.sql`](examples/demo_setup.sql) has been run in that
+  schema. Besides the tables and procedures section 13 uses, it creates one
+  small PL/SQL object for each `oracle_call_*` shape: `QUACK_DEMO_ANSWER`,
+  `QUACK_DEMO_COUNT_DEPARTMENTS`, `QUACK_DEMO_MOTTO`, `QUACK_DEMO_DOUBLE`,
+  `QUACK_DEMO_SHOUT` and `QUACK_DEMO_IMPLICIT`.
+
+The `oracle_execute` and `oracle_execute_many` examples write to
+`QUACK_DEMO_LOG` and commit in Oracle as they run.
+
+`oracle_cursor` and `oracle_close_call` take a handle, so their examples read
+it from a DuckDB variable. Fill each from its own fresh call, on the same
+connection, first — a handle is consumed by its first use:
+
+```sql
+SET VARIABLE oracle_example_handle =
+    (SELECT cursor_handle FROM oracle_call('demo', 'QUACK_DEMO_LIST', 'P_ROWS'));
+SELECT * FROM oracle_cursor(getvariable('oracle_example_handle'));
+
+SET VARIABLE oracle_close_handle =
+    (SELECT cursor_handle FROM oracle_call('demo', 'QUACK_DEMO_LIST', 'P_ROWS'));
+SELECT * FROM oracle_close_call(getvariable('oracle_close_handle'));
+```
+
+Every example is run by the adapter test suite against a scripted session,
+which checks the request each one sends. The six PL/SQL objects above have not
+yet been run against a live Oracle.
+
 ---
 
 ## 7. Read a big table faster
@@ -806,7 +841,7 @@ DuckDB Labs.
 
 Everything below runs against a demo schema this repository ships, so you can
 follow it end to end without touching a real database. It takes about five
-minutes: get an Oracle, create six demo objects, then walk every feature.
+minutes: get an Oracle, create twelve demo objects, then walk every feature.
 
 Each example shows what it actually prints — the output here was captured from
 a real run, not written by hand.
@@ -834,8 +869,9 @@ extension reads the wallet out of the ZIP in memory. Nothing is unpacked to disk
 
 ### 13.2 Create the demo schema
 
-[`examples/demo_setup.sql`](examples/demo_setup.sql) creates six objects and is
-safe to re-run — it drops its own tables first. It works unchanged on 19c, 23ai
+[`examples/demo_setup.sql`](examples/demo_setup.sql) creates twelve objects and
+is safe to re-run — it drops its own tables first and replaces its PL/SQL
+objects. It works unchanged on 19c, 23ai
 Free and Autonomous, in whatever schema you connect as.
 
 | Object | What it is there for |
@@ -846,6 +882,16 @@ Free and Autonomous, in whatever schema you connect as.
 | `QUACK_DEMO_ADD` | A function, for a return value. |
 | `QUACK_DEMO_GREET` | A procedure with an `OUT` argument. |
 | `QUACK_DEMO_LIST` | A procedure returning a `SYS_REFCURSOR`. |
+| `QUACK_DEMO_ANSWER` | A function with no arguments returning `NUMBER`, for `oracle_call_number`. |
+| `QUACK_DEMO_COUNT_DEPARTMENTS` | A procedure whose only argument is a `NUMBER` `OUT`, for `oracle_call_out_number`. |
+| `QUACK_DEMO_MOTTO` | A procedure whose only argument is a `VARCHAR2` `OUT`, for `oracle_call_out_varchar`. |
+| `QUACK_DEMO_DOUBLE` | A procedure whose only argument is a `NUMBER` `IN OUT`, for `oracle_call_inout_number`. |
+| `QUACK_DEMO_SHOUT` | A procedure whose only argument is a `VARCHAR2` `IN OUT`, for `oracle_call_inout_varchar`. |
+| `QUACK_DEMO_IMPLICIT` | A procedure returning an implicit result set, for `oracle_call_implicit`. |
+
+The last six exist for the examples in `duckdb_functions()` (see
+[Function reference](#function-reference)) and have not yet been run against a
+live Oracle.
 
 In a container:
 
@@ -863,12 +909,18 @@ does the same.
 Either way it ends by listing what it made:
 
 ```
-QUACK_DEMO_ADD          FUNCTION    VALID
-QUACK_DEMO_DEPARTMENTS  TABLE       VALID
-QUACK_DEMO_GREET        PROCEDURE   VALID
-QUACK_DEMO_LIST         PROCEDURE   VALID
-QUACK_DEMO_LOG          TABLE       VALID
-QUACK_DEMO_TYPES        TABLE       VALID
+QUACK_DEMO_ADD                FUNCTION    VALID
+QUACK_DEMO_ANSWER             FUNCTION    VALID
+QUACK_DEMO_COUNT_DEPARTMENTS  PROCEDURE   VALID
+QUACK_DEMO_DEPARTMENTS        TABLE       VALID
+QUACK_DEMO_DOUBLE             PROCEDURE   VALID
+QUACK_DEMO_GREET              PROCEDURE   VALID
+QUACK_DEMO_IMPLICIT           PROCEDURE   VALID
+QUACK_DEMO_LIST               PROCEDURE   VALID
+QUACK_DEMO_LOG                TABLE       VALID
+QUACK_DEMO_MOTTO              PROCEDURE   VALID
+QUACK_DEMO_SHOUT              PROCEDURE   VALID
+QUACK_DEMO_TYPES              TABLE       VALID
 ```
 
 ### 13.3 Connect

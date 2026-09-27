@@ -12,6 +12,8 @@
 #include "oracle_scanner/value_codec.hpp"
 #include "oracle_scanner_extension.hpp"
 #include "oracle_adapter.hpp"
+#include "oracle_scanner/call_registry.hpp"
+#include "oracle_scanner/ttc_execute.hpp"
 
 #include "duckdb/common/exception/conversion_exception.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
@@ -21,6 +23,9 @@
 #include "duckdb/planner/filter/optional_filter.hpp"
 
 #include "duckdb.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
 #include <cassert>
 #include <csignal>
@@ -142,6 +147,14 @@ struct FakeScript {
     std::vector<OracleCallRequest> calls;
     std::vector<OracleBind> call_outputs;
     size_t call_explicit_cursors = 0;
+    size_t call_implicit_cursors = 0;
+    // When set, a call answers what it was asked rather than call_outputs: the
+    // return bind and every OUT or IN OUT scalar argument of the request, in
+    // that order, each valued from call_output_values by name (NULL when the
+    // script names none). That is the shape a real session returns, so a test
+    // does not have to restate the request it is checking.
+    bool call_echo_outputs = false;
+    std::map<std::string, WireValue> call_output_values;
 
     // Set to make the scripted cursor fail mid-stream, which is how a protocol
     // failure reaches the adapter after the bind has already succeeded.
@@ -335,8 +348,29 @@ public:
         script->calls.push_back(request);
         OracleCallResult result;
         result.outputs = script->call_outputs;
+        if (script->call_echo_outputs) {
+            result.outputs.clear();
+            const auto answer = [&](const OracleBind &bind) {
+                auto filled = bind;
+                const auto scripted = script->call_output_values.find(bind.name);
+                filled.value = scripted == script->call_output_values.end() ? WireValue() : scripted->second;
+                result.outputs.push_back(std::move(filled));
+            };
+            if (request.return_bind && request.return_bind->oracle_type != oracle_scanner::ORACLE_WIRE_TYPE_CURSOR) {
+                answer(*request.return_bind);
+            }
+            for (const auto &argument : request.arguments) {
+                if (argument.direction != oracle_scanner::BindDirection::BIND_IN &&
+                    argument.oracle_type != oracle_scanner::ORACLE_WIRE_TYPE_CURSOR) {
+                    answer(argument);
+                }
+            }
+        }
         for (size_t index = 0; index < script->call_explicit_cursors; index++) {
             result.explicit_cursors.push_back(std::make_unique<FakeCursor>(script));
+        }
+        for (size_t index = 0; index < script->call_implicit_cursors; index++) {
+            result.implicit_cursors.push_back(std::make_unique<FakeCursor>(script));
         }
         return result;
     }
@@ -1676,6 +1710,430 @@ void TestFailedStatementIsNotReplayed() {
     std::cout << "failed statements are not replayed" << std::endl;
 }
 
+// The dictionary rows ALL_ARGUMENTS gives for QUACK_DEMO_ADD in
+// examples/demo_setup.sql: the return value at position 0, then P_A and P_B.
+static std::vector<OracleColumn> DictionaryColumns() {
+    return {Column("OWNER", 1),     Column("PACKAGE_NAME", 1), Column("OBJECT_NAME", 1),
+            Column("OVERLOAD", 1),  Column("POSITION", 2),     Column("ARGUMENT_NAME", 1),
+            Column("DATA_TYPE", 1), Column("IN_OUT", 1),       Column("DATA_LEVEL", 2)};
+}
+
+static std::vector<WireRow> QuackDemoAddDictionary() {
+    const auto row = [](const std::string &position, const std::string &name, const std::string &in_out) {
+        return WireRow {Text("DEMO"),         WireValue(),    Text("QUACK_DEMO_ADD"), WireValue(), Number(position),
+                        name.empty() ? WireValue() : Text(name), Text("NUMBER"), Text(in_out),  Number("0")};
+    };
+    return {row("0", "", "OUT"), row("1", "P_A", "IN"), row("2", "P_B", "IN")};
+}
+
+static std::string Decoded(const std::optional<std::vector<uint8_t>> &wire) {
+    CHECK(wire.has_value());
+    return std::string(wire->begin(), wire->end());
+}
+
+// One registered example, and what it has to do against the fake session.
+struct FunctionExampleCase {
+    std::function<void(FakeScript &)> setup;
+    // Statements run first, on the same connection, as the README's function
+    // reference tells a reader to.
+    std::vector<std::string> prerequisites;
+    std::function<void(FakeScript &, duckdb::MaterializedQueryResult &)> verify;
+};
+
+static std::map<std::string, FunctionExampleCase> FunctionExampleCases() {
+    using duckdb::MaterializedQueryResult;
+    using oracle_scanner::BindDirection;
+    using oracle_scanner::OracleCallableKind;
+    const auto departments = [](FakeScript &script) {
+        script.columns = {Column("DEPARTMENT_ID", 2, 6, 0), Column("DEPARTMENT_NAME", 1)};
+        script.rows = {{Number("10"), Text("ACCOUNTING")}, {Number("20"), Text("RESEARCH")},
+                       {Number("30"), Text("SALES")},      {Number("40"), Text("OPERATIONS")}};
+    };
+    const auto one_call = [](FakeScript &script) -> const OracleCallRequest & {
+        CHECK(script.calls.size() == 1);
+        return script.calls[0];
+    };
+    std::map<std::string, FunctionExampleCase> cases;
+
+    cases["oracle_scanner_version"] = {nullptr, {}, [](FakeScript &, MaterializedQueryResult &result) {
+                                           CHECK(result.RowCount() == 1 &&
+                                                 !result.GetValue(0, 0).ToString().empty());
+                                       }};
+    cases["oracle_query"] = {[](FakeScript &script) {
+                                 script.columns = {Column("VALUE", 2)};
+                                 script.rows = {{Number("42")}};
+                             },
+                             {},
+                             [](FakeScript &script, MaterializedQueryResult &result) {
+                                 CHECK(script.queries.back() == "SELECT :1 AS value FROM dual");
+                                 CHECK(script.query_binds.back().size() == 1);
+                                 CHECK(result.RowCount() == 1 && result.GetValue(0, 0).ToString() == "42");
+                             }};
+    cases["oracle_execute"] = {[](FakeScript &script) { script.affected_rows = 1; },
+                               {},
+                               [](FakeScript &script, MaterializedQueryResult &result) {
+                                   CHECK(script.counted_executes.size() == 1 &&
+                                         script.counted_executes[0].find("INSERT INTO QUACK_DEMO_LOG") == 0);
+                                   CHECK(script.counted_execute_binds[0].size() == 2);
+                                   CHECK(result.GetValue(0, 0).GetValue<int64_t>() == 1);
+                               }};
+    cases["oracle_execute_many"] = {[](FakeScript &script) { script.affected_rows = 1; },
+                                    {},
+                                    [](FakeScript &script, MaterializedQueryResult &result) {
+                                        CHECK(script.batch_rows.size() == 2 && script.batch_rows[0].size() == 2);
+                                        CHECK(result.GetValue(0, 0).GetValue<int64_t>() == 2);
+                                    }};
+    cases["oracle_call_number"] = {[](FakeScript &script) {
+                                       script.call_echo_outputs = true;
+                                       script.call_output_values["r"] = Number("42");
+                                   },
+                                   {},
+                                   [one_call](FakeScript &script, MaterializedQueryResult &result) {
+                                       const auto &call = one_call(script);
+                                       CHECK(call.kind == OracleCallableKind::FUNCTION &&
+                                             call.qualified_name == "QUACK_DEMO_ANSWER" && call.arguments.empty());
+                                       CHECK(result.GetValue(0, 0).ToString() == "42");
+                                   }};
+    cases["oracle_call_number_args"] = {
+        [](FakeScript &script) {
+            script.call_echo_outputs = true;
+            script.call_output_values["r"] = Number("5");
+        },
+        {},
+        [one_call](FakeScript &script, MaterializedQueryResult &result) {
+            const auto &call = one_call(script);
+            CHECK(call.kind == OracleCallableKind::FUNCTION && call.qualified_name == "QUACK_DEMO_ADD");
+            CHECK(call.arguments.size() == 2 && call.arguments[0].name == "P_A" && call.arguments[1].name == "P_B");
+            CHECK(call.arguments[0].direction == BindDirection::BIND_IN &&
+                  oracle_scanner::DecodeOracleNumber(*call.arguments[0].value) == "2");
+            CHECK(result.GetValue(0, 0).ToString() == "5");
+        }};
+    cases["oracle_call_out_number"] = {
+        [](FakeScript &script) {
+            script.call_echo_outputs = true;
+            script.call_output_values["P_COUNT"] = Number("4");
+        },
+        {},
+        [one_call](FakeScript &script, MaterializedQueryResult &result) {
+            const auto &call = one_call(script);
+            CHECK(call.kind == OracleCallableKind::PROCEDURE && call.qualified_name == "QUACK_DEMO_COUNT_DEPARTMENTS");
+            CHECK(call.arguments.size() == 1 && call.arguments[0].name == "P_COUNT" &&
+                  call.arguments[0].direction == BindDirection::BIND_OUT && call.arguments[0].oracle_type == 2);
+            CHECK(result.GetValue(0, 0).ToString() == "4");
+        }};
+    cases["oracle_call_out_varchar"] = {
+        [](FakeScript &script) {
+            script.call_echo_outputs = true;
+            script.call_output_values["P_TEXT"] = Text("no Oracle client required");
+        },
+        {},
+        [one_call](FakeScript &script, MaterializedQueryResult &result) {
+            const auto &call = one_call(script);
+            CHECK(call.qualified_name == "QUACK_DEMO_MOTTO" && call.arguments.size() == 1 &&
+                  call.arguments[0].name == "P_TEXT" && call.arguments[0].direction == BindDirection::BIND_OUT &&
+                  call.arguments[0].oracle_type == 1);
+            CHECK(result.GetValue(0, 0).ToString() == "no Oracle client required");
+        }};
+    cases["oracle_call_inout_number"] = {
+        [](FakeScript &script) {
+            script.call_echo_outputs = true;
+            script.call_output_values["P_VALUE"] = Number("42");
+        },
+        {},
+        [one_call](FakeScript &script, MaterializedQueryResult &result) {
+            const auto &call = one_call(script);
+            CHECK(call.qualified_name == "QUACK_DEMO_DOUBLE" && call.arguments.size() == 1 &&
+                  call.arguments[0].name == "P_VALUE" && call.arguments[0].direction == BindDirection::BIND_IN_OUT);
+            CHECK(oracle_scanner::DecodeOracleNumber(*call.arguments[0].value) == "21");
+            CHECK(result.GetValue(0, 0).ToString() == "42");
+        }};
+    cases["oracle_call_inout_varchar"] = {
+        [](FakeScript &script) {
+            script.call_echo_outputs = true;
+            script.call_output_values["P_TEXT"] = Text("QUACK");
+        },
+        {},
+        [one_call](FakeScript &script, MaterializedQueryResult &result) {
+            const auto &call = one_call(script);
+            CHECK(call.qualified_name == "QUACK_DEMO_SHOUT" && call.arguments.size() == 1 &&
+                  call.arguments[0].name == "P_TEXT" && call.arguments[0].direction == BindDirection::BIND_IN_OUT);
+            CHECK(Decoded(call.arguments[0].value) == "quack");
+            CHECK(result.GetValue(0, 0).ToString() == "QUACK");
+        }};
+    const auto one_handle = [](MaterializedQueryResult &result) {
+        CHECK(result.RowCount() == 1);
+        (void)oracle_scanner::ParseCursorHandle(result.GetValue(result.ColumnCount() - 1, 0).ToString());
+    };
+    cases["oracle_call"] = {[](FakeScript &script) { script.call_explicit_cursors = 1; },
+                            {},
+                            [one_call, one_handle](FakeScript &script, MaterializedQueryResult &result) {
+                                const auto &call = one_call(script);
+                                CHECK(call.qualified_name == "QUACK_DEMO_LIST" && call.arguments.size() == 1 &&
+                                      call.arguments[0].name == "P_ROWS" &&
+                                      call.arguments[0].oracle_type == oracle_scanner::ORACLE_WIRE_TYPE_CURSOR);
+                                one_handle(result);
+                            }};
+    cases["oracle_call_implicit"] = {[](FakeScript &script) { script.call_implicit_cursors = 1; },
+                                     {},
+                                     [one_call, one_handle](FakeScript &script, MaterializedQueryResult &result) {
+                                         const auto &call = one_call(script);
+                                         CHECK(call.qualified_name == "QUACK_DEMO_IMPLICIT" &&
+                                               call.arguments.empty());
+                                         one_handle(result);
+                                     }};
+    cases["oracle_call_cursors"] = {[](FakeScript &script) { script.call_explicit_cursors = 1; },
+                                    {},
+                                    [one_call, one_handle](FakeScript &script, MaterializedQueryResult &result) {
+                                        const auto &call = one_call(script);
+                                        CHECK(call.qualified_name == "QUACK_DEMO_LIST" &&
+                                              call.arguments.size() == 1 && call.arguments[0].name == "P_ROWS");
+                                        one_handle(result);
+                                    }};
+    cases["oracle_call_named"] = {
+        [](FakeScript &script) {
+            script.call_echo_outputs = true;
+            script.call_output_values["P_GREETING"] = Text("hello, world");
+        },
+        {},
+        [one_call](FakeScript &script, MaterializedQueryResult &result) {
+            const auto &call = one_call(script);
+            CHECK(call.kind == OracleCallableKind::PROCEDURE && call.qualified_name == "QUACK_DEMO_GREET");
+            CHECK(call.arguments.size() == 2 && call.arguments[0].name == "P_NAME" &&
+                  call.arguments[0].direction == BindDirection::BIND_IN && Decoded(call.arguments[0].value) == "world");
+            CHECK(call.arguments[1].name == "P_GREETING" && call.arguments[1].direction == BindDirection::BIND_OUT);
+            CHECK(result.RowCount() == 1 && result.GetValue(0, 0).ToString() == "P_GREETING" &&
+                  result.GetValue(1, 0).ToString() == "hello, world");
+        }};
+    cases["oracle_call_named_function"] = {
+        [](FakeScript &script) {
+            script.call_echo_outputs = true;
+            script.call_output_values["return_value"] = Number("5");
+        },
+        {},
+        [one_call](FakeScript &script, MaterializedQueryResult &result) {
+            const auto &call = one_call(script);
+            CHECK(call.kind == OracleCallableKind::FUNCTION && call.qualified_name == "QUACK_DEMO_ADD");
+            CHECK(call.return_bind && call.return_bind->oracle_type == 2);
+            CHECK(call.arguments.size() == 2 && call.arguments[1].name == "P_B" &&
+                  oracle_scanner::DecodeOracleNumber(*call.arguments[1].value) == "3");
+            CHECK(result.GetValue(0, 0).ToString() == "return_value" && result.GetValue(1, 0).ToString() == "5");
+        }};
+    cases["oracle_arguments"] = {[](FakeScript &script) {
+                                     script.columns = DictionaryColumns();
+                                     script.rows = QuackDemoAddDictionary();
+                                 },
+                                 {},
+                                 [](FakeScript &script, MaterializedQueryResult &result) {
+                                     CHECK(script.calls.empty());
+                                     CHECK(result.RowCount() == 3);
+                                     CHECK(result.GetValue(2, 1).ToString() == "P_A" &&
+                                           result.GetValue(2, 2).ToString() == "P_B");
+                                     for (duckdb::idx_t row = 0; row < 3; row++) {
+                                         CHECK(result.GetValue(6, row).IsNull());
+                                     }
+                                 }};
+    cases["oracle_call_auto"] = {
+        [](FakeScript &script) {
+            script.columns = DictionaryColumns();
+            script.rows = QuackDemoAddDictionary();
+            script.call_echo_outputs = true;
+            script.call_output_values["return_value"] = Number("5");
+        },
+        {},
+        [one_call](FakeScript &script, MaterializedQueryResult &result) {
+            const auto &call = one_call(script);
+            CHECK(call.kind == OracleCallableKind::FUNCTION &&
+                  call.qualified_name.find("QUACK_DEMO_ADD") != std::string::npos);
+            CHECK(call.arguments.size() == 2 && oracle_scanner::DecodeOracleNumber(*call.arguments[0].value) == "2" &&
+                  oracle_scanner::DecodeOracleNumber(*call.arguments[1].value) == "3");
+            CHECK(result.GetValue(0, 0).ToString() == "return_value" && result.GetValue(1, 0).ToString() == "5");
+        }};
+    // The two cursor examples read a handle from a DuckDB variable, which the
+    // README's function reference fills from a fresh call first — one call
+    // per example, since a handle is consumed.
+    cases["oracle_cursor"] = {
+        [departments](FakeScript &script) {
+            departments(script);
+            script.call_explicit_cursors = 1;
+        },
+        {"SET VARIABLE oracle_example_handle = (SELECT cursor_handle FROM oracle_call('demo', 'QUACK_DEMO_LIST', "
+         "'P_ROWS'));"},
+        [](FakeScript &, MaterializedQueryResult &result) {
+            CHECK(result.RowCount() == 4 && result.ColumnCount() == 2);
+            CHECK(result.GetValue(1, 3).ToString() == "OPERATIONS");
+        }};
+    cases["oracle_close_call"] = {
+        [departments](FakeScript &script) {
+            departments(script);
+            script.call_explicit_cursors = 1;
+        },
+        {"SET VARIABLE oracle_close_handle = (SELECT cursor_handle FROM oracle_call('demo', 'QUACK_DEMO_LIST', "
+         "'P_ROWS'));"},
+        [](FakeScript &script, MaterializedQueryResult &result) {
+            CHECK(result.RowCount() == 1 && result.GetValue(0, 0).GetValue<bool>());
+            CHECK(script.cursor_closes >= 1);
+        }};
+    cases["oracle_scan_parallel"] = {
+        [](FakeScript &script) {
+            script.routes.push_back({"get_system_change_number", {{Column("SCN", 2)}, {{Number("991144")}}}});
+            script.routes.push_back(
+                {"WHERE 1 = 0", {{Column("DEPARTMENT_ID", 2, 6, 0), Column("DEPARTMENT_NAME", 1)}, {}}});
+            script.routes.push_back({"MIN(", {{Column("LO", 2), Column("HI", 2), Column("NULLS", 2)},
+                                              {{Number("10"), Number("40"), Number("0")}}}});
+            script.tables["QUACK_DEMO_DEPARTMENTS"] = {{Column("DEPARTMENT_ID", 2, 6, 0), Column("DEPARTMENT_NAME", 1)},
+                                                     {{Number("10"), Text("ACCOUNTING")}}};
+        },
+        {},
+        [](FakeScript &script, MaterializedQueryResult &) {
+            size_t shards = 0;
+            for (const auto &statement : script.queries) {
+                if (statement.find("FROM \"QUACK_DEMO_DEPARTMENTS\" AS OF SCN 991144") != std::string::npos &&
+                    statement.find("\"DEPARTMENT_ID\" >= ") != std::string::npos) {
+                    shards++;
+                }
+            }
+            CHECK(shards == 4);
+        }};
+    return cases;
+}
+
+// Every example duckdb_functions() shows is run — the registered string itself,
+// not a copy of it — against a fake session in the environment the examples
+// promise: the extension loaded, a secret named `demo`, and the demo objects,
+// here scripted. Parsing alone would not show that the arguments are right,
+// so each case also checks the request the session actually received. Nothing
+// here reaches a network.
+void TestFunctionExamplesRun() {
+    std::vector<std::pair<std::string, std::string>> examples;
+    {
+        TestDatabase database;
+        auto listed = database.Query("SELECT function_name, function_type, examples FROM duckdb_functions() "
+                                     "WHERE starts_with(function_name, 'oracle_') ORDER BY function_name");
+        CHECK(!listed->HasError());
+        for (duckdb::idx_t row = 0; row < listed->RowCount(); row++) {
+            const auto list = duckdb::ListValue::GetChildren(listed->GetValue(2, row));
+            CHECK(list.size() == 1);
+            examples.emplace_back(listed->GetValue(0, row).ToString(), list[0].ToString());
+        }
+    }
+    auto cases = FunctionExampleCases();
+    // The same set on both sides: a function added without an executable
+    // example, or a case left for a function that is gone, fails here.
+    CHECK(examples.size() == cases.size() && examples.size() == 20);
+    for (const auto &example : examples) {
+        const auto found = cases.find(example.first);
+        if (found == cases.end()) {
+            std::cerr << "no example case for " << example.first << "\n";
+            CHECK(false && "function example without a test case");
+        }
+        auto script = std::make_shared<FakeScript>();
+        if (found->second.setup) {
+            found->second.setup(*script);
+        }
+        auto factory = InstallFake(script);
+        TestDatabase database;
+        database.Run("CREATE SECRET demo (TYPE oracle, HOST '127.0.0.1', PORT 1521, SERVICE_NAME 'service', "
+                     "USER 'app_user', PASSWORD 'placeholder');");
+        for (const auto &statement : found->second.prerequisites) {
+            database.Run(statement);
+        }
+        const auto is_scalar = example.first == "oracle_scanner_version";
+        // Parsing first, the way each kind of example is meant to be used: a
+        // scalar example is an expression, a table example one whole statement.
+        if (is_scalar) {
+            CHECK(duckdb::Parser::ParseExpressionList(example.second).size() == 1);
+        } else {
+            duckdb::Parser parser;
+            parser.ParseQuery(example.second);
+            CHECK(parser.statements.size() == 1 &&
+                  parser.statements[0]->type == duckdb::StatementType::SELECT_STATEMENT);
+        }
+        if (!is_scalar) {
+            // A table example is exactly one SELECT from its own function.
+            CHECK(example.second.rfind("SELECT * FROM " + example.first + "(", 0) == 0);
+            CHECK(example.second.back() == ';');
+        }
+        script->calls.clear();
+        auto result = database.Query(is_scalar ? "SELECT " + example.second : example.second);
+        if (result->HasError()) {
+            std::cerr << example.first << " example failed: " << result->GetError() << "\n";
+            CHECK(false && "a documented example does not run");
+        }
+        found->second.verify(*script, *result);
+    }
+
+    // A handle is consumed by its first use, so running the oracle_cursor
+    // example twice fails the second time: the reference has to tell readers
+    // to make a fresh call for each.
+    {
+        auto script = std::make_shared<FakeScript>();
+        script->columns = {Column("DEPARTMENT_ID", 2, 6, 0)};
+        script->rows = {{Number("10")}};
+        script->call_explicit_cursors = 1;
+        auto factory = InstallFake(script);
+        TestDatabase database;
+        database.Run("CREATE SECRET demo (TYPE oracle, HOST '127.0.0.1', PORT 1521, SERVICE_NAME 'service', "
+                     "USER 'app_user', PASSWORD 'placeholder');");
+        database.Run(cases["oracle_cursor"].prerequisites[0]);
+        const auto example = "SELECT * FROM oracle_cursor(getvariable('oracle_example_handle'));";
+        CHECK(!database.Query(example)->HasError());
+        CHECK(database.Query(example)->HasError());
+    }
+    std::cout << "every documented function example runs" << std::endl;
+}
+
+// Every documented registration uses ALTER_ON_CONFLICT, the conflict mode the
+// bare RegisterFunction overloads set. Loading the extension twice would not
+// show it — DuckDB may skip the second load — and registering the same
+// signature again fails under either mode, so the infos the extension
+// registers are inspected directly, all twenty of them.
+void TestDocumentedRegistrationsAlterOnConflict() {
+    std::vector<std::string> names;
+    const auto check = [&](const duckdb::CreateFunctionInfo &info, const std::string &name) {
+        CHECK(info.on_conflict == duckdb::OnCreateConflict::ALTER_ON_CONFLICT);
+        CHECK(info.descriptions.size() == 1 && !info.descriptions[0].description.empty() &&
+              info.descriptions[0].examples.size() == 1);
+        names.push_back(name);
+    };
+    const auto version = duckdb::OracleScannerVersionFunctionInfo();
+    check(version, version.functions.name);
+    for (const auto &info : duckdb::OracleQueryFunctionInfos()) {
+        check(info, info.functions.name);
+    }
+    const auto parallel = duckdb::OracleParallelScanFunctionInfo();
+    check(parallel, parallel.functions.name);
+    CHECK(names.size() == 20);
+
+    // And what that mode means on a database that already has the functions:
+    // an extra overload under an existing name is added to it, where
+    // ERROR_ON_CONFLICT refuses the same thing.
+    TestDatabase database;
+    duckdb::ExtensionLoader loader(*database.db.instance, "oracle_scanner");
+    const auto overload = [] {
+        return duckdb::TableFunction("oracle_arguments", {duckdb::LogicalType::INTEGER}, nullptr,
+                                     [](duckdb::ClientContext &, duckdb::TableFunctionBindInput &,
+                                        duckdb::vector<duckdb::LogicalType> &,
+                                        duckdb::vector<std::string> &) -> duckdb::unique_ptr<duckdb::FunctionData> {
+                                         return nullptr;
+                                     });
+    };
+    duckdb::CreateTableFunctionInfo strict(overload());
+    strict.on_conflict = duckdb::OnCreateConflict::ERROR_ON_CONFLICT;
+    bool refused = false;
+    try {
+        loader.RegisterFunction(std::move(strict));
+    } catch (const std::exception &) {
+        refused = true;
+    }
+    CHECK(refused);
+    duckdb::CreateTableFunctionInfo altering(overload());
+    altering.on_conflict = duckdb::OnCreateConflict::ALTER_ON_CONFLICT;
+    loader.RegisterFunction(std::move(altering));
+    auto listed = database.Query("SELECT count(*) FROM duckdb_functions() WHERE function_name = 'oracle_arguments'");
+    CHECK(!listed->HasError() && listed->GetValue(0, 0).GetValue<int64_t>() == 2);
+    std::cout << "documented registrations use ALTER_ON_CONFLICT" << std::endl;
+}
+
 int main() {
 
     TestQueryTypeMappingAndValues();
@@ -1703,6 +2161,8 @@ int main() {
     TestFunctionsCanReturnARefCursor();
     TestConnectDescriptorSecretReachesTheSession();
     TestFailedStatementIsNotReplayed();
+    TestFunctionExamplesRun();
+    TestDocumentedRegistrationsAlterOnConflict();
     std::cout << "oracle_scanner adapter tests passed\n";
     return 0;
 }

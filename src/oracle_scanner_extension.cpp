@@ -8,6 +8,7 @@
 
 namespace duckdb {
 
+void RegisterOracleScannerVersion(ExtensionLoader &loader);
 void RegisterOracleSecrets(ExtensionLoader &loader);
 void RegisterOracleQuery(ExtensionLoader &loader);
 void RegisterOracleAttachedCatalog(ExtensionLoader &loader);
@@ -28,9 +29,25 @@ static void OracleScannerVersion(DataChunk &args, ExpressionState &, Vector &res
 	    StringVector::AddString(result, ORACLE_SCANNER_VERSION_STRING);
 }
 
+CreateScalarFunctionInfo OracleScannerVersionFunctionInfo() {
+	CreateScalarFunctionInfo info(ScalarFunction("oracle_scanner_version", {}, LogicalType::VARCHAR, OracleScannerVersion));
+	// What the bare RegisterFunction(ScalarFunction) overload sets.
+	info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	FunctionDescription description;
+	description.description = "Returns the version of this oracle_scanner build.";
+	description.examples = {"oracle_scanner_version()"};
+	description.categories = {"oracle", "metadata"};
+	info.descriptions.push_back(std::move(description));
+	return info;
+}
+
+void RegisterOracleScannerVersion(ExtensionLoader &loader) {
+	loader.RegisterFunction(OracleScannerVersionFunctionInfo());
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	loader.SetDescription("Native Oracle TNS/TTC connectivity for DuckDB");
-	loader.RegisterFunction(ScalarFunction("oracle_scanner_version", {}, LogicalType::VARCHAR, OracleScannerVersion));
+	RegisterOracleScannerVersion(loader);
 	RegisterOracleSecrets(loader);
 	RegisterOracleQuery(loader);
 	RegisterOracleAttachedCatalog(loader);

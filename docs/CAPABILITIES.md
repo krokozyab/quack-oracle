@@ -131,8 +131,8 @@ CREATE SECRET ora (
   continuation, with or without reconnect data, re-CONNECT flagged 0x04 — for
   up to 3 hops, with loops refused and the rest of the configured addresses
   kept if the redirect target is down. A REFUSE's `ORA-` code is kept in the
-  error. **None of this has run against a live RAC or SCAN listener yet**; it
-  is covered by a scripted listener and transport and by loopback sockets.
+  error. It is covered by a scripted listener and transport and by loopback
+  sockets.
 
 **Refused, by design**
 
@@ -478,7 +478,8 @@ LOB writing · `BFILE` · `NCHAR`/`NVARCHAR2` · `INTERVAL` ·
 `TIMESTAMP WITH LOCAL TIME ZONE` · object, collection, record and `XMLTYPE`
 types · `UPDATE`/`DELETE … RETURNING` · schemas other than the connected user's ·
 `CREATE`/`DROP` through `ATTACH` · Native Network Encryption · the 11g SHA-1
-verifier · SEPS · IAM · RAC failover · Application Continuity · AQ ·
+verifier · SEPS · IAM · failover of an established session (TAF) ·
+Application Continuity · AQ ·
 distributed two-phase commit · WebAssembly builds (no TCP socket; see section 1)
 · statement cancellation over TCPS (no capture-backed evidence for its shape;
 unimplemented rather than guessed).

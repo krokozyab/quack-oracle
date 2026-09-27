@@ -330,3 +330,78 @@ statement error
 ATTACH 'missing_oracle_secret' AS missing_oracle (TYPE oracle_scanner);
 ----
 Binder Error: Oracle secret 'missing_oracle_secret' was not found
+
+# Every SQL function carries documentation in duckdb_functions(): the exact
+# list of twenty, their kinds, argument names in place of col0..colN, and the
+# argument types, varargs and named parameters exactly as they were before the
+# documentation was added.
+query TTTTT
+SELECT function_name, function_type, parameters, parameter_types, varargs
+FROM duckdb_functions()
+WHERE starts_with(function_name, 'oracle_')
+ORDER BY function_name;
+----
+oracle_arguments	table	[secret_name, callable_name]	[VARCHAR, VARCHAR]	NULL
+oracle_call	table	[secret_name, procedure_name, cursor_argument]	[VARCHAR, VARCHAR, VARCHAR]	NULL
+oracle_call_auto	table	[secret_name, callable_name, values]	[VARCHAR, VARCHAR, ANY]	NULL
+oracle_call_cursors	table	[secret_name, procedure_name, cursor_arguments]	[VARCHAR, VARCHAR, 'VARCHAR[]']	NULL
+oracle_call_implicit	table	[secret_name, procedure_name]	[VARCHAR, VARCHAR]	NULL
+oracle_call_inout_number	table	[secret_name, procedure_name, argument_name, value]	[VARCHAR, VARCHAR, VARCHAR, VARCHAR]	NULL
+oracle_call_inout_varchar	table	[secret_name, procedure_name, argument_name, value]	[VARCHAR, VARCHAR, VARCHAR, VARCHAR]	NULL
+oracle_call_named	table	[secret_name, procedure_name, arguments]	[VARCHAR, VARCHAR, ANY]	NULL
+oracle_call_named_function	table	[secret_name, function_name, return_type, arguments]	[VARCHAR, VARCHAR, VARCHAR, ANY]	NULL
+oracle_call_number	table	[secret_name, function_name]	[VARCHAR, VARCHAR]	NULL
+oracle_call_number_args	table	[secret_name, function_name, arguments]	[VARCHAR, VARCHAR, ANY]	NULL
+oracle_call_out_number	table	[secret_name, procedure_name, argument_name]	[VARCHAR, VARCHAR, VARCHAR]	NULL
+oracle_call_out_varchar	table	[secret_name, procedure_name, argument_name]	[VARCHAR, VARCHAR, VARCHAR]	NULL
+oracle_close_call	table	[cursor_handle]	[VARCHAR]	NULL
+oracle_cursor	table	[cursor_handle]	[VARCHAR]	NULL
+oracle_execute	table	[secret_name, sql]	[VARCHAR, VARCHAR]	ANY
+oracle_execute_many	table	[secret_name, sql, rows]	[VARCHAR, VARCHAR, ANY]	NULL
+oracle_query	table	[secret_name, sql]	[VARCHAR, VARCHAR]	ANY
+oracle_scan_parallel	table	[secret_name, table_name, key_column, shards]	[VARCHAR, VARCHAR, VARCHAR, BIGINT]	NULL
+oracle_scanner_version	scalar	[]	[]	NULL
+
+# One scalar and nineteen table functions, and no function whose documentation
+# is missing: a non-empty one-sentence description, exactly one non-empty
+# example, one or two categories starting with 'oracle', and no placeholder
+# argument names.
+query II
+SELECT count(*) FILTER (WHERE function_type = 'scalar'), count(*) FILTER (WHERE function_type = 'table')
+FROM duckdb_functions()
+WHERE starts_with(function_name, 'oracle_');
+----
+1	19
+
+query I
+SELECT count(*)
+FROM duckdb_functions()
+WHERE starts_with(function_name, 'oracle_')
+  AND (description IS NULL OR description = '' OR NOT ends_with(description, '.')
+       OR len(examples) <> 1 OR examples[1] IS NULL OR examples[1] = ''
+       OR len(categories) NOT BETWEEN 1 AND 2 OR categories[1] <> 'oracle'
+       OR len(list_filter(parameters, p -> regexp_matches(p, '^col[0-9]+$'))) > 0);
+----
+0
+
+# Each table example is a single SELECT from its own function, and the scalar
+# example is the bare expression, with no SELECT of its own.
+query I
+SELECT count(*)
+FROM duckdb_functions()
+WHERE starts_with(function_name, 'oracle_')
+  AND function_type = 'table'
+  AND NOT (starts_with(examples[1], 'SELECT * FROM ' || function_name || '(') AND ends_with(examples[1], ');'));
+----
+0
+
+query T
+SELECT examples[1] FROM duckdb_functions() WHERE function_name = 'oracle_scanner_version';
+----
+oracle_scanner_version()
+
+# The scalar example evaluates, and gives the same answer as the direct call.
+query I
+SELECT oracle_scanner_version() = (SELECT oracle_scanner_version());
+----
+true

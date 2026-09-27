@@ -15,6 +15,8 @@
 
 #include <cstdint>
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/planner/table_filter.hpp"
 
@@ -102,6 +104,30 @@ public:
     //! still have a cursor open on it.
     std::shared_ptr<OracleSession> borrowed;
 };
+
+//! What duckdb_functions() shows for one SQL function: argument names for the
+//! positional and named parameters, in that order, a one-sentence description,
+//! one example and its categories.
+struct OracleFunctionDocumentation {
+    vector<string> parameter_names;
+    string description;
+    string example;
+    vector<string> categories;
+};
+
+//! The registration of an already configured table function with its
+//! documentation. Taking the finished TableFunction keeps its varargs, named
+//! parameters and callbacks exactly as they were; the conflict mode is
+//! ALTER_ON_CONFLICT, the same the bare RegisterFunction(TableFunction) overload
+//! sets.
+CreateTableFunctionInfo DocumentedTableFunctionInfo(TableFunction function, OracleFunctionDocumentation documentation);
+
+//! What each documented registration registers, built apart from registering
+//! it so that a test can inspect every info — its conflict mode and its
+//! description — directly. The Register* functions register exactly these.
+CreateScalarFunctionInfo OracleScannerVersionFunctionInfo();
+vector<CreateTableFunctionInfo> OracleQueryFunctionInfos();
+CreateTableFunctionInfo OracleParallelScanFunctionInfo();
 
 //! A read session for this connection and secret, pooled when
 //! oracle_session_pool_size allows it.

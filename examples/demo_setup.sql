@@ -1,8 +1,9 @@
 -- oracle_scanner demo schema.
 --
--- Creates four objects the README's "Try it yourself" section uses. Safe to
--- run more than once: existing demo objects are dropped first. Works on
--- Oracle 19c, 23ai Free and OCI Autonomous, in whatever schema you connect as.
+-- Creates the objects the README's "Try it yourself" section and the examples
+-- in duckdb_functions() use. Safe to run more than once: existing demo tables
+-- are dropped first and the PL/SQL objects are replaced. Works on Oracle 19c,
+-- 23ai Free and OCI Autonomous, in whatever schema you connect as.
 --
 --   sqlplus user/password@host:1521/service @demo_setup.sql
 
@@ -86,6 +87,58 @@ END;
 CREATE OR REPLACE PROCEDURE QUACK_DEMO_LIST(P_ROWS OUT SYS_REFCURSOR) IS
 BEGIN
     OPEN P_ROWS FOR SELECT DEPARTMENT_ID, DEPARTMENT_NAME FROM QUACK_DEMO_DEPARTMENTS ORDER BY DEPARTMENT_ID;
+END;
+/
+
+-- One small object per call shape the oracle_call_* family has, so every
+-- function's documented example has something of exactly that shape to call.
+-- TODO(live): these six have not yet been run against a live Oracle; only their
+-- argument shapes are checked, offline, by TestFunctionExamplesRun in
+-- test/cpp/adapter_test.cpp. Run demo_setup.sql and every duckdb_functions()
+-- example against 19c and 23ai before calling them verified.
+
+-- oracle_call_number: a function with no arguments returning NUMBER.
+CREATE OR REPLACE FUNCTION QUACK_DEMO_ANSWER RETURN NUMBER IS
+BEGIN
+    RETURN 42;
+END;
+/
+
+-- oracle_call_out_number: a procedure whose only argument is a NUMBER OUT.
+CREATE OR REPLACE PROCEDURE QUACK_DEMO_COUNT_DEPARTMENTS(P_COUNT OUT NUMBER) IS
+BEGIN
+    SELECT COUNT(*) INTO P_COUNT FROM QUACK_DEMO_DEPARTMENTS;
+END;
+/
+
+-- oracle_call_out_varchar: a procedure whose only argument is a VARCHAR2 OUT.
+CREATE OR REPLACE PROCEDURE QUACK_DEMO_MOTTO(P_TEXT OUT VARCHAR2) IS
+BEGIN
+    P_TEXT := 'no Oracle client required';
+END;
+/
+
+-- oracle_call_inout_number: a procedure whose only argument is a NUMBER IN OUT.
+CREATE OR REPLACE PROCEDURE QUACK_DEMO_DOUBLE(P_VALUE IN OUT NUMBER) IS
+BEGIN
+    P_VALUE := P_VALUE * 2;
+END;
+/
+
+-- oracle_call_inout_varchar: a procedure whose only argument is a VARCHAR2 IN OUT.
+CREATE OR REPLACE PROCEDURE QUACK_DEMO_SHOUT(P_TEXT IN OUT VARCHAR2) IS
+BEGIN
+    P_TEXT := UPPER(P_TEXT);
+END;
+/
+
+-- oracle_call_implicit: a procedure with no arguments returning an implicit
+-- result set (Oracle 12c and later).
+CREATE OR REPLACE PROCEDURE QUACK_DEMO_IMPLICIT IS
+    departments SYS_REFCURSOR;
+BEGIN
+    OPEN departments FOR SELECT DEPARTMENT_ID, DEPARTMENT_NAME FROM QUACK_DEMO_DEPARTMENTS ORDER BY DEPARTMENT_ID;
+    DBMS_SQL.RETURN_RESULT(departments);
 END;
 /
 

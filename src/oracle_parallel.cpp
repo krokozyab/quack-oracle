@@ -350,13 +350,24 @@ void OracleParallelFunction(ClientContext &context, TableFunctionInput &input, D
 
 } // namespace
 
-void RegisterOracleParallelScan(ExtensionLoader &loader) {
+CreateTableFunctionInfo OracleParallelScanFunctionInfo() {
     TableFunction function("oracle_scan_parallel",
                            {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
                            OracleParallelFunction, OracleParallelBind, OracleParallelInitGlobal,
                            OracleParallelInitLocal);
     function.named_parameters["shards"] = LogicalType::BIGINT;
-    loader.RegisterFunction(function);
+    // The named parameter is listed after the positional ones, which is where
+    // duckdb_functions() puts it; without a name for it, it would show as col3.
+    return DocumentedTableFunctionInfo(
+        std::move(function),
+        {{"secret_name", "table_name", "key_column", "shards"},
+         "Reads one Oracle table through several sessions in ranges of an integral NUMBER key, all at a single SCN.",
+         "SELECT * FROM oracle_scan_parallel('demo', 'QUACK_DEMO_DEPARTMENTS', 'DEPARTMENT_ID', shards := 4);",
+         {"oracle", "query"}});
+}
+
+void RegisterOracleParallelScan(ExtensionLoader &loader) {
+    loader.RegisterFunction(OracleParallelScanFunctionInfo());
 }
 
 } // namespace duckdb

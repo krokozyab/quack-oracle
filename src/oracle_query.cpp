@@ -15,6 +15,7 @@
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/main/secret/secret.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/main/client_context_state.hpp"
@@ -1616,65 +1617,187 @@ void OracleQueryFunction(ClientContext &, TableFunctionInput &input, DataChunk &
 }
 
 
-void RegisterOracleQuery(ExtensionLoader &loader) {
-    TableFunction function("oracle_query", {LogicalType::VARCHAR, LogicalType::VARCHAR}, OracleQueryFunction, OracleQueryBind,
-                           OracleQueryInit);
-    function.varargs = LogicalType::ANY;
-    loader.RegisterFunction(function);
+CreateTableFunctionInfo DocumentedTableFunctionInfo(TableFunction function, OracleFunctionDocumentation documentation) {
+    CreateTableFunctionInfo info(std::move(function));
+    info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+    FunctionDescription description;
+    description.parameter_names = std::move(documentation.parameter_names);
+    description.description = std::move(documentation.description);
+    description.examples = {std::move(documentation.example)};
+    description.categories = std::move(documentation.categories);
+    info.descriptions.push_back(std::move(description));
+    return info;
+}
+
+// Every example below assumes the extension is loaded, an Oracle secret named
+// `demo` exists, and examples/demo_setup.sql has been run in that schema; see
+// the "Function reference" section of README.md. oracle_cursor and
+// oracle_close_call also need a handle stored in a DuckDB variable first, as
+// that section shows. None of them runs against an empty DuckDB.
+vector<CreateTableFunctionInfo> OracleQueryFunctionInfos() {
+    vector<CreateTableFunctionInfo> infos;
+    TableFunction query("oracle_query", {LogicalType::VARCHAR, LogicalType::VARCHAR}, OracleQueryFunction, OracleQueryBind,
+                        OracleQueryInit);
+    query.varargs = LogicalType::ANY;
+    infos.push_back(DocumentedTableFunctionInfo(
+        std::move(query),
+        {{"secret_name", "sql", "params"},
+         "Runs an Oracle SELECT query with optional positional or named bind parameters and returns its rows.",
+         "SELECT * FROM oracle_query('demo', 'SELECT :1 AS value FROM dual', [42]);",
+         {"oracle", "query"}}));
 
     TableFunction execute("oracle_execute", {LogicalType::VARCHAR, LogicalType::VARCHAR}, OracleExecuteFunction,
                           OracleExecuteBind, OracleExecuteInit);
     execute.varargs = LogicalType::ANY;
-    loader.RegisterFunction(execute);
+    infos.push_back(DocumentedTableFunctionInfo(
+        std::move(execute),
+        {{"secret_name", "sql", "params"},
+         "Runs one Oracle INSERT, UPDATE or DELETE with optional positional or named bind parameters, commits it in "
+         "Oracle, and returns affected_rows.",
+         "SELECT * FROM oracle_execute('demo', 'INSERT INTO QUACK_DEMO_LOG (LABEL, AMOUNT) VALUES (:label, :amount)', "
+         "{'label': 'example', 'amount': 1.5});",
+         {"oracle", "write"}}));
 
-    loader.RegisterFunction(TableFunction("oracle_execute_many",
-                                          {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
-                                          OracleExecuteFunction, OracleExecuteManyBind, OracleExecuteManyInit));
+    infos.push_back(DocumentedTableFunctionInfo(
+        TableFunction("oracle_execute_many", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
+                      OracleExecuteFunction, OracleExecuteManyBind, OracleExecuteManyInit),
+        {{"secret_name", "sql", "rows"},
+         "Runs one Oracle INSERT, UPDATE or DELETE once for each bind record in a list using array DML, "
+         "commits it in Oracle, and returns the total affected_rows.",
+         "SELECT * FROM oracle_execute_many('demo', 'INSERT INTO QUACK_DEMO_LOG (LABEL, AMOUNT) VALUES (:label, "
+         ":amount)', [{'label': 'a', 'amount': 1.5}, {'label': 'b', 'amount': 2.5}]);",
+         {"oracle", "write"}}));
 
-    loader.RegisterFunction(TableFunction("oracle_call_number", {LogicalType::VARCHAR, LogicalType::VARCHAR},
-                                          OracleCallNumberFunction, OracleCallNumberBind, OracleCallNumberInit));
-    loader.RegisterFunction(TableFunction("oracle_call_number_args",
-                                          {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
-                                          OracleCallNumberFunction, OracleCallNumberArgsBind, OracleCallNumberArgsInit));
-    loader.RegisterFunction(TableFunction("oracle_call_out_number",
-                                          {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-                                          OracleCallNumberFunction, OracleCallOutNumberBind, OracleCallOutNumberInit));
-    loader.RegisterFunction(TableFunction("oracle_call_out_varchar",
-                                          {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-                                          OracleCallNumberFunction, OracleCallOutVarcharBind, OracleCallOutVarcharInit));
-    loader.RegisterFunction(TableFunction("oracle_call_inout_number",
-                                          {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-                                           LogicalType::VARCHAR},
-                                          OracleCallNumberFunction, OracleCallInOutNumberBind, OracleCallInOutNumberInit));
-    loader.RegisterFunction(TableFunction("oracle_call_inout_varchar",
-                                          {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-                                           LogicalType::VARCHAR},
-                                          OracleCallNumberFunction, OracleCallInOutVarcharBind, OracleCallInOutVarcharInit));
+    infos.push_back(DocumentedTableFunctionInfo(
+        TableFunction("oracle_call_number", {LogicalType::VARCHAR, LogicalType::VARCHAR}, OracleCallNumberFunction,
+                      OracleCallNumberBind, OracleCallNumberInit),
+        {{"secret_name", "function_name"},
+         "Calls an Oracle function that takes no arguments and returns NUMBER, and returns its result as text.",
+         "SELECT * FROM oracle_call_number('demo', 'QUACK_DEMO_ANSWER');",
+         {"oracle", "call"}}));
+    infos.push_back(DocumentedTableFunctionInfo(
+        TableFunction("oracle_call_number_args", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
+                      OracleCallNumberFunction, OracleCallNumberArgsBind, OracleCallNumberArgsInit),
+        {{"secret_name", "function_name", "arguments"},
+         "Calls an Oracle function that returns NUMBER with named IN arguments taken from a STRUCT, and returns its "
+         "result as text.",
+         "SELECT * FROM oracle_call_number_args('demo', 'QUACK_DEMO_ADD', {P_A: 2, P_B: 3});",
+         {"oracle", "call"}}));
+    infos.push_back(DocumentedTableFunctionInfo(
+        TableFunction("oracle_call_out_number", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+                      OracleCallNumberFunction, OracleCallOutNumberBind, OracleCallOutNumberInit),
+        {{"secret_name", "procedure_name", "argument_name"},
+         "Calls an Oracle procedure whose only argument is a NUMBER OUT, and returns that value as text.",
+         "SELECT * FROM oracle_call_out_number('demo', 'QUACK_DEMO_COUNT_DEPARTMENTS', 'P_COUNT');",
+         {"oracle", "call"}}));
+    infos.push_back(DocumentedTableFunctionInfo(
+        TableFunction("oracle_call_out_varchar", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+                      OracleCallNumberFunction, OracleCallOutVarcharBind, OracleCallOutVarcharInit),
+        {{"secret_name", "procedure_name", "argument_name"},
+         "Calls an Oracle procedure whose only argument is a VARCHAR2 OUT, and returns that value.",
+         "SELECT * FROM oracle_call_out_varchar('demo', 'QUACK_DEMO_MOTTO', 'P_TEXT');",
+         {"oracle", "call"}}));
+    infos.push_back(DocumentedTableFunctionInfo(
+        TableFunction("oracle_call_inout_number",
+                      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+                      OracleCallNumberFunction, OracleCallInOutNumberBind, OracleCallInOutNumberInit),
+        {{"secret_name", "procedure_name", "argument_name", "value"},
+         "Passes a NUMBER, given as text, to an Oracle procedure's only argument, an IN OUT, and returns the updated "
+         "value as text.",
+         "SELECT * FROM oracle_call_inout_number('demo', 'QUACK_DEMO_DOUBLE', 'P_VALUE', '21');",
+         {"oracle", "call"}}));
+    infos.push_back(DocumentedTableFunctionInfo(
+        TableFunction("oracle_call_inout_varchar",
+                      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+                      OracleCallNumberFunction, OracleCallInOutVarcharBind, OracleCallInOutVarcharInit),
+        {{"secret_name", "procedure_name", "argument_name", "value"},
+         "Passes a VARCHAR2 to an Oracle procedure's only argument, an IN OUT, and returns the updated value.",
+         "SELECT * FROM oracle_call_inout_varchar('demo', 'QUACK_DEMO_SHOUT', 'P_TEXT', 'quack');",
+         {"oracle", "call"}}));
 
-    loader.RegisterFunction(TableFunction("oracle_call", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-                                          OracleCallFunction, OracleCallBind, OracleCallInit));
-    loader.RegisterFunction(TableFunction("oracle_call_implicit", {LogicalType::VARCHAR, LogicalType::VARCHAR},
-                                          OracleCallFunction, OracleCallImplicitBind, OracleCallImplicitInit));
-    loader.RegisterFunction(TableFunction("oracle_call_cursors",
-                                          {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR)},
-                                          OracleCallFunction, OracleCallCursorsBind, OracleCallCursorsInit));
-    loader.RegisterFunction(TableFunction("oracle_call_named",
-                                          {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
-                                          OracleCallNamedFunction, OracleCallNamedBind, OracleCallNamedInit));
-    loader.RegisterFunction(TableFunction("oracle_call_named_function",
-                                          {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-                                           LogicalType::ANY},
-                                          OracleCallNamedFunction, OracleCallNamedFunctionBind,
-                                          OracleCallNamedFunctionInit));
-    loader.RegisterFunction(TableFunction("oracle_arguments", {LogicalType::VARCHAR, LogicalType::VARCHAR},
-                                          OracleArgumentsFunction, OracleArgumentsBind, OracleArgumentsInit));
-    loader.RegisterFunction(TableFunction("oracle_call_auto",
-                                          {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
-                                          OracleCallNamedFunction, OracleCallAutoBind, OracleCallAutoInit));
-    loader.RegisterFunction(TableFunction("oracle_cursor", {LogicalType::VARCHAR}, OracleQueryFunction, OracleCursorBind,
-                                          OracleCursorInit));
-    loader.RegisterFunction(TableFunction("oracle_close_call", {LogicalType::VARCHAR}, OracleCloseCallFunction,
-                                          OracleCloseCallBind, OracleCloseCallInit));
+    infos.push_back(DocumentedTableFunctionInfo(
+        TableFunction("oracle_call", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+                      OracleCallFunction, OracleCallBind, OracleCallInit),
+        {{"secret_name", "procedure_name", "cursor_argument"},
+         "Calls an Oracle procedure whose only argument is an OUT SYS_REFCURSOR, and returns a cursor handle rather "
+         "than the cursor's rows.",
+         "SELECT * FROM oracle_call('demo', 'QUACK_DEMO_LIST', 'P_ROWS');",
+         {"oracle", "call"}}));
+    infos.push_back(DocumentedTableFunctionInfo(
+        TableFunction("oracle_call_implicit", {LogicalType::VARCHAR, LogicalType::VARCHAR}, OracleCallFunction,
+                      OracleCallImplicitBind, OracleCallImplicitInit),
+        {{"secret_name", "procedure_name"},
+         "Calls an Oracle procedure that takes no arguments and returns a cursor handle for each implicit result "
+         "set it returns.",
+         "SELECT * FROM oracle_call_implicit('demo', 'QUACK_DEMO_IMPLICIT');",
+         {"oracle", "call"}}));
+    infos.push_back(DocumentedTableFunctionInfo(
+        TableFunction("oracle_call_cursors",
+                      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR)},
+                      OracleCallFunction, OracleCallCursorsBind, OracleCallCursorsInit),
+        {{"secret_name", "procedure_name", "cursor_arguments"},
+         "Calls an Oracle procedure whose arguments are the listed OUT SYS_REFCURSORs, and returns a cursor handle "
+         "for each.",
+         "SELECT * FROM oracle_call_cursors('demo', 'QUACK_DEMO_LIST', ['P_ROWS']);",
+         {"oracle", "call"}}));
+    infos.push_back(DocumentedTableFunctionInfo(
+        TableFunction("oracle_call_named", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
+                      OracleCallNamedFunction, OracleCallNamedBind, OracleCallNamedInit),
+        {{"secret_name", "procedure_name", "arguments"},
+         "Calls an Oracle procedure with arguments whose names, directions, types and values are given explicitly, "
+         "and returns its OUT values and cursor handles.",
+         "SELECT * FROM oracle_call_named('demo', 'QUACK_DEMO_GREET', [{'name': 'P_NAME', 'direction': 'in', "
+         "'type': 'varchar', 'value': 'world'}, {'name': 'P_GREETING', 'direction': 'out', 'type': 'varchar', "
+         "'value': NULL}]);",
+         {"oracle", "call"}}));
+    infos.push_back(DocumentedTableFunctionInfo(
+        TableFunction("oracle_call_named_function",
+                      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
+                      OracleCallNamedFunction, OracleCallNamedFunctionBind, OracleCallNamedFunctionInit),
+        {{"secret_name", "function_name", "return_type", "arguments"},
+         "Calls an Oracle function with the given return type and explicitly described arguments, and returns its "
+         "result and OUT values.",
+         "SELECT * FROM oracle_call_named_function('demo', 'QUACK_DEMO_ADD', 'number', [{'name': 'P_A', "
+         "'direction': 'in', 'type': 'number', 'value': '2'}, {'name': 'P_B', 'direction': 'in', 'type': 'number', "
+         "'value': '3'}]);",
+         {"oracle", "call"}}));
+    infos.push_back(DocumentedTableFunctionInfo(
+        TableFunction("oracle_arguments", {LogicalType::VARCHAR, LogicalType::VARCHAR}, OracleArgumentsFunction,
+                      OracleArgumentsBind, OracleArgumentsInit),
+        {{"secret_name", "callable_name"},
+         "Lists the arguments of every overload of an Oracle procedure or function, with the reason for any "
+         "argument type this client cannot bind.",
+         "SELECT * FROM oracle_arguments('demo', 'QUACK_DEMO_ADD');",
+         {"oracle", "metadata"}}));
+    infos.push_back(DocumentedTableFunctionInfo(
+        TableFunction("oracle_call_auto", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
+                      OracleCallNamedFunction, OracleCallAutoBind, OracleCallAutoInit),
+        {{"secret_name", "callable_name", "values"},
+         "Reads an Oracle procedure's or function's signature from the data dictionary and calls it with the given "
+         "values in argument declaration order.",
+         "SELECT * FROM oracle_call_auto('demo', 'QUACK_DEMO_ADD', ['2', '3']);",
+         {"oracle", "call"}}));
+    infos.push_back(DocumentedTableFunctionInfo(
+        TableFunction("oracle_cursor", {LogicalType::VARCHAR}, OracleQueryFunction, OracleCursorBind,
+                      OracleCursorInit),
+        {{"cursor_handle"},
+         "Consumes a cursor handle created earlier on the same DuckDB connection and returns the cursor's rows.",
+         "SELECT * FROM oracle_cursor(getvariable('oracle_example_handle'));",
+         {"oracle", "cursor"}}));
+    infos.push_back(DocumentedTableFunctionInfo(
+        TableFunction("oracle_close_call", {LogicalType::VARCHAR}, OracleCloseCallFunction, OracleCloseCallBind,
+                      OracleCloseCallInit),
+        {{"cursor_handle"},
+         "Closes the remaining registered cursors of the whole call a cursor handle belongs to, and returns closed.",
+         "SELECT * FROM oracle_close_call(getvariable('oracle_close_handle'));",
+         {"oracle", "cursor"}}));
+    return infos;
+}
+
+void RegisterOracleQuery(ExtensionLoader &loader) {
+    for (auto &info : OracleQueryFunctionInfos()) {
+        loader.RegisterFunction(std::move(info));
+    }
 }
 
 } // namespace duckdb
