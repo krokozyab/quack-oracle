@@ -309,7 +309,7 @@ private:
         if (!last) {
             throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "Oracle host resolved to no address");
         }
-        throw *last;
+        throw OracleConnectError(*last);
     }
 
     // One chain, from one resolved address of a configured one, through every
@@ -337,7 +337,7 @@ private:
         size_t last_depth = 0;
         const auto remember = [&](const OracleConnectError &error, size_t depth) {
             if (!ConnectFailureAllowsFailover(error.Failure())) {
-                throw error;
+                throw OracleConnectError(error);
             }
             last = error;
             last_depth = depth;
@@ -445,7 +445,7 @@ private:
             throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "Oracle redirect chain had no address");
         }
         if (last_depth == 0) {
-            throw *last;
+            throw OracleConnectError(*last);
         }
         throw OracleConnectError(last->Kind(), ConnectFailure::REDIRECT_FAILED,
                                  std::string("every address the Oracle listener redirected to failed: ") + last->what(),
@@ -577,7 +577,7 @@ private:
         const auto remaining =
             std::chrono::duration_cast<std::chrono::milliseconds>(deadline - environment.now()).count();
         const auto remaining_seconds =
-            static_cast<uint64_t>((std::max)(remaining, decltype(remaining)(1)) + 999) / 1000;
+            static_cast<uint64_t>((std::max)(remaining, std::chrono::milliseconds::rep(1)) + 999) / 1000;
         return static_cast<uint32_t>(
             (std::min)(static_cast<uint64_t>(config.connect_timeout_seconds), remaining_seconds));
     }
