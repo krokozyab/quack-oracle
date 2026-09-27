@@ -54,7 +54,7 @@ std::vector<TnsPacket> BuildTnsConnectPackets(const std::string &descriptor, con
         std::copy(descriptor.begin(), descriptor.end(), payload.begin() + CONNECT_FIXED_PAYLOAD_SIZE);
     }
     std::vector<TnsPacket> packets;
-    packets.push_back({TnsPacketType::CONNECT, 0, std::move(payload)});
+    packets.push_back({TnsPacketType::CONNECT, options.packet_flags, std::move(payload)});
     if (!descriptor_is_inline) {
         // The client must not duplicate long connect data: the listener reads
         // it from the DATA continuation before it sends ACCEPT.

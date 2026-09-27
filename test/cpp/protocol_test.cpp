@@ -33,6 +33,8 @@
 #include "oracle_scanner/validating_session.hpp"
 #include "oracle_scanner/statement_registry.hpp"
 #include "oracle_scanner/connect_descriptor.hpp"
+#include "oracle_scanner/connect_error.hpp"
+#include "oracle_scanner/connect_plan.hpp"
 #include "oracle_scanner/client_identity.hpp"
 #include "oracle_scanner/data_assembler.hpp"
 #include "oracle_scanner/descriptor_parser.hpp"
@@ -93,7 +95,10 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <chrono>
 #include <deque>
+#include <map>
+#include <memory>
 #include <vector>
 
 // A release build defines NDEBUG, and assert() then removes not just the check
@@ -132,6 +137,18 @@ static void ExpectProtocolError(FUNCTION function) {
         function();
         CHECK(false && "expected ProtocolError");
     } catch (const ProtocolError &) {
+    }
+}
+
+// For the connect loop: the ConnectFailure is what decides whether another
+// address is tried, so that is what these tests pin.
+template <class FUNCTION>
+static void ExpectConnectFailure(ConnectFailure failure, FUNCTION function) {
+    try {
+        function();
+        CHECK(false && "expected OracleConnectError");
+    } catch (const OracleConnectError &error) {
+        CHECK(error.Failure() == failure);
     }
 }
 
@@ -530,13 +547,26 @@ static void TestConnectHandshake() {
                                                 accepted.output.begin() + 2 * first_packet_length), false)
                .type == TnsPacketType::CONNECT);
 
+    // REDIRECT data is a UB2 length and then that many bytes. The redirect is
+    // only split here, not parsed: "(DESCRIPTION=(A))" is enough.
     FragmentedStream redirected(EncodeTnsPacket(TnsPacketType::REDIRECT, 0,
-                                                {'x', 'x', '(', 'D', 'E', 'S', 'C', 'R', 'I', 'P', 'T', 'I', 'O',
+                                                {0x00, 0x11, '(', 'D', 'E', 'S', 'C', 'R', 'I', 'P', 'T', 'I', 'O',
                                                  'N', '=', '(', 'A', ')', ')'}, false));
     TnsPacketStream redirected_packets(redirected, false);
     result = RunTnsConnect(redirected_packets, "(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=X)))");
     CHECK(result.disposition == TnsConnectDisposition::REDIRECTED);
-    CHECK(result.redirect_descriptor == "(DESCRIPTION=(A))");
+    CHECK(result.redirect.address == "(DESCRIPTION=(A))" && result.redirect.reconnect_data.empty());
+
+    // The parser this replaced skipped forward to the first '(' and so read
+    // these two junk bytes as a harmless prefix. Read as what they are — a
+    // length of 0x7878 — they declare far more than the listener sends, and the
+    // connect waits for the rest rather than searching past them.
+    FragmentedStream prefixed(EncodeTnsPacket(TnsPacketType::REDIRECT, 0,
+                                              {'x', 'x', '(', 'D', 'E', 'S', 'C', 'R', 'I', 'P', 'T', 'I', 'O',
+                                               'N', '=', '(', 'A', ')', ')'}, false));
+    TnsPacketStream prefixed_packets(prefixed, false);
+    ExpectError(ProtocolErrorKind::TRUNCATED,
+                [&] { RunTnsConnect(prefixed_packets, "(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=X)))"); });
 
     FragmentedStream refused(EncodeTnsPacket(TnsPacketType::REFUSE, 0, {}, false));
     TnsPacketStream refused_packets(refused, false);
@@ -1354,6 +1384,29 @@ static Identity MakeIdentity(const std::string &common_name, long not_before_sec
 } // namespace local_tls
 
 #if !defined(_WIN32)
+// Test servers write to clients that may already have given up — a client
+// that rejects a certificate, or one that stopped on its connect budget — and
+// that write must not raise SIGPIPE. Blocking the signal in the server thread
+// alone proved not to be enough on macOS, where CTest runs saw it delivered
+// anyway; SO_NOSIGPIPE on the accepted socket (macOS) and MSG_NOSIGNAL on each
+// send (Linux) stop it at the socket. Only the test's own server sockets get
+// this: the client's protection is what TestWriteToClosedPeerDoesNotKillTheProcess
+// checks, and none of this touches it.
+static void SuppressSigPipeOnSocket(int socket_fd) {
+#if defined(SO_NOSIGPIPE)
+    int one = 1;
+    setsockopt(socket_fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#else
+    (void)socket_fd;
+#endif
+}
+
+#if defined(MSG_NOSIGNAL)
+static constexpr int TEST_SEND_FLAGS = MSG_NOSIGNAL;
+#else
+static constexpr int TEST_SEND_FLAGS = 0;
+#endif
+
 // A local TLS server, so certificate verification can be tested against cases
 // no live endpoint offers: an expired certificate, and the wallet-free path
 // where the client presents nothing and trusts an explicit CA. Everything is
@@ -1429,6 +1482,7 @@ private:
         if (accepted < 0) {
             return;
         }
+        SuppressSigPipeOnSocket(accepted);
         auto *ssl = SSL_new(context);
         if (ssl) {
             SSL_set_fd(ssl, accepted);
@@ -1474,7 +1528,7 @@ static void TestLocalTlsCertificateVerification() {
         TlsConfiguration tls;
         tls.server_name = server_name;
         tls.ca_pem_contents = expired.certificate_pem;
-        ExpectProtocolError([&] { (void)OpenSslByteStream::Connect("127.0.0.1", server.Port(), 5, 5, true, tls); });
+        ExpectConnectFailure(ConnectFailure::TLS_VERIFICATION, [&] { (void)OpenSslByteStream::Connect("127.0.0.1", server.Port(), 5, 5, true, tls); });
     }
 
     // A name the certificate does not carry.
@@ -1483,7 +1537,7 @@ static void TestLocalTlsCertificateVerification() {
         TlsConfiguration tls;
         tls.server_name = "oracle-scanner.invalid";
         tls.ca_pem_contents = valid.certificate_pem;
-        ExpectProtocolError([&] { (void)OpenSslByteStream::Connect("127.0.0.1", server.Port(), 5, 5, true, tls); });
+        ExpectConnectFailure(ConnectFailure::TLS_VERIFICATION, [&] { (void)OpenSslByteStream::Connect("127.0.0.1", server.Port(), 5, 5, true, tls); });
     }
 
     // A CA that did not sign what the server presented, even though both carry
@@ -1493,7 +1547,7 @@ static void TestLocalTlsCertificateVerification() {
         TlsConfiguration tls;
         tls.server_name = server_name;
         tls.ca_pem_contents = other.certificate_pem;
-        ExpectProtocolError([&] { (void)OpenSslByteStream::Connect("127.0.0.1", server.Port(), 5, 5, true, tls); });
+        ExpectConnectFailure(ConnectFailure::TLS_VERIFICATION, [&] { (void)OpenSslByteStream::Connect("127.0.0.1", server.Port(), 5, 5, true, tls); });
     }
 
     // And the DN check on top of a certificate that already verifies.
@@ -1513,7 +1567,7 @@ static void TestLocalTlsCertificateVerification() {
         tls.server_name = server_name;
         tls.ca_pem_contents = valid.certificate_pem;
         tls.expected_server_dn = "CN=oracle-scanner.invalid";
-        ExpectProtocolError([&] { (void)OpenSslByteStream::Connect("127.0.0.1", server.Port(), 5, 5, true, tls); });
+        ExpectConnectFailure(ConnectFailure::TLS_VERIFICATION, [&] { (void)OpenSslByteStream::Connect("127.0.0.1", server.Port(), 5, 5, true, tls); });
     }
 }
 #endif // !_WIN32
@@ -1707,9 +1761,14 @@ static void TestDescriptorParser() {
         ParseConnectDescriptor(
             "(NOT_DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=x)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=x)))");
     });
-    ExpectError(ProtocolErrorKind::MALFORMED, [] {
+    // A DESCRIPTION-level key this client does not know is refused by name
+    // rather than skipped, since skipping it could drop a setting the user
+    // expects to work. A missing CONNECT_DATA is still malformed.
+    ExpectError(ProtocolErrorKind::UNSUPPORTED, [] {
         ParseConnectDescriptor("(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=x)(PORT=1))(SERVICE_NAME=x))");
     });
+    ExpectError(ProtocolErrorKind::MALFORMED,
+                [] { ParseConnectDescriptor("(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=x)(PORT=1)))"); });
 }
 
 static void TestValueCodecs() {
@@ -2305,9 +2364,15 @@ static void TestLiveTnsNegotiation() {
         wrong_server_name.server_name = "oracle-scanner.invalid";
         ExpectProtocolError([&] { (void)TnsClientConnection::Connect(config, wrong_server_name); });
 
-        auto wrong_wallet_password = tls;
-        wrong_wallet_password.client_pem_password += "-wrong";
-        ExpectProtocolError([&] { (void)TnsClientConnection::Connect(config, wrong_wallet_password); });
+        // Only meaningful for a wallet whose key is actually encrypted. A
+        // wallet ZIP that carries cwallet.sso is opened auto-login and needs no
+        // password at all, so a "wrong" one changes nothing — asserting a
+        // failure there aborted this stage before the checks below ever ran.
+        if (!config.wallet_password.empty()) {
+            auto wrong_wallet_password = tls;
+            wrong_wallet_password.client_pem_password += "-wrong";
+            ExpectProtocolError([&] { (void)TnsClientConnection::Connect(config, wrong_wallet_password); });
+        }
 
         auto untrusted_ca = tls;
         untrusted_ca.ca_pem_contents = ReadPemFile(RequiredEnvironment("ORACLE_SCANNER_LIVE_UNTRUSTED_CA_FILE"));
@@ -3221,7 +3286,10 @@ static void TestWriteToClosedPeerDoesNotKillTheProcess() {
 static void TestConnectRunsThroughTheTransportSeam() {
     const std::string redirect_descriptor =
         "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=10.0.0.9)(PORT=1522))(CONNECT_DATA=(SERVICE_NAME=moved)))";
-    std::vector<uint8_t> redirect_payload(redirect_descriptor.begin(), redirect_descriptor.end());
+    // A UB2 length, then the data.
+    std::vector<uint8_t> redirect_payload {static_cast<uint8_t>(redirect_descriptor.size() >> 8U),
+                                           static_cast<uint8_t>(redirect_descriptor.size())};
+    redirect_payload.insert(redirect_payload.end(), redirect_descriptor.begin(), redirect_descriptor.end());
 
     std::vector<std::pair<std::string, uint16_t>> endpoints;
     // A deque, so a reference handed to a transport stays valid when the next
@@ -3257,8 +3325,10 @@ static void TestConnectRunsThroughTheTransportSeam() {
     CHECK(endpoints[0].first == "first.example" && endpoints[0].second == 1521);
     CHECK(endpoints[1].first == "10.0.0.9" && endpoints[1].second == 1522);
 
-    // Each attempt wrote a CONNECT packet, and the second carried the
-    // descriptor the listener handed back rather than the original one.
+    // Each attempt wrote a CONNECT packet. The redirect carried no reconnect
+    // data, so the second CONNECT is rebuilt for the new address with the
+    // original service — the listener's SERVICE_NAME=moved sits in the address
+    // part, which names where to go, not what to ask for.
     CHECK(written.size() == 2);
     for (const auto &bytes : written) {
         // The buffer holds everything the connect wrote, so the first packet is
@@ -3271,8 +3341,14 @@ static void TestConnectRunsThroughTheTransportSeam() {
                   .type == TnsPacketType::CONNECT);
     }
     const auto &second = written[1];
-    CHECK(std::search(second.begin(), second.end(), redirect_descriptor.begin(), redirect_descriptor.end()) !=
-          second.end());
+    const std::string second_text(second.begin(), second.end());
+    CHECK(second_text.find("(HOST=10.0.0.9)(PORT=1522)") != std::string::npos);
+    CHECK(second_text.find("(SERVICE_NAME=svc)") != std::string::npos);
+    // The re-CONNECT carries the redirect flag; the first CONNECT does not.
+    CHECK(written[0][5] == 0x00 && second[5] == TNS_PACKET_FLAG_REDIRECT);
+    // And O5LOGON will still name what the user configured.
+    CHECK(connection->AuthConnectString().find("(HOST=first.example)") != std::string::npos);
+    CHECK(connection->AuthConnectString().find("(CID=") == std::string::npos);
 }
 
 // The CHECK_OOB probe needs a TCP urgent byte, which a transport is entitled
@@ -3308,6 +3384,1561 @@ static void TestTransportWithoutOutOfBandRefusesTheOobProbe() {
     }
     CHECK(defaulted);
 }
+
+// ---------------------------------------------------------------------------
+// Multi-address connects, listener redirects and failover (RAC / SCAN).
+//
+// Every packet below is SYNTHETIC: built here from the field layouts that
+// python-oracledb Thin (commit 4a6d3b39, connect.pyx and connection.pyx) and
+// go-ora (commit 360b4b7a, network/redirect_packet.go, refuse_packet.go and
+// session.go) read and write. None is a capture, and none has been checked
+// against a live RAC listener — which is the limit of what these tests prove.
+// ---------------------------------------------------------------------------
+
+// REDIRECT: a UB2 length, then the data inline — or, when `inline_data` is
+// false, nothing inline and the data in one DATA packet after two zero data
+// flag bytes, which is the form go-ora reads when the REDIRECT is empty.
+static std::vector<uint8_t> RedirectPacketBytes(const std::string &data, uint8_t flags = 0, bool inline_data = true) {
+    std::vector<uint8_t> payload {static_cast<uint8_t>(data.size() >> 8U), static_cast<uint8_t>(data.size())};
+    if (inline_data) {
+        payload.insert(payload.end(), data.begin(), data.end());
+        return EncodeTnsPacket(TnsPacketType::REDIRECT, flags, payload, false);
+    }
+    auto wire = EncodeTnsPacket(TnsPacketType::REDIRECT, flags, payload, false);
+    std::vector<uint8_t> continuation {0x00, 0x00};
+    continuation.insert(continuation.end(), data.begin(), data.end());
+    const auto data_packet = EncodeTnsPacket(TnsPacketType::DATA, 0, continuation, false);
+    wire.insert(wire.end(), data_packet.begin(), data_packet.end());
+    return wire;
+}
+
+// REFUSE: user reason, system reason, a UB2 message length, the message. The
+// message is the listener's descriptor-shaped text with (ERR=...).
+static std::vector<uint8_t> RefusePacketBytes(uint32_t oracle_error) {
+    const std::string message = "(DESCRIPTION=(TMP=)(VSNNUM=0)(ERR=" + std::to_string(oracle_error) +
+                                ")(ERROR_STACK=(ERROR=(CODE=" + std::to_string(oracle_error) + ")(EMFI=4))))";
+    std::vector<uint8_t> payload {0x22, 0x00, static_cast<uint8_t>(message.size() >> 8U),
+                                  static_cast<uint8_t>(message.size())};
+    payload.insert(payload.end(), message.begin(), message.end());
+    return EncodeTnsPacket(TnsPacketType::REFUSE, 0, payload, false);
+}
+
+static std::vector<uint8_t> Bytes(const std::string &text) {
+    return {text.begin(), text.end()};
+}
+
+static void TestRedirectDataSplitting() {
+    // Address only.
+    auto redirect = ParseTnsRedirectData(Bytes("(ADDRESS=(PROTOCOL=TCP)(HOST=node1)(PORT=1521))"), 0);
+    CHECK(redirect.address == "(ADDRESS=(PROTOCOL=TCP)(HOST=node1)(PORT=1521))" && redirect.reconnect_data.empty());
+
+    // Address, NUL, reconnect data — with and without the 0x02 flag, since
+    // python-oracledb splits on the NUL regardless.
+    auto with_reconnect = Bytes("(ADDRESS=(PROTOCOL=TCP)(HOST=node1)(PORT=1521))");
+    with_reconnect.push_back(0);
+    const std::string reconnect = "(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=svc)(INSTANCE_NAME=inst1)))";
+    with_reconnect.insert(with_reconnect.end(), reconnect.begin(), reconnect.end());
+    for (const uint8_t flags : {uint8_t(0), TNS_REDIRECT_FLAG_HAS_RECONNECT_DATA}) {
+        redirect = ParseTnsRedirectData(with_reconnect, flags);
+        CHECK(redirect.address == "(ADDRESS=(PROTOCOL=TCP)(HOST=node1)(PORT=1521))");
+        CHECK(redirect.reconnect_data == reconnect);
+    }
+
+    // Trailing NUL padding, and CR/LF inside the text, are tolerated.
+    auto padded = with_reconnect;
+    padded.push_back(0);
+    padded.push_back(0);
+    CHECK(ParseTnsRedirectData(padded, 0).reconnect_data == reconnect);
+    CHECK(ParseTnsRedirectData(Bytes("\r\n(ADDRESS=(HOST=node1)\r\n(PORT=1521))\r\n"), 0).address ==
+          "(ADDRESS=(HOST=node1)  (PORT=1521))");
+
+    // A NUL with nothing after it is an address with no reconnect data.
+    auto bare = Bytes("(ADDRESS=(HOST=node1)(PORT=1521))");
+    bare.push_back(0);
+    CHECK(ParseTnsRedirectData(bare, 0).reconnect_data.empty());
+
+    // Flagged as carrying reconnect data, but no separator.
+    ExpectError(ProtocolErrorKind::MALFORMED, [] {
+        (void)ParseTnsRedirectData(Bytes("(ADDRESS=(HOST=node1)(PORT=1521))"), TNS_REDIRECT_FLAG_HAS_RECONNECT_DATA);
+    });
+    // No searching for a descriptor start: a prefix is refused.
+    ExpectError(ProtocolErrorKind::MALFORMED,
+                [] { (void)ParseTnsRedirectData(Bytes("junk(ADDRESS=(HOST=node1)(PORT=1521))"), 0); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)ParseTnsRedirectData(Bytes("(ADDRESS=(HOST=\x01))"), 0); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)ParseTnsRedirectData({}, 0); });
+    auto bad_reconnect = Bytes("(ADDRESS=(HOST=node1)(PORT=1521))");
+    bad_reconnect.push_back(0);
+    bad_reconnect.push_back('x');
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)ParseTnsRedirectData(bad_reconnect, 0); });
+}
+
+static void TestRedirectPacketFraming() {
+    const std::string descriptor = "(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=X)))";
+    const std::string address = "(ADDRESS=(PROTOCOL=TCP)(HOST=node1)(PORT=1521))";
+    const auto run = [&](std::vector<uint8_t> wire) {
+        FragmentedStream stream(std::move(wire), 5);
+        TnsPacketStream packets(stream, false);
+        return RunTnsConnect(packets, descriptor);
+    };
+
+    // Inline, and entirely in the DATA continuation.
+    CHECK(run(RedirectPacketBytes(address)).redirect.address == address);
+    CHECK(run(RedirectPacketBytes(address, 0, false)).redirect.address == address);
+
+    // Split between the two: part inline, the rest in DATA.
+    {
+        std::vector<uint8_t> payload {0x00, static_cast<uint8_t>(address.size())};
+        payload.insert(payload.end(), address.begin(), address.begin() + 10);
+        auto wire = EncodeTnsPacket(TnsPacketType::REDIRECT, 0, payload, false);
+        std::vector<uint8_t> rest {0x00, 0x00};
+        rest.insert(rest.end(), address.begin() + 10, address.end());
+        const auto data = EncodeTnsPacket(TnsPacketType::DATA, 0, rest, false);
+        wire.insert(wire.end(), data.begin(), data.end());
+        CHECK(run(wire).redirect.address == address);
+    }
+    // A zero length, and a payload with no length at all.
+    ExpectError(ProtocolErrorKind::MALFORMED,
+                [&] { run(EncodeTnsPacket(TnsPacketType::REDIRECT, 0, {0x00, 0x00}, false)); });
+    ExpectError(ProtocolErrorKind::TRUNCATED, [&] { run(EncodeTnsPacket(TnsPacketType::REDIRECT, 0, {0x00}, false)); });
+    // Inline data longer than declared.
+    {
+        std::vector<uint8_t> payload {0x00, 0x05};
+        payload.insert(payload.end(), address.begin(), address.end());
+        ExpectError(ProtocolErrorKind::MALFORMED, [&] { run(EncodeTnsPacket(TnsPacketType::REDIRECT, 0, payload, false)); });
+    }
+    // A continuation that is not DATA.
+    {
+        auto wire = EncodeTnsPacket(TnsPacketType::REDIRECT, 0, {0x00, 0x10}, false);
+        const auto marker = EncodeTnsPacket(TnsPacketType::MARKER, 0, {0x01, 0x00, 0x02}, false);
+        wire.insert(wire.end(), marker.begin(), marker.end());
+        ExpectError(ProtocolErrorKind::MALFORMED, [&] { run(wire); });
+    }
+    // A continuation that overruns the declared length.
+    {
+        auto wire = EncodeTnsPacket(TnsPacketType::REDIRECT, 0, {0x00, 0x04}, false);
+        std::vector<uint8_t> overlong {0x00, 0x00};
+        overlong.insert(overlong.end(), address.begin(), address.end());
+        const auto data = EncodeTnsPacket(TnsPacketType::DATA, 0, overlong, false);
+        wire.insert(wire.end(), data.begin(), data.end());
+        ExpectError(ProtocolErrorKind::MALFORMED, [&] { run(wire); });
+    }
+    // An empty continuation, which would otherwise let a listener stall the
+    // client one empty packet at a time.
+    {
+        auto wire = EncodeTnsPacket(TnsPacketType::REDIRECT, 0, {0x00, 0x04}, false);
+        const auto data = EncodeTnsPacket(TnsPacketType::DATA, 0, {0x00, 0x00}, false);
+        wire.insert(wire.end(), data.begin(), data.end());
+        ExpectError(ProtocolErrorKind::MALFORMED, [&] { run(wire); });
+    }
+    // More continuation packets than the bound allows, one byte each.
+    {
+        auto wire = EncodeTnsPacket(TnsPacketType::REDIRECT, 0, {0x00, 0x40}, false);
+        for (size_t index = 0; index <= TNS_MAX_REDIRECT_CONTINUATIONS; index++) {
+            const auto data = EncodeTnsPacket(TnsPacketType::DATA, 0, {0x00, 0x00, '('}, false);
+            wire.insert(wire.end(), data.begin(), data.end());
+        }
+        ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [&] { run(wire); });
+    }
+    // The listener hangs up before the data is complete.
+    ExpectConnectFailure(ConnectFailure::TRANSPORT_LOST,
+                         [&] { run(EncodeTnsPacket(TnsPacketType::REDIRECT, 0, {0x00, 0x10}, false)); });
+}
+
+static void TestRefusalCarriesTheOracleCode() {
+    const auto refuse_wire = RefusePacketBytes(12514);
+    auto refusal = ParseTnsRefusal(std::vector<uint8_t>(refuse_wire.begin() + 8, refuse_wire.end()));
+    CHECK(refusal.oracle_error == 12514 && refusal.user_reason == 0x22 && refusal.system_reason == 0);
+    // Case and spacing, the way go-ora's pattern allows them.
+    const std::string loose = "(description=(err = 12528 )(vsnnum=0))";
+    std::vector<uint8_t> payload {0, 0, 0, static_cast<uint8_t>(loose.size())};
+    payload.insert(payload.end(), loose.begin(), loose.end());
+    CHECK(ParseTnsRefusal(payload).oracle_error == 12528);
+    // Short, empty, and lying about its length: diagnostics only, never a throw.
+    CHECK(ParseTnsRefusal({}).oracle_error == 0);
+    CHECK(ParseTnsRefusal({1, 2, 0xff, 0xff, '(', 'E'}).oracle_error == 0);
+    CHECK(ParseTnsRefusal({1, 2, 0xff, 0xff, '(', 'E'}).message == "(E");
+
+    FragmentedStream stream(RefusePacketBytes(12514), 7);
+    TnsPacketStream packets(stream, false);
+    try {
+        RunTnsConnect(packets, "(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=X)))");
+        CHECK(false && "expected a refusal");
+    } catch (const OracleConnectError &error) {
+        CHECK(error.Kind() == ProtocolErrorKind::INVALID_STATE);
+        CHECK(error.Failure() == ConnectFailure::LISTENER_REFUSED && error.OracleErrorCode() == 12514);
+        CHECK(std::string(error.what()).find("ORA-12514") != std::string::npos);
+    }
+}
+
+static void TestReconnectCarriesTheRedirectFlag() {
+    TnsConnectOptions options;
+    options.packet_flags = TNS_PACKET_FLAG_REDIRECT;
+    auto packets = BuildTnsConnectPackets("(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=X)))", options);
+    CHECK(packets.size() == 1 && packets[0].flags == TNS_PACKET_FLAG_REDIRECT);
+    CHECK(EncodeTnsPacket(packets[0].type, packets[0].flags, packets[0].payload, false)[5] == 0x04);
+    // Long connect data: only the CONNECT carries the flag, as in both
+    // references; its DATA continuation does not.
+    packets = BuildTnsConnectPackets(std::string(300, 'x'), options);
+    CHECK(packets.size() == 2 && packets[0].flags == TNS_PACKET_FLAG_REDIRECT && packets[1].flags == 0);
+    CHECK(BuildTnsConnectPackets("(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=X)))")[0].flags == 0);
+}
+
+static void TestDescriptorRoutingParameters() {
+    // A SCAN descriptor the way Oracle's high-availability guidance writes one.
+    auto scan = ParseConnectDescriptor(
+        "(DESCRIPTION=(CONNECT_TIMEOUT=90)(RETRY_COUNT=20)(RETRY_DELAY=3)(TRANSPORT_CONNECT_TIMEOUT=3)"
+        "(ADDRESS_LIST=(LOAD_BALANCE=on)(ADDRESS=(PROTOCOL=TCP)(HOST=scan.example)(PORT=1521)))"
+        "(ADDRESS_LIST=(LOAD_BALANCE=on)(ADDRESS=(PROTOCOL=TCP)(HOST=standby-scan.example)(PORT=1521)))"
+        "(CONNECT_DATA=(SERVICE_NAME=sales.example)))");
+    CHECK(scan.address_lists.size() == 2 && scan.address_lists[0].load_balance && scan.address_lists[0].failover);
+    CHECK(*scan.connect_timeout_seconds == 90 && *scan.retry_count == 20 && *scan.retry_delay_seconds == 3 &&
+          *scan.transport_connect_timeout_seconds == 3);
+    CHECK(scan.endpoints.size() == 2 && scan.endpoints[1].host == "standby-scan.example");
+
+    // Direct addresses form one implicit list governed by the DESCRIPTION.
+    auto direct = ParseConnectDescriptor(
+        "(DESCRIPTION=(FAILOVER=off)(LOAD_BALANCE=yes)(ADDRESS=(HOST=a.example))(ADDRESS=(PROTOCOL=tcp)(HOST=b.example)"
+        "(PORT=1522))(CONNECT_DATA=(SERVICE_NAME=svc)(INSTANCE_NAME=svc1)(SERVER=dedicated)))");
+    CHECK(direct.address_lists.size() == 1 && direct.address_lists[0].addresses.size() == 2);
+    CHECK(!direct.address_lists[0].failover && direct.address_lists[0].load_balance);
+    CHECK(!direct.retry_count && !direct.connect_timeout_seconds);
+    // PROTOCOL and PORT default to TCP and 1521.
+    CHECK(direct.address_lists[0].addresses[0].protocol == TransportProtocol::TCP &&
+          direct.address_lists[0].addresses[0].port == 1521);
+    CHECK(direct.instance_name == "svc1" && direct.server_type == "DEDICATED");
+
+    // Harmless keys are accepted: an Autonomous Database wallet entry.
+    auto autonomous = ParseConnectDescriptor(
+        "(description= (retry_count=20)(retry_delay=3)(address=(protocol=tcps)(port=1522)(host=adb.example))"
+        "(connect_data=(service_name=x_low.adb.example))(security=(ssl_server_dn_match=yes)))");
+    CHECK(*autonomous.retry_count == 20 && autonomous.endpoints[0].protocol == TransportProtocol::TCPS);
+    CHECK(ParseConnectDescriptor("(DESCRIPTION=(EXPIRE_TIME=10)(SDU=8192)(ENABLE=broken)(SOURCE_ROUTE=off)"
+                                 "(ADDRESS=(HOST=a)(PORT=1)(SEND_BUF_SIZE=65536))(CONNECT_DATA=(SERVICE_NAME=s)))")
+              .endpoints.size() == 1);
+
+    // What would silently change meaning is refused by name.
+    const std::vector<std::string> unsupported {
+        "(DESCRIPTION_LIST=(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s))))",
+        "(DESCRIPTION=(SOURCE_ROUTE=on)(ADDRESS=(HOST=a)(PORT=1))(ADDRESS=(HOST=b)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)))",
+        "(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)(FAILOVER_MODE=(TYPE=select)(METHOD=basic))))",
+        "(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SID=orcl)))",
+        "(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)(SERVER=pooled)))",
+        "(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1)(HTTPS_PROXY=proxy))(CONNECT_DATA=(SERVICE_NAME=s)))",
+        "(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)(UR=A)))",
+        "(DESCRIPTION=(MYSTERY=1)(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)))",
+        "(DESCRIPTION=(TRANSPORT_CONNECT_TIMEOUT=250ms)(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)))",
+        "(DESCRIPTION=(ADDRESS_LIST=(SOURCE_ROUTE=yes)(ADDRESS=(HOST=a)(PORT=1)))(CONNECT_DATA=(SERVICE_NAME=s)))",
+    };
+    for (const auto &descriptor : unsupported) {
+        ExpectError(ProtocolErrorKind::UNSUPPORTED, [&] { (void)ParseConnectDescriptor(descriptor); });
+    }
+    const std::vector<std::string> malformed {
+        "(DESCRIPTION=(FAILOVER=on)(FAILOVER=off)(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)))",
+        "(DESCRIPTION=(FAILOVER=maybe)(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)))",
+        "(DESCRIPTION=(RETRY_COUNT=x)(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)))",
+        "(DESCRIPTION=(CONNECT_TIMEOUT=0)(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)))",
+        "(DESCRIPTION=(ADDRESS_LIST=(FAILOVER=on))(CONNECT_DATA=(SERVICE_NAME=s)))",
+        "(DESCRIPTION=(ADDRESS=(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)))",
+    };
+    for (const auto &descriptor : malformed) {
+        ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)ParseConnectDescriptor(descriptor); });
+    }
+    ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [] {
+        (void)ParseConnectDescriptor("(DESCRIPTION=(RETRY_COUNT=101)(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)))");
+    });
+    std::string many = "(DESCRIPTION=";
+    for (size_t index = 0; index <= MAX_CONNECT_ADDRESSES; index++) {
+        many += "(ADDRESS=(HOST=h" + std::to_string(index) + ")(PORT=1521))";
+    }
+    many += "(CONNECT_DATA=(SERVICE_NAME=s)))";
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)ParseConnectDescriptor(many); });
+}
+
+static void TestRedirectAddressParsing() {
+    auto parsed = ParseRedirectAddresses("(ADDRESS=(PROTOCOL=TCP)(HOST=node1-vip)(PORT=1521))");
+    CHECK(parsed.size() == 1 && parsed[0].address.host == "node1-vip" && parsed[0].protocol_given);
+    parsed = ParseRedirectAddresses("(ADDRESS_LIST=(ADDRESS=(HOST=node1)(PORT=1521))(ADDRESS=(PROTOCOL=tcp)(HOST=node2)(PORT=1522)))");
+    CHECK(parsed.size() == 2 && !parsed[0].protocol_given && parsed[1].address.port == 1522);
+    // A full DESCRIPTION, with keys that are the listener's own business.
+    parsed = ParseRedirectAddresses(
+        "(DESCRIPTION=(SOMETHING=x)(ADDRESS=(PROTOCOL=TCP)(HOST=10.0.0.21)(PORT=1521))"
+        "(ADDRESS_LIST=(ADDRESS=(PROTOCOL=TCP)(HOST=10.0.0.22)(PORT=1521)))(CONNECT_DATA=(SERVICE_NAME=moved)))");
+    CHECK(parsed.size() == 2 && parsed[1].address.host == "10.0.0.22");
+    ExpectError(ProtocolErrorKind::UNSUPPORTED,
+                [] { (void)ParseRedirectAddresses("(ADDRESS=(PROTOCOL=IPC)(HOST=x)(PORT=1))"); });
+    ExpectError(ProtocolErrorKind::UNSUPPORTED, [] {
+        (void)ParseRedirectAddresses("(DESCRIPTION_LIST=(DESCRIPTION=(ADDRESS=(HOST=x)(PORT=1))))");
+    });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)ParseRedirectAddresses("(CONNECT_DATA=(SERVICE_NAME=x))"); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)ParseRedirectAddresses("(ADDRESS=(HOST=x))"); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)ParseRedirectAddresses("(DESCRIPTION=(CONNECT_DATA=(S=x)))"); });
+    ExpectError(ProtocolErrorKind::MALFORMED,
+                [] { (void)ParseRedirectAddresses("(ADDRESS=(HOST=bad)(HOST=x)(PORT=1)(PORT=2))"); });
+
+    ValidateRedirectReconnectData("(DESCRIPTION=(ADDRESS=(HOST=x)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=s)(CID=(PROGRAM=p))))");
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { ValidateRedirectReconnectData("(ADDRESS=(HOST=x)(PORT=1))"); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { ValidateRedirectReconnectData("(DESCRIPTION=(ADDRESS=(HOST=x)))"); });
+    ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED,
+                [] { ValidateRedirectReconnectData(std::string(MAX_RECONNECT_DATA_BYTES + 1, '(')); });
+}
+
+static ConnectionConfig RoutedConfig(const std::vector<std::vector<std::string>> &lists, bool failover = true,
+                                     bool load_balance = false) {
+    ConnectionConfig config;
+    config.service_name = "svc";
+    for (const auto &hosts : lists) {
+        ConnectAddressList list;
+        list.failover = failover;
+        list.load_balance = load_balance;
+        for (const auto &host : hosts) {
+            list.addresses.push_back({host, 1521, TransportProtocol::TCP});
+        }
+        config.routing.address_lists.push_back(list);
+    }
+    config.routing.failover = failover;
+    config.routing.load_balance = load_balance;
+    return config;
+}
+
+static std::vector<std::string> Hosts(const std::vector<ConnectAddress> &addresses) {
+    std::vector<std::string> result;
+    for (const auto &address : addresses) {
+        result.push_back(address.host);
+    }
+    return result;
+}
+
+// A random source that plays back a fixed sequence, so a shuffle is a known
+// permutation.
+static std::function<uint64_t()> Sequence(std::vector<uint64_t> values) {
+    auto shared = std::make_shared<std::vector<uint64_t>>(std::move(values));
+    auto position = std::make_shared<size_t>(0);
+    return [shared, position]() { return (*shared)[(*position)++ % shared->size()]; };
+}
+
+static void TestConnectOrderPolicy() {
+    const auto never = []() -> uint64_t {
+        CHECK(false && "LOAD_BALANCE is off: no randomness may be drawn");
+        return 0;
+    };
+    using Order = std::vector<std::string>;
+    CHECK(Hosts(PlanConnectOrder(RoutedConfig({{"a", "b", "c"}}), never)) == Order({"a", "b", "c"}));
+    CHECK(Hosts(PlanConnectOrder(RoutedConfig({{"a", "b", "c"}}, false, false), never)) == Order({"a"}));
+    // failover + load balance: all three, in the permutation the draws pick.
+    // Fisher-Yates from the end: swap(c, index 0) -> c b a; swap(b, index 1) -> c b a.
+    CHECK(Hosts(PlanConnectOrder(RoutedConfig({{"a", "b", "c"}}, true, true), Sequence({0, 1}))) ==
+          Order({"c", "b", "a"}));
+    CHECK(Hosts(PlanConnectOrder(RoutedConfig({{"a", "b", "c"}}, true, true), Sequence({2, 0}))) ==
+          Order({"b", "a", "c"}));
+    // no failover + load balance: exactly one, chosen by the draw.
+    CHECK(Hosts(PlanConnectOrder(RoutedConfig({{"a", "b", "c"}}, false, true), Sequence({1}))) == Order({"b"}));
+    // Two lists: the DESCRIPTION's policy picks lists, each list's picks within.
+    auto two = RoutedConfig({{"a1", "a2"}, {"b1", "b2"}});
+    CHECK(Hosts(PlanConnectOrder(two, never)) == Order({"a1", "a2", "b1", "b2"}));
+    two.routing.load_balance = true;
+    CHECK(Hosts(PlanConnectOrder(two, Sequence({0}))) == Order({"b1", "b2", "a1", "a2"}));
+    two.routing.load_balance = false;
+    two.routing.failover = false;
+    CHECK(Hosts(PlanConnectOrder(two, never)) == Order({"a1", "a2"}));
+    // The single HOST/PORT form is one address, whatever the policy.
+    ConnectionConfig single;
+    single.host = "db.example";
+    single.service_name = "svc";
+    CHECK(Hosts(PlanConnectOrder(single, never)) == Order({"db.example"}));
+}
+
+static void TestRoutedConfigValidationAndDescriptors() {
+    auto config = RoutedConfig({{"node1", "node2"}});
+    config.instance_name = "svc1";
+    config.server_type = "dedicated";
+    const auto descriptor = BuildConnectDescriptor(config, config.routing.address_lists[0].addresses[1]);
+    CHECK(descriptor.find("(HOST=node2)") != std::string::npos);
+    CHECK(descriptor.find("(SERVICE_NAME=svc)(INSTANCE_NAME=svc1)(SERVER=DEDICATED)") != std::string::npos);
+    CHECK(BuildAuthConnectString(config).find("(HOST=node1)") != std::string::npos);
+    // A host beside a descriptor's addresses is ambiguous.
+    auto both = config;
+    both.host = "other";
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { ValidateConnectionConfig(both); });
+    // protocol has to agree with the addresses.
+    auto disagreeing = config;
+    disagreeing.routing.address_lists[0].addresses[1].protocol = TransportProtocol::TCPS;
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { ValidateConnectionConfig(disagreeing); });
+    disagreeing.protocol = TransportProtocol::TCPS;
+    ValidateConnectionConfig(disagreeing);
+    auto empty_list = config;
+    empty_list.routing.address_lists.push_back({});
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { ValidateConnectionConfig(empty_list); });
+    auto bad_host = config;
+    bad_host.routing.address_lists[0].addresses[0].host = "x)(HOST=y";
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { ValidateConnectionConfig(bad_host); });
+    auto pooled = config;
+    pooled.server_type = "POOLED";
+    ExpectError(ProtocolErrorKind::UNSUPPORTED, [&] { ValidateConnectionConfig(pooled); });
+    auto retries = config;
+    retries.routing.retry_count = MAX_CONNECT_RETRY_COUNT + 1;
+    ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [&] { ValidateConnectionConfig(retries); });
+    // The pool key follows the addresses and their order, never a password.
+    auto reordered = RoutedConfig({{"node2", "node1"}});
+    CHECK(ConnectionTargetKey(RoutedConfig({{"node1", "node2"}})) != ConnectionTargetKey(reordered));
+    // The default budget never undercuts the per-attempt timeout.
+    ConnectionConfig slow;
+    slow.host = "db";
+    slow.service_name = "svc";
+    slow.connect_timeout_seconds = 120;
+    CHECK(EffectiveConnectBudgetSeconds(slow) == 120);
+    slow.connect_timeout_seconds = 10;
+    CHECK(EffectiveConnectBudgetSeconds(slow) == DEFAULT_CONNECT_BUDGET_SECONDS);
+}
+
+// A scripted network. Each dialed "address:port" — an IP for a resolved name —
+// answers each new connection with the next behaviour in its script; the last
+// one repeats. An address with no script is unreachable, the way a closed port
+// is. Every transport handed out is counted while alive, so a test can see
+// that a failed attempt released its transport.
+class FakeNetwork {
+public:
+    enum class Kind { ANSWER, UNREACHABLE, BLACK_HOLE, BAD_CERTIFICATE };
+    struct Behaviour {
+        Kind kind = Kind::ANSWER;
+        std::vector<uint8_t> bytes;
+    };
+    struct Open {
+        std::string address;
+        uint16_t port = 0;
+        uint32_t timeout = 0;
+        bool tls = false;
+        std::string server_name;
+        std::string sni_name;
+    };
+
+    class Transport : public ScriptedTransport {
+    public:
+        Transport(std::vector<uint8_t> input, std::vector<uint8_t> *sink, int &live_p)
+            : ScriptedTransport(std::move(input), sink), live(live_p) {
+            live++;
+        }
+        ~Transport() override {
+            live--;
+        }
+
+    private:
+        int &live;
+    };
+
+    void Script(const std::string &address, uint16_t port, std::vector<Behaviour> behaviours) {
+        scripts[address + ":" + std::to_string(port)] = std::deque<Behaviour>(behaviours.begin(), behaviours.end());
+    }
+    void Answer(const std::string &address, uint16_t port, std::vector<uint8_t> bytes) {
+        Script(address, port, {{Kind::ANSWER, std::move(bytes)}});
+    }
+
+    OracleTransportFactory Factory(std::chrono::steady_clock::time_point *clock = nullptr) {
+        return [this, clock](const std::string &host, uint16_t port, uint32_t timeout, uint32_t, bool use_tls,
+                             const TlsConfiguration &tls) -> std::unique_ptr<ByteStream> {
+            opens.push_back({host, port, timeout, use_tls, tls.server_name, tls.sni_name});
+            const auto found = scripts.find(host + ":" + std::to_string(port));
+            if (found == scripts.end() || found->second.empty()) {
+                throw OracleConnectError(ProtocolErrorKind::TRUNCATED, ConnectFailure::UNREACHABLE,
+                                         "scripted: connection refused");
+            }
+            auto behaviour = found->second.front();
+            if (found->second.size() > 1) {
+                found->second.pop_front();
+            }
+            switch (behaviour.kind) {
+            case Kind::UNREACHABLE:
+                throw OracleConnectError(ProtocolErrorKind::TRUNCATED, ConnectFailure::UNREACHABLE,
+                                         "scripted: connection refused");
+            case Kind::BLACK_HOLE:
+                // Nothing answers, so the whole per-attempt timeout is spent.
+                if (clock) {
+                    *clock += std::chrono::seconds(timeout);
+                }
+                throw OracleConnectError(ProtocolErrorKind::TRUNCATED, ConnectFailure::UNREACHABLE,
+                                         "scripted: connection timed out");
+            case Kind::BAD_CERTIFICATE:
+                throw OracleConnectError(ProtocolErrorKind::INVALID_STATE, ConnectFailure::TLS_VERIFICATION,
+                                         "scripted: certificate verification failed");
+            case Kind::ANSWER:
+                break;
+            }
+            written.emplace_back();
+            return std::make_unique<Transport>(std::move(behaviour.bytes), &written.back(), live);
+        };
+    }
+
+    std::vector<std::string> Opened() const {
+        std::vector<std::string> result;
+        for (const auto &open : opens) {
+            result.push_back(open.address);
+        }
+        return result;
+    }
+
+    std::map<std::string, std::deque<Behaviour>> scripts;
+    std::vector<Open> opens;
+    // One entry per transport actually handed out, holding what the client
+    // wrote to it.
+    std::deque<std::vector<uint8_t>> written;
+    int live = 0;
+};
+
+// A clock that moves only when the connect sleeps or a scripted black hole
+// spends a timeout, plus a record of the sleeping.
+struct FakeClock {
+    std::chrono::steady_clock::time_point now {};
+    std::chrono::milliseconds slept {0};
+    std::function<void()> on_sleep;
+    std::function<uint64_t()> random;
+
+    OracleConnectEnvironment Environment() {
+        OracleConnectEnvironment environment;
+        environment.now = [this] { return now; };
+        environment.sleep = [this](std::chrono::milliseconds duration) {
+            now += duration;
+            slept += duration;
+            if (on_sleep) {
+                on_sleep();
+            }
+        };
+        environment.random = [this]() -> uint64_t { return random ? random() : 0; };
+        return environment;
+    }
+};
+
+// The first packet a client wrote: its header flags and its connect data,
+// inline or from the DATA continuation.
+struct WrittenConnect {
+    uint8_t flags = 0;
+    std::string data;
+};
+
+static WrittenConnect FirstConnect(const std::vector<uint8_t> &bytes) {
+    CHECK(bytes.size() >= 8);
+    const size_t length = (static_cast<size_t>(bytes[0]) << 8U) | bytes[1];
+    CHECK(length <= bytes.size() && bytes[4] == static_cast<uint8_t>(TnsPacketType::CONNECT));
+    WrittenConnect result;
+    result.flags = bytes[5];
+    if (length > 74) {
+        result.data.assign(bytes.begin() + 74, bytes.begin() + static_cast<std::ptrdiff_t>(length));
+    } else {
+        CHECK(bytes.size() >= length + 10);
+        const size_t next = (static_cast<size_t>(bytes[length]) << 8U) | bytes[length + 1];
+        result.data.assign(bytes.begin() + static_cast<std::ptrdiff_t>(length + 10),
+                           bytes.begin() + static_cast<std::ptrdiff_t>(length + next));
+    }
+    return result;
+}
+
+static std::string RedirectData(const std::string &address, const std::string &reconnect = std::string()) {
+    auto data = address;
+    if (!reconnect.empty()) {
+        data.push_back('\0');
+        data += reconnect;
+    }
+    return data;
+}
+
+static void TestConnectFailsOverToTheNextAddress() {
+    FakeNetwork network;
+    network.Answer("node2", 1521, AcceptPacketBytes(false));
+    FakeClock clock;
+    ScopedOracleConnectEnvironment environment(clock.Environment());
+    ScopedOracleTransportFactory installed(network.Factory());
+    {
+        const auto connection = TnsClientConnection::Connect(RoutedConfig({{"node1", "node2"}}));
+        CHECK(network.Opened() == std::vector<std::string>({"node1", "node2"}));
+        // The failed attempt left nothing open; the accepted one is held.
+        CHECK(network.live == 1);
+        CHECK(connection->AuthConnectString().find("(HOST=node2)") != std::string::npos);
+    }
+    CHECK(network.live == 0);
+
+    // FAILOVER=OFF with LOAD_BALANCE=OFF: the first address only, and its
+    // failure is reported exactly as a single-address connect reports it.
+    network.opens.clear();
+    try {
+        TnsClientConnection::Connect(RoutedConfig({{"node1", "node2"}}, false, false));
+        CHECK(false && "expected the first address to fail");
+    } catch (const OracleConnectError &error) {
+        CHECK(error.Failure() == ConnectFailure::UNREACHABLE && error.Kind() == ProtocolErrorKind::TRUNCATED);
+        CHECK(std::string(error.what()) == "scripted: connection refused");
+    }
+    CHECK(network.Opened() == std::vector<std::string>({"node1"}));
+}
+
+static void TestRefusalFailsOverAndKeepsTheCode() {
+    FakeNetwork network;
+    network.Answer("node1", 1521, RefusePacketBytes(12514));
+    network.Answer("node2", 1521, AcceptPacketBytes(false));
+    FakeClock clock;
+    ScopedOracleConnectEnvironment environment(clock.Environment());
+    ScopedOracleTransportFactory installed(network.Factory());
+    (void)TnsClientConnection::Connect(RoutedConfig({{"node1", "node2"}}));
+    CHECK(network.Opened() == std::vector<std::string>({"node1", "node2"}));
+    CHECK(network.live == 0);
+
+    network.opens.clear();
+    network.Answer("node2", 1521, RefusePacketBytes(12528));
+    try {
+        TnsClientConnection::Connect(RoutedConfig({{"node1", "node2"}}));
+        CHECK(false && "expected every listener to refuse");
+    } catch (const OracleConnectError &error) {
+        const std::string message = error.what();
+        CHECK(error.Failure() == ConnectFailure::LISTENER_REFUSED && error.Kind() == ProtocolErrorKind::INVALID_STATE);
+        // The last refusal's code; both refusals in the attempt list.
+        CHECK(error.OracleErrorCode() == 12528);
+        CHECK(message.find("after 2 attempts") != std::string::npos);
+        CHECK(message.find("node1:1521: listener refused") != std::string::npos);
+        CHECK(message.find("ORA-12514") != std::string::npos && message.find("ORA-12528") != std::string::npos);
+    }
+    CHECK(network.live == 0);
+}
+
+static void TestEveryAddressUnreachableIsListed() {
+    FakeNetwork network;
+    FakeClock clock;
+    ScopedOracleConnectEnvironment environment(clock.Environment());
+    ScopedOracleTransportFactory installed(network.Factory());
+    auto config = RoutedConfig({{"node1", "node2", "node3"}});
+    config.user = "scott";
+    try {
+        TnsClientConnection::Connect(config);
+        CHECK(false && "expected every address to fail");
+    } catch (const OracleConnectError &error) {
+        const std::string message = error.what();
+        CHECK(error.Failure() == ConnectFailure::UNREACHABLE && error.Kind() == ProtocolErrorKind::TRUNCATED);
+        CHECK(message.find("after 3 attempts") != std::string::npos);
+        for (const auto *host : {"node1:1521", "node2:1521", "node3:1521"}) {
+            CHECK(message.find(host) != std::string::npos);
+        }
+        // Addresses and outcomes only: no user, no connect data.
+        CHECK(message.find("scott") == std::string::npos);
+        CHECK(message.find("CONNECT_DATA") == std::string::npos && message.find("SERVICE_NAME") == std::string::npos);
+    }
+    CHECK(network.Opened().size() == 3 && network.live == 0);
+}
+
+static void TestScanNameWithSeveralAddresses() {
+    FakeNetwork network;
+    network.Script("10.0.0.1", 1522, {{FakeNetwork::Kind::UNREACHABLE, {}}});
+    network.Answer("10.0.0.2", 1522, AcceptPacketBytes(false));
+    FakeClock clock;
+    ScopedOracleConnectEnvironment environment(clock.Environment());
+    ScopedOracleTransportFactory installed(network.Factory());
+    ScopedOracleHostResolver resolver([](const std::string &host, uint16_t) {
+        CHECK(host == "scan.example");
+        return std::vector<std::string> {"10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.2"};
+    });
+    ConnectionConfig config;
+    config.host = "scan.example";
+    config.port = 1522;
+    config.service_name = "svc";
+    config.protocol = TransportProtocol::TCPS;
+    (void)TnsClientConnection::Connect(config);
+    CHECK(network.Opened() == std::vector<std::string>({"10.0.0.1", "10.0.0.2"}));
+    // Dialed by IP, verified and introduced by the configured name.
+    for (const auto &open : network.opens) {
+        CHECK(open.tls && open.server_name == "scan.example" && open.sni_name == "scan.example");
+    }
+    // An explicit TLS_SERVER_NAME is checked on every attempt; SNI still
+    // names the configured host, as it always did.
+    network.opens.clear();
+    config.tls_server_name = "cert.example";
+    TlsConfiguration tls;
+    tls.server_name = config.tls_server_name;
+    (void)TnsClientConnection::Connect(config, tls);
+    CHECK(network.opens.back().server_name == "cert.example" && network.opens.back().sni_name == "scan.example");
+    // Duplicates the resolver returned are dialed once.
+    ScopedOracleHostResolver duplicates([](const std::string &, uint16_t) {
+        return std::vector<std::string> {"10.0.0.1", "10.0.0.1", "10.0.0.3"};
+    });
+    network.opens.clear();
+    ExpectConnectFailure(ConnectFailure::UNREACHABLE, [&] { (void)TnsClientConnection::Connect(config, tls); });
+    CHECK(network.Opened() == std::vector<std::string>({"10.0.0.1", "10.0.0.3"}));
+}
+
+static void TestScanListenerRedirectsToANode() {
+    const std::string node_address = "(ADDRESS=(PROTOCOL=TCP)(HOST=node1-vip)(PORT=1521))";
+    const std::string reconnect = "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=node1-vip)(PORT=1521))"
+                                  "(CONNECT_DATA=(SERVICE_NAME=svc)(INSTANCE_NAME=svc1)(CID=(PROGRAM=x))))";
+    for (const bool inline_data : {true, false}) {
+        FakeNetwork network;
+        network.Answer("10.0.0.1", 1521,
+                       RedirectPacketBytes(RedirectData(node_address, reconnect), TNS_REDIRECT_FLAG_HAS_RECONNECT_DATA,
+                                           inline_data));
+        network.Answer("10.0.1.1", 1521, AcceptPacketBytes(false));
+        FakeClock clock;
+        ScopedOracleConnectEnvironment environment(clock.Environment());
+        ScopedOracleTransportFactory installed(network.Factory());
+        ScopedOracleHostResolver resolver([](const std::string &host, uint16_t) {
+            return host == "scan.example" ? std::vector<std::string> {"10.0.0.1"}
+                                          : std::vector<std::string> {"10.0.1.1"};
+        });
+        ConnectionConfig config;
+        config.host = "scan.example";
+        config.service_name = "svc";
+        const auto connection = TnsClientConnection::Connect(config);
+        CHECK(network.Opened() == std::vector<std::string>({"10.0.0.1", "10.0.1.1"}));
+        CHECK(network.live == 1);
+        const auto first = FirstConnect(network.written[0]);
+        const auto second = FirstConnect(network.written[1]);
+        CHECK(first.flags == 0 && first.data.find("(HOST=scan.example)") != std::string::npos);
+        // The re-CONNECT carries the redirect flag and the listener's reconnect
+        // data, verbatim.
+        CHECK(second.flags == TNS_PACKET_FLAG_REDIRECT && second.data == reconnect);
+        CHECK(connection->ConnectDescriptor() == reconnect);
+        // O5LOGON names what was configured, without the listener-only CID.
+        const auto &auth = connection->AuthConnectString();
+        CHECK(auth.find("(HOST=scan.example)") != std::string::npos && auth.find("(SERVICE_NAME=svc)") != std::string::npos);
+        CHECK(auth.find("(CID=") == std::string::npos);
+
+        // The configuration is untouched: the next physical connection starts
+        // at the SCAN address again, not at the node the last one reached.
+        network.opens.clear();
+        (void)TnsClientConnection::Connect(config);
+        CHECK(network.Opened() == std::vector<std::string>({"10.0.0.1", "10.0.1.1"}));
+    }
+}
+
+static void TestRedirectWithoutReconnectDataIsRebuilt() {
+    FakeNetwork network;
+    network.Answer("scan", 1521,
+                   RedirectPacketBytes("(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=node2)(PORT=1525))"
+                                       "(CONNECT_DATA=(SERVICE_NAME=elsewhere)))"));
+    network.Answer("node2", 1525, AcceptPacketBytes(false));
+    FakeClock clock;
+    ScopedOracleConnectEnvironment environment(clock.Environment());
+    ScopedOracleTransportFactory installed(network.Factory());
+    auto config = RoutedConfig({{"scan"}});
+    config.instance_name = "svc2";
+    const auto connection = TnsClientConnection::Connect(config);
+    const auto second = FirstConnect(network.written[1]);
+    // The new address, the original service and instance: the address part of
+    // a redirect says where to go, not what to ask for.
+    CHECK(second.flags == TNS_PACKET_FLAG_REDIRECT);
+    CHECK(second.data.find("(HOST=node2)(PORT=1525)") != std::string::npos);
+    CHECK(second.data.find("(SERVICE_NAME=svc)(INSTANCE_NAME=svc2)") != std::string::npos);
+    CHECK(second.data.find("elsewhere") == std::string::npos);
+}
+
+static void TestUnreachableRedirectTargetFallsBack() {
+    FakeClock clock;
+    ScopedOracleConnectEnvironment environment(clock.Environment());
+    // The first SCAN address sends the client to a node that is down; the
+    // second SCAN address is still tried before anything else.
+    {
+        FakeNetwork network;
+        network.Answer("10.0.0.1", 1521, RedirectPacketBytes("(ADDRESS=(PROTOCOL=TCP)(HOST=node1)(PORT=1521))"));
+        network.Answer("10.0.0.2", 1521, AcceptPacketBytes(false));
+        ScopedOracleTransportFactory installed(network.Factory());
+        ScopedOracleHostResolver resolver([](const std::string &host, uint16_t) {
+            return host == "scan" ? std::vector<std::string> {"10.0.0.1", "10.0.0.2"}
+                                  : std::vector<std::string> {host};
+        });
+        const auto connection = TnsClientConnection::Connect(RoutedConfig({{"scan", "backup"}}));
+        CHECK(network.Opened() == std::vector<std::string>({"10.0.0.1", "node1", "10.0.0.2"}));
+        CHECK(network.live == 1);
+    }
+    // And when the SCAN has nothing left, the rest of the configured list.
+    {
+        FakeNetwork network;
+        network.Answer("scan", 1521, RedirectPacketBytes("(ADDRESS_LIST=(ADDRESS=(HOST=node1)(PORT=1521))"
+                                                         "(ADDRESS=(HOST=node2)(PORT=1521)))"));
+        network.Answer("backup", 1521, AcceptPacketBytes(false));
+        ScopedOracleTransportFactory installed(network.Factory());
+        (void)TnsClientConnection::Connect(RoutedConfig({{"scan", "backup"}}));
+        // Both redirect targets were tried, in the listener's order.
+        CHECK(network.Opened() == std::vector<std::string>({"scan", "node1", "node2", "backup"}));
+    }
+    // With nowhere left, the failure says the redirect is what failed.
+    {
+        FakeNetwork network;
+        network.Answer("scan", 1521, RedirectPacketBytes("(ADDRESS=(HOST=node1)(PORT=1521))"));
+        ScopedOracleTransportFactory installed(network.Factory());
+        ExpectConnectFailure(ConnectFailure::REDIRECT_FAILED,
+                             [] { (void)TnsClientConnection::Connect(RoutedConfig({{"scan"}})); });
+    }
+}
+
+static void TestRedirectCyclesAndLimits() {
+    FakeClock clock;
+    ScopedOracleConnectEnvironment environment(clock.Environment());
+    {
+        FakeNetwork network;
+        network.Answer("a", 1521, RedirectPacketBytes("(ADDRESS=(HOST=b)(PORT=1521))"));
+        network.Answer("b", 1521, RedirectPacketBytes("(ADDRESS=(HOST=A)(PORT=1521))"));
+        network.Answer("c", 1521, AcceptPacketBytes(false));
+        ScopedOracleTransportFactory installed(network.Factory());
+        try {
+            TnsClientConnection::Connect(RoutedConfig({{"a"}}));
+            CHECK(false && "expected a redirect cycle");
+        } catch (const OracleConnectError &error) {
+            CHECK(error.Failure() == ConnectFailure::REDIRECT_FAILED);
+            CHECK(std::string(error.what()).find("loops back") != std::string::npos);
+        }
+        // A cycle is this listener's problem, not the configuration's: the next
+        // configured address still gets its turn.
+        network.opens.clear();
+        (void)TnsClientConnection::Connect(RoutedConfig({{"a", "c"}}));
+        CHECK(network.Opened() == std::vector<std::string>({"a", "b", "c"}));
+
+        // Within one hop: the first node the listener named sends the client
+        // back where it started, and the second node it named still answers.
+        network.opens.clear();
+        network.Answer("scan", 1521,
+                       RedirectPacketBytes("(ADDRESS_LIST=(ADDRESS=(HOST=n1)(PORT=1521))(ADDRESS=(HOST=n2)(PORT=1521)))"));
+        network.Answer("n1", 1521, RedirectPacketBytes("(ADDRESS=(HOST=scan)(PORT=1521))"));
+        network.Answer("n2", 1521, AcceptPacketBytes(false));
+        const auto connection = TnsClientConnection::Connect(RoutedConfig({{"scan"}}));
+        CHECK(network.Opened() == std::vector<std::string>({"scan", "n1", "n2"}) && network.live == 1);
+    }
+    {
+        FakeNetwork network;
+        const std::vector<std::string> chain {"h0", "h1", "h2", "h3", "h4"};
+        for (size_t index = 0; index + 1 < chain.size(); index++) {
+            network.Answer(chain[index], 1521,
+                           RedirectPacketBytes("(ADDRESS=(HOST=" + chain[index + 1] + ")(PORT=1521))"));
+        }
+        network.Answer("h4", 1521, AcceptPacketBytes(false));
+        ScopedOracleTransportFactory installed(network.Factory());
+        try {
+            TnsClientConnection::Connect(RoutedConfig({{"h0"}}));
+            CHECK(false && "expected the redirect limit");
+        } catch (const OracleConnectError &error) {
+            CHECK(error.Failure() == ConnectFailure::REDIRECT_FAILED);
+            CHECK(std::string(error.what()).find("redirect limit") != std::string::npos);
+        }
+        CHECK(network.Opened() == std::vector<std::string>({"h0", "h1", "h2", "h3"}));
+        CHECK(network.live == 0);
+    }
+}
+
+static void TestRedirectCannotChangeTheProtocol() {
+    FakeClock clock;
+    ScopedOracleConnectEnvironment environment(clock.Environment());
+    FakeNetwork network;
+    network.Answer("secure", 1522, RedirectPacketBytes("(ADDRESS=(PROTOCOL=TCP)(HOST=node1)(PORT=1521))"));
+    network.Answer("node1", 1521, AcceptPacketBytes(false));
+    network.Answer("other", 1522, AcceptPacketBytes(false));
+    ScopedOracleTransportFactory installed(network.Factory());
+    auto config = RoutedConfig({{"secure", "other"}});
+    for (auto &address : config.routing.address_lists[0].addresses) {
+        address.protocol = TransportProtocol::TCPS;
+        address.port = 1522;
+    }
+    config.protocol = TransportProtocol::TCPS;
+    try {
+        TnsClientConnection::Connect(config);
+        CHECK(false && "expected the downgrade to be refused");
+    } catch (const OracleConnectError &error) {
+        CHECK(error.Failure() == ConnectFailure::PROTOCOL);
+        CHECK(std::string(error.what()).find("refusing to downgrade") != std::string::npos);
+    }
+    // Refused outright: not the redirect target, and not the next address.
+    CHECK(network.Opened() == std::vector<std::string>({"secure"}));
+
+    // A redirect that names no protocol keeps TCPS, and TLS settings with it.
+    network.opens.clear();
+    network.Answer("secure", 1522, RedirectPacketBytes("(ADDRESS=(HOST=node2)(PORT=1522))"));
+    network.Answer("node2", 1522, AcceptPacketBytes(false));
+    (void)TnsClientConnection::Connect(config);
+    CHECK(network.Opened() == std::vector<std::string>({"secure", "node2"}));
+    CHECK(network.opens[1].tls && network.opens[1].server_name == "secure" && network.opens[1].sni_name == "secure");
+
+    // Nor may a TCP connection be sent to TCPS.
+    network.opens.clear();
+    network.Answer("plain", 1521, RedirectPacketBytes("(ADDRESS=(PROTOCOL=TCPS)(HOST=node3)(PORT=2484))"));
+    ExpectConnectFailure(ConnectFailure::PROTOCOL, [] { (void)TnsClientConnection::Connect(RoutedConfig({{"plain"}})); });
+}
+
+static void TestMalformedListenerAnswersAreNotFailedOver() {
+    FakeClock clock;
+    ScopedOracleConnectEnvironment environment(clock.Environment());
+    FakeNetwork network;
+    network.Answer("a", 1521, RedirectPacketBytes("junk"));
+    network.Answer("b", 1521, AcceptPacketBytes(false));
+    ScopedOracleTransportFactory installed(network.Factory());
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)TnsClientConnection::Connect(RoutedConfig({{"a", "b"}})); });
+    CHECK(network.Opened() == std::vector<std::string>({"a"}) && network.live == 0);
+
+    // A certificate that does not verify ends the connect too.
+    network.opens.clear();
+    network.Script("a", 1521, {{FakeNetwork::Kind::BAD_CERTIFICATE, {}}});
+    ExpectConnectFailure(ConnectFailure::TLS_VERIFICATION,
+                         [] { (void)TnsClientConnection::Connect(RoutedConfig({{"a", "b"}})); });
+    CHECK(network.Opened() == std::vector<std::string>({"a"}));
+
+    // Anything after ACCEPT is not a connect failure at all: here the CHECK_OOB
+    // probe, which a scripted transport cannot answer. The second address is
+    // never tried.
+    network.opens.clear();
+    network.Answer("a", 1521, AcceptPacketBytes(true));
+    ExpectError(ProtocolErrorKind::UNSUPPORTED, [] { (void)TnsClientConnection::Connect(RoutedConfig({{"a", "b"}})); });
+    CHECK(network.Opened() == std::vector<std::string>({"a"}));
+}
+
+static void TestUnresolvableNameFailsOver() {
+    FakeClock clock;
+    ScopedOracleConnectEnvironment environment(clock.Environment());
+    FakeNetwork network;
+    network.Answer("b", 1521, AcceptPacketBytes(false));
+    ScopedOracleTransportFactory installed(network.Factory());
+    ScopedOracleHostResolver resolver([](const std::string &host, uint16_t) -> std::vector<std::string> {
+        if (host == "gone.example") {
+            throw OracleConnectError(ProtocolErrorKind::TRUNCATED, ConnectFailure::UNREACHABLE, "scripted: no such host");
+        }
+        return {host};
+    });
+    (void)TnsClientConnection::Connect(RoutedConfig({{"gone.example", "b"}}));
+    CHECK(network.Opened() == std::vector<std::string>({"b"}));
+    // A resolver that returns nothing is the same failure.
+    ScopedOracleHostResolver empty([](const std::string &, uint16_t) { return std::vector<std::string>(); });
+    ExpectConnectFailure(ConnectFailure::UNREACHABLE, [] { (void)ResolveOracleHost("x.example", 1521); });
+    // An IP literal never reaches a resolver.
+    CHECK(ResolveOracleHost("2001:db8::1", 1521) == std::vector<std::string>({"2001:db8::1"}));
+}
+
+static void TestRetriesDelaysAndTheBudget() {
+    FakeNetwork network;
+    FakeClock clock;
+    ScopedOracleConnectEnvironment environment(clock.Environment());
+    ScopedOracleTransportFactory installed(network.Factory(&clock.now));
+
+    // RETRY_COUNT=2, RETRY_DELAY=5: three passes, two delays.
+    auto config = RoutedConfig({{"dead"}});
+    config.routing.retry_count = 2;
+    config.routing.retry_delay_seconds = 5;
+    try {
+        TnsClientConnection::Connect(config);
+        CHECK(false && "expected every pass to fail");
+    } catch (const OracleConnectError &error) {
+        CHECK(error.Failure() == ConnectFailure::UNREACHABLE);
+        CHECK(std::string(error.what()).find("after 3 attempts") != std::string::npos);
+    }
+    CHECK(network.Opened().size() == 3 && clock.slept == std::chrono::seconds(10));
+
+    // A 12-second budget: attempts at 0, 5 and 10 s, each allowed only what is
+    // left of the budget, and no delay that would end past it.
+    network.opens.clear();
+    config.routing.retry_count = 10;
+    config.routing.connect_budget_seconds = 12;
+    config.connect_timeout_seconds = 10;
+    try {
+        TnsClientConnection::Connect(config);
+        CHECK(false && "expected the budget to run out");
+    } catch (const OracleConnectError &error) {
+        CHECK(error.Failure() == ConnectFailure::BUDGET_EXHAUSTED && error.Kind() == ProtocolErrorKind::TRUNCATED);
+        CHECK(std::string(error.what()).find("leaves no room for RETRY_DELAY") != std::string::npos);
+    }
+    CHECK(network.opens.size() == 3 && network.opens[0].timeout == 10 && network.opens[1].timeout == 7 &&
+          network.opens[2].timeout == 2);
+
+    // Addresses that swallow the connect spend their whole timeout, and the
+    // budget stops the list partway through.
+    network.opens.clear();
+    auto holes = RoutedConfig({{"h1", "h2", "h3"}});
+    for (const auto *host : {"h1", "h2", "h3"}) {
+        network.Script(host, 1521, {{FakeNetwork::Kind::BLACK_HOLE, {}}});
+    }
+    holes.routing.connect_budget_seconds = 15;
+    holes.connect_timeout_seconds = 10;
+    ExpectConnectFailure(ConnectFailure::BUDGET_EXHAUSTED, [&] { (void)TnsClientConnection::Connect(holes); });
+    CHECK(network.Opened() == std::vector<std::string>({"h1", "h2"}));
+    CHECK(network.opens[0].timeout == 10 && network.opens[1].timeout == 5);
+}
+
+static void TestCancellationStopsTheConnect() {
+    FakeNetwork network;
+    FakeClock clock;
+    ScopedOracleConnectEnvironment environment(clock.Environment());
+    ScopedOracleTransportFactory installed(network.Factory());
+    auto config = RoutedConfig({{"dead"}});
+    config.routing.retry_count = 5;
+    config.routing.retry_delay_seconds = 5;
+
+    bool cancelled = true;
+    {
+        ScopedOracleConnectCancellation cancellation([&] { return cancelled; });
+        ExpectConnectFailure(ConnectFailure::CANCELLED, [&] { (void)TnsClientConnection::Connect(config); });
+        CHECK(network.opens.empty());
+
+        // Cancelled during the first retry delay: noticed within one slice.
+        cancelled = false;
+        clock.on_sleep = [&] { cancelled = true; };
+        ExpectConnectFailure(ConnectFailure::CANCELLED, [&] { (void)TnsClientConnection::Connect(config); });
+        CHECK(network.opens.size() == 1 && clock.slept == std::chrono::milliseconds(100));
+    }
+    // The check was this thread's, and it is gone with its scope.
+    CHECK(!OracleConnectCancelled());
+
+    // The configuration can carry its own check, which is how the DuckDB
+    // adapter hands over a query's interrupt flag.
+    network.opens.clear();
+    auto interrupted = config;
+    interrupted.connect_cancelled = [] { return true; };
+    ExpectConnectFailure(ConnectFailure::CANCELLED, [&] { (void)TnsClientConnection::Connect(interrupted); });
+    CHECK(network.opens.empty());
+}
+
+static void TestLoadBalanceShufflesEachConnection() {
+    FakeNetwork network;
+    for (const auto *host : {"a", "b", "c"}) {
+        network.Answer(host, 1521, AcceptPacketBytes(false));
+    }
+    FakeClock clock;
+    clock.random = Sequence({0, 1, 2, 0});
+    ScopedOracleConnectEnvironment environment(clock.Environment());
+    ScopedOracleTransportFactory installed(network.Factory());
+    const auto config = RoutedConfig({{"a", "b", "c"}}, true, true);
+    const auto key = ConnectionTargetKey(config);
+    // Draws 0,1 give c,b,a; draws 2,0 give b,a,c. Each connection shuffles
+    // afresh and the first address in its order answers.
+    (void)TnsClientConnection::Connect(config);
+    (void)TnsClientConnection::Connect(config);
+    CHECK(network.Opened() == std::vector<std::string>({"c", "b"}));
+    CHECK(ConnectionTargetKey(config) == key);
+    // LOAD_BALANCE=OFF keeps the written order every time.
+    network.opens.clear();
+    const auto ordered = RoutedConfig({{"a", "b", "c"}});
+    (void)TnsClientConnection::Connect(ordered);
+    (void)TnsClientConnection::Connect(ordered);
+    CHECK(network.Opened() == std::vector<std::string>({"a", "a"}));
+}
+
+// Review regressions. A redirect chain keeps every level's untried addresses:
+// when one node's own redirect leads nowhere, the next node the SCAN listener
+// named is still tried.
+static void TestRedirectChainKeepsEachLevelsAlternatives() {
+    FakeClock clock;
+    ScopedOracleConnectEnvironment environment(clock.Environment());
+    {
+        FakeNetwork network;
+        network.Answer("scan", 1521,
+                       RedirectPacketBytes("(ADDRESS_LIST=(ADDRESS=(HOST=n1)(PORT=1521))(ADDRESS=(HOST=n2)(PORT=1521)))"));
+        network.Answer("n1", 1521, RedirectPacketBytes("(ADDRESS=(HOST=dead)(PORT=1521))"));
+        network.Answer("n2", 1521, AcceptPacketBytes(false));
+        ScopedOracleTransportFactory installed(network.Factory());
+        const auto connection = TnsClientConnection::Connect(RoutedConfig({{"scan"}}));
+        CHECK(network.Opened() == std::vector<std::string>({"scan", "n1", "dead", "n2"}));
+        CHECK(network.live == 1);
+        // The accepted CONNECT went to n2 as the SCAN listener's redirect
+        // directed, flagged as a re-CONNECT.
+        CHECK(FirstConnect(network.written.back()).flags == TNS_PACKET_FLAG_REDIRECT);
+    }
+    // Two levels deep: the branch under n1 is exhausted at both of its own
+    // levels before the chain returns to n2.
+    {
+        FakeNetwork network;
+        network.Answer("scan", 1521,
+                       RedirectPacketBytes("(ADDRESS_LIST=(ADDRESS=(HOST=n1)(PORT=1521))(ADDRESS=(HOST=n2)(PORT=1521)))"));
+        network.Answer("n1", 1521,
+                       RedirectPacketBytes("(ADDRESS_LIST=(ADDRESS=(HOST=m1)(PORT=1521))(ADDRESS=(HOST=m2)(PORT=1521)))"));
+        network.Answer("m1", 1521, RefusePacketBytes(12516));
+        network.Answer("n2", 1521, AcceptPacketBytes(false));
+        ScopedOracleTransportFactory installed(network.Factory());
+        (void)TnsClientConnection::Connect(RoutedConfig({{"scan"}}));
+        CHECK(network.Opened() == std::vector<std::string>({"scan", "n1", "m1", "m2", "n2"}));
+    }
+    // A sibling is not a cycle: n1 redirecting to n2, which the SCAN listener
+    // also offered but the chain has not visited, is followed. Only an
+    // address on the chain's own path counts as looping back.
+    {
+        FakeNetwork network;
+        network.Answer("scan", 1521,
+                       RedirectPacketBytes("(ADDRESS_LIST=(ADDRESS=(HOST=n1)(PORT=1521))(ADDRESS=(HOST=n2)(PORT=1521)))"));
+        network.Answer("n1", 1521, RedirectPacketBytes("(ADDRESS=(HOST=n2)(PORT=1521))"));
+        network.Answer("n2", 1521, AcceptPacketBytes(false));
+        ScopedOracleTransportFactory installed(network.Factory());
+        (void)TnsClientConnection::Connect(RoutedConfig({{"scan"}}));
+        CHECK(network.Opened() == std::vector<std::string>({"scan", "n1", "n2"}));
+    }
+}
+
+// A transport whose every read costs time on the fake clock.
+class SlowTransport : public ScriptedTransport {
+public:
+    SlowTransport(std::vector<uint8_t> input, FakeClock &clock_p, std::chrono::milliseconds per_read_p,
+                  size_t chunk_p)
+        : ScriptedTransport(std::move(input)), clock(clock_p), per_read(per_read_p), chunk(chunk_p) {
+    }
+    size_t Read(uint8_t *destination, size_t maximum_size) override {
+        clock.now += per_read;
+        if (on_read) {
+            on_read();
+        }
+        return ScriptedTransport::Read(destination, (std::min)(maximum_size, chunk));
+    }
+    std::function<void()> on_read;
+
+private:
+    FakeClock &clock;
+    std::chrono::milliseconds per_read;
+    size_t chunk;
+};
+
+// The overall budget holds through the listener exchange, not only between
+// attempts: an ACCEPT that arrives after it is spent does not make a
+// connection, however it trickled in.
+static void TestBudgetHoldsThroughTheListenerExchange() {
+    FakeClock clock;
+    ScopedOracleConnectEnvironment environment(clock.Environment());
+    auto config = RoutedConfig({{"scan"}});
+    config.routing.connect_budget_seconds = 1;
+    size_t opens = 0;
+
+    // One slow read: the whole ACCEPT, two seconds late.
+    {
+        ScopedOracleTransportFactory installed([&](const std::string &, uint16_t, uint32_t, uint32_t, bool,
+                                                   const TlsConfiguration &) -> std::unique_ptr<ByteStream> {
+            opens++;
+            return std::make_unique<SlowTransport>(AcceptPacketBytes(false), clock, std::chrono::seconds(2), 4096);
+        });
+        ExpectConnectFailure(ConnectFailure::BUDGET_EXHAUSTED, [&] { (void)TnsClientConnection::Connect(config); });
+        CHECK(opens == 1);
+    }
+    // A dribble: a byte at a time, each well inside any read timeout, adding
+    // up to far more than the budget.
+    clock.now = {};
+    config.routing.connect_budget_seconds = 2;
+    {
+        ScopedOracleTransportFactory installed([&](const std::string &, uint16_t, uint32_t, uint32_t, bool,
+                                                   const TlsConfiguration &) -> std::unique_ptr<ByteStream> {
+            return std::make_unique<SlowTransport>(AcceptPacketBytes(false), clock, std::chrono::milliseconds(300), 1);
+        });
+        try {
+            (void)TnsClientConnection::Connect(config);
+            CHECK(false && "expected the budget to run out mid-exchange");
+        } catch (const OracleConnectError &error) {
+            CHECK(error.Failure() == ConnectFailure::BUDGET_EXHAUSTED);
+            CHECK(std::string(error.what()).find("before the connection was ready") != std::string::npos);
+        }
+        CHECK(clock.now <= std::chrono::steady_clock::time_point {} + std::chrono::milliseconds(2300));
+    }
+    // A resolver that eats the budget.
+    clock.now = {};
+    {
+        FakeNetwork network;
+        network.Answer("scan", 1521, AcceptPacketBytes(false));
+        ScopedOracleTransportFactory installed(network.Factory());
+        ScopedOracleHostResolver resolver([&](const std::string &host, uint16_t) {
+            clock.now += std::chrono::seconds(5);
+            return std::vector<std::string> {host};
+        });
+        ExpectConnectFailure(ConnectFailure::BUDGET_EXHAUSTED, [&] { (void)TnsClientConnection::Connect(config); });
+        CHECK(network.opens.empty());
+    }
+    // Cancellation reaches into the exchange as well.
+    clock.now = {};
+    config.routing.connect_budget_seconds = 60;
+    {
+        bool cancelled = false;
+        ScopedOracleConnectCancellation cancellation([&] { return cancelled; });
+        ScopedOracleTransportFactory installed([&](const std::string &, uint16_t, uint32_t, uint32_t, bool,
+                                                   const TlsConfiguration &) -> std::unique_ptr<ByteStream> {
+            auto transport =
+                std::make_unique<SlowTransport>(AcceptPacketBytes(false), clock, std::chrono::milliseconds(1), 4);
+            transport->on_read = [&] { cancelled = true; };
+            return transport;
+        });
+        ExpectConnectFailure(ConnectFailure::CANCELLED, [&] { (void)TnsClientConnection::Connect(config); });
+    }
+}
+
+// The same with the real clock: a name that takes three seconds to resolve,
+// against a one-second budget, ends the connect in about one.
+static void TestSlowNameResolutionIsCutOffByTheBudget() {
+    ScopedOracleTransportFactory installed([](const std::string &, uint16_t, uint32_t, uint32_t, bool,
+                                              const TlsConfiguration &) -> std::unique_ptr<ByteStream> {
+        CHECK(false && "a transport must not be opened after the budget ran out");
+        return nullptr;
+    });
+    ScopedOracleHostResolver resolver([](const std::string &host, uint16_t) {
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        return std::vector<std::string> {host};
+    });
+    auto config = RoutedConfig({{"slow.example"}});
+    config.routing.connect_budget_seconds = 1;
+    const auto started = std::chrono::steady_clock::now();
+    ExpectConnectFailure(ConnectFailure::BUDGET_EXHAUSTED, [&] { (void)TnsClientConnection::Connect(config); });
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    CHECK(elapsed >= std::chrono::milliseconds(900) && elapsed < std::chrono::milliseconds(2500));
+}
+
+// A resolver that hangs must not turn into a thread per connect. Lookups run
+// on a bounded pool; connects that give up leave at most MAX_RESOLVER_WORKERS
+// lookups running between them, and a lookup whose caller gave up before a
+// worker took it is never run at all.
+static void TestResolverWorkersAreBounded() {
+    struct State {
+        std::mutex lock;
+        std::condition_variable changed;
+        bool release = false;
+        int active = 0;
+        int most_active = 0;
+        int started = 0;
+    };
+    auto state = std::make_shared<State>();
+    ScopedOracleHostResolver resolver([state](const std::string &, uint16_t) {
+        std::unique_lock<std::mutex> guard(state->lock);
+        state->started++;
+        state->active++;
+        state->most_active = (std::max)(state->most_active, state->active);
+        state->changed.wait(guard, [&] { return state->release; });
+        state->active--;
+        state->changed.notify_all();
+        return std::vector<std::string> {"127.0.0.1"};
+    });
+    auto config = RoutedConfig({{"hanging.example"}});
+
+    // Twelve connects in a row, each cancelled while its lookup hangs.
+    for (int index = 0; index < 12; index++) {
+        auto checks = std::make_shared<int>(0);
+        config.connect_cancelled = [checks] { return ++*checks > 2; };
+        ExpectConnectFailure(ConnectFailure::CANCELLED, [&] { (void)TnsClientConnection::Connect(config); });
+    }
+    CHECK(OracleResolverWorkerCount() <= MAX_RESOLVER_WORKERS);
+
+    // Then more at once than there are workers and queue places together, each
+    // with a one-second budget: every one ends on its budget, none hangs, and
+    // still no more workers exist.
+    config.connect_cancelled = nullptr;
+    config.routing.connect_budget_seconds = 1;
+    std::vector<std::thread> callers;
+    std::mutex outcomes_lock;
+    std::vector<ConnectFailure> outcomes;
+    const auto started_at = std::chrono::steady_clock::now();
+    for (size_t index = 0; index < MAX_RESOLVER_WORKERS + MAX_RESOLVER_QUEUE + 4; index++) {
+        callers.emplace_back([&] {
+            try {
+                (void)TnsClientConnection::Connect(config);
+            } catch (const OracleConnectError &error) {
+                std::lock_guard<std::mutex> guard(outcomes_lock);
+                outcomes.push_back(error.Failure());
+            }
+        });
+    }
+    for (auto &caller : callers) {
+        caller.join();
+    }
+    CHECK(std::chrono::steady_clock::now() - started_at < std::chrono::milliseconds(3000));
+    CHECK(outcomes.size() == callers.size());
+    for (const auto failure : outcomes) {
+        CHECK(failure == ConnectFailure::BUDGET_EXHAUSTED);
+    }
+    CHECK(OracleResolverWorkerCount() <= MAX_RESOLVER_WORKERS);
+
+    std::unique_lock<std::mutex> guard(state->lock);
+    CHECK(state->most_active <= static_cast<int>(MAX_RESOLVER_WORKERS));
+    // Only lookups a worker had already taken ever ran; the rest were
+    // withdrawn by the callers that gave up on them.
+    CHECK(state->started <= static_cast<int>(MAX_RESOLVER_WORKERS));
+    state->release = true;
+    state->changed.notify_all();
+    CHECK(state->changed.wait_for(guard, std::chrono::seconds(5), [&] { return state->active == 0; }));
+}
+
+// A transport that answers CONNECT with ACCEPT at once and then, when asked
+// for more, spends time on the fake clock and hangs up: a server that accepted
+// and then went quiet during TTC negotiation.
+class QuietAfterAccept : public ScriptedTransport {
+public:
+    QuietAfterAccept(FakeClock &clock_p, std::function<void()> on_quiet_p = nullptr)
+        : ScriptedTransport(AcceptPacketBytes(false)), clock(clock_p), on_quiet(std::move(on_quiet_p)) {
+    }
+    size_t Read(uint8_t *destination, size_t maximum_size) override {
+        if (read_offset == input.size()) {
+            clock.now += std::chrono::seconds(5);
+            if (on_quiet) {
+                on_quiet();
+            }
+            return 0;
+        }
+        return ScriptedTransport::Read(destination, maximum_size);
+    }
+
+private:
+    FakeClock &clock;
+    std::function<void()> on_quiet;
+};
+
+// The budget covers the whole establishment, not just the listener exchange:
+// TTC negotiation and O5LOGON run under the same deadline and cancellation,
+// until authentication completes.
+static void TestBudgetHoldsUntilAuthentication() {
+    FakeClock clock;
+    ScopedOracleConnectEnvironment environment(clock.Environment());
+    auto config = RoutedConfig({{"db"}});
+    config.routing.connect_budget_seconds = 1;
+    {
+        ScopedOracleTransportFactory installed([&](const std::string &, uint16_t, uint32_t, uint32_t, bool,
+                                                   const TlsConfiguration &) -> std::unique_ptr<ByteStream> {
+            return std::make_unique<QuietAfterAccept>(clock);
+        });
+        auto connection = TnsClientConnection::Connect(config);
+        ExpectConnectFailure(ConnectFailure::BUDGET_EXHAUSTED, [&] { (void)connection->Negotiate(); });
+    }
+    // Cancellation reaches negotiation too.
+    clock.now = {};
+    config.routing.connect_budget_seconds = 60;
+    {
+        bool cancelled = false;
+        config.connect_cancelled = [&] { return cancelled; };
+        ScopedOracleTransportFactory installed([&](const std::string &, uint16_t, uint32_t, uint32_t, bool,
+                                                   const TlsConfiguration &) -> std::unique_ptr<ByteStream> {
+            return std::make_unique<QuietAfterAccept>(clock, [&] { cancelled = true; });
+        });
+        auto connection = TnsClientConnection::Connect(config);
+        ExpectConnectFailure(ConnectFailure::CANCELLED, [&] { (void)connection->Negotiate(); });
+        config.connect_cancelled = nullptr;
+    }
+    // Once establishment is over the budget no longer applies: the same quiet
+    // server is now an ordinary truncated read, whatever the clock says.
+    clock.now = {};
+    config.routing.connect_budget_seconds = 1;
+    {
+        ScopedOracleTransportFactory installed([&](const std::string &, uint16_t, uint32_t, uint32_t, bool,
+                                                   const TlsConfiguration &) -> std::unique_ptr<ByteStream> {
+            return std::make_unique<QuietAfterAccept>(clock);
+        });
+        auto connection = TnsClientConnection::Connect(config);
+        connection->EndEstablishment();
+        // Twice is harmless.
+        connection->EndEstablishment();
+        try {
+            (void)connection->Negotiate();
+            CHECK(false && "expected the quiet server to fail negotiation");
+        } catch (const OracleConnectError &) {
+            CHECK(false && "the connect budget must not apply after establishment");
+        } catch (const ProtocolError &error) {
+            CHECK(error.Kind() == ProtocolErrorKind::TRUNCATED);
+        }
+    }
+    // EndEstablishment after Close touches nothing: Close frees the stream the
+    // disarm callback pointed into, and has to drop the callback with it. Under
+    // ASan, which the debug build uses, the old order was a heap use after free.
+    {
+        FakeNetwork network;
+        network.Answer("db", 1521, AcceptPacketBytes(false));
+        ScopedOracleTransportFactory installed(network.Factory());
+        auto connection = TnsClientConnection::Connect(config);
+        connection->Close();
+        connection->EndEstablishment();
+        connection->Close();
+        CHECK(connection->State() == OracleConnectionState::CLOSED && network.live == 0);
+    }
+}
+
+// The error lists what was parsed from a redirect — host, port, protocol —
+// and never what the listener sent: a DESCRIPTION can carry its whole
+// CONNECT_DATA, and reconnect data is connect data by definition.
+static void TestRedirectTextStaysOutOfErrors() {
+    FakeClock clock;
+    ScopedOracleConnectEnvironment environment(clock.Environment());
+    FakeNetwork network;
+    network.Answer("scan", 1521,
+                   RedirectPacketBytes(RedirectData("(DESCRIPTION=(ADDRESS=(HOST=dead)(PORT=1521))"
+                                                    "(CONNECT_DATA=(TOKEN=PRIVATE_MARKER)))",
+                                                    "(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=svc)"
+                                                    "(TOKEN=RECONNECT_MARKER)))")));
+    ScopedOracleTransportFactory installed(network.Factory());
+    try {
+        (void)TnsClientConnection::Connect(RoutedConfig({{"scan"}}));
+        CHECK(false && "expected the redirect target to be unreachable");
+    } catch (const OracleConnectError &error) {
+        const std::string message = error.what();
+        CHECK(message.find("PRIVATE_MARKER") == std::string::npos);
+        CHECK(message.find("RECONNECT_MARKER") == std::string::npos);
+        CHECK(message.find("CONNECT_DATA") == std::string::npos);
+        CHECK(message.find("redirected to dead:1521") != std::string::npos);
+    }
+    // Nor does a redirect that is refused while being followed leak it.
+    network.Answer("scan", 1521,
+                   RedirectPacketBytes("(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=node)(PORT=2484))"
+                                       "(CONNECT_DATA=(TOKEN=PRIVATE_MARKER)))"));
+    try {
+        (void)TnsClientConnection::Connect(RoutedConfig({{"scan"}}));
+        CHECK(false && "expected the protocol change to be refused");
+    } catch (const OracleConnectError &error) {
+        CHECK(std::string(error.what()).find("PRIVATE_MARKER") == std::string::npos);
+    }
+}
+
+#if !defined(_WIN32)
+// A small loopback listener: it accepts connections one after another, reads
+// one TNS packet from each, keeps it, and answers with the next scripted reply.
+// It is what the default transport — a real socket through OpenSSL — needs to
+// be exercised end to end offline. It is a mock of the listener's first
+// exchange and nothing more: not a RAC, not a database.
+class MockListener {
+public:
+    // `hold` is how long each accepted connection is kept open after the
+    // reply; a long hold with an empty reply is a listener that accepts the
+    // TCP connection and then says nothing.
+    explicit MockListener(std::vector<std::vector<uint8_t>> replies_p,
+                          std::chrono::milliseconds hold_p = std::chrono::milliseconds(50))
+        : replies(std::move(replies_p)), hold(hold_p) {
+        listener = socket(AF_INET, SOCK_STREAM, 0);
+        CHECK(listener >= 0);
+        int reuse = 1;
+        setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        sockaddr_in address {};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        CHECK(bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0);
+        CHECK(listen(listener, 4) == 0);
+        socklen_t size = sizeof(address);
+        CHECK(getsockname(listener, reinterpret_cast<sockaddr *>(&address), &size) == 0);
+        port = ntohs(address.sin_port);
+        worker = std::thread([this] { Serve(); });
+    }
+    ~MockListener() {
+        if (worker.joinable()) {
+            worker.join();
+        }
+        close(listener);
+    }
+    uint16_t Port() const {
+        return port;
+    }
+    // The first packet each accepted connection sent.
+    std::vector<std::vector<uint8_t>> received;
+
+private:
+    static bool ReadFully(int socket_fd, uint8_t *destination, size_t size) {
+        while (size > 0) {
+            const auto count = recv(socket_fd, destination, size, 0);
+            if (count <= 0) {
+                return false;
+            }
+            destination += count;
+            size -= static_cast<size_t>(count);
+        }
+        return true;
+    }
+    void Serve() {
+        sigset_t block;
+        sigemptyset(&block);
+        sigaddset(&block, SIGPIPE);
+        pthread_sigmask(SIG_BLOCK, &block, nullptr);
+        for (const auto &reply : replies) {
+            const auto accepted = accept(listener, nullptr, nullptr);
+            if (accepted < 0) {
+                return;
+            }
+            SuppressSigPipeOnSocket(accepted);
+            std::vector<uint8_t> packet(8);
+            if (ReadFully(accepted, packet.data(), 8)) {
+                const size_t length = (static_cast<size_t>(packet[0]) << 8U) | packet[1];
+                packet.resize((std::max)(length, size_t(8)));
+                if (ReadFully(accepted, packet.data() + 8, packet.size() - 8)) {
+                    received.push_back(packet);
+                    if (!reply.empty()) {
+                        (void)send(accepted, reply.data(), reply.size(), TEST_SEND_FLAGS);
+                    }
+                }
+            }
+            // Keep the accepted connection open briefly so the client reads
+            // the reply before it sees the close.
+            std::this_thread::sleep_for(hold);
+            close(accepted);
+        }
+    }
+
+    std::vector<std::vector<uint8_t>> replies;
+    std::chrono::milliseconds hold;
+    int listener = -1;
+    uint16_t port = 0;
+    std::thread worker;
+};
+
+// The default transport against real sockets: a closed port, a listener that
+// redirects, and one that accepts. The closed port has to fail at once — the
+// old BIO_do_connect_retry path retried a refused connect for the whole
+// timeout — and the redirect has to reach the second listener with the
+// redirect flag on the wire.
+static void TestLoopbackListenersFailoverAndRedirect() {
+    // A port that was bound and closed without listening: connect is refused.
+    int closed_socket = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(closed_socket >= 0);
+    sockaddr_in closed_address {};
+    closed_address.sin_family = AF_INET;
+    closed_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK(bind(closed_socket, reinterpret_cast<sockaddr *>(&closed_address), sizeof(closed_address)) == 0);
+    socklen_t closed_size = sizeof(closed_address);
+    CHECK(getsockname(closed_socket, reinterpret_cast<sockaddr *>(&closed_address), &closed_size) == 0);
+    const auto closed_port = ntohs(closed_address.sin_port);
+    close(closed_socket);
+
+    MockListener node({AcceptPacketBytes(false)});
+    const auto node_address = "(ADDRESS=(PROTOCOL=TCP)(HOST=127.0.0.1)(PORT=" + std::to_string(node.Port()) + "))";
+    MockListener scan({RedirectPacketBytes(node_address)});
+
+    ConnectionConfig config;
+    config.service_name = "svc";
+    config.connect_timeout_seconds = 10;
+    ConnectAddressList list;
+    list.addresses.push_back({"127.0.0.1", closed_port, TransportProtocol::TCP});
+    list.addresses.push_back({"127.0.0.1", scan.Port(), TransportProtocol::TCP});
+    config.routing.address_lists.push_back(list);
+
+    const auto started = std::chrono::steady_clock::now();
+    auto connection = TnsClientConnection::Connect(config);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    CHECK(connection && connection->State() == OracleConnectionState::TRANSPORT_CONNECTED);
+    // Well inside the ten-second per-attempt timeout.
+    CHECK(elapsed < std::chrono::seconds(5));
+    connection.reset();
+    CHECK(scan.received.size() == 1 && node.received.size() == 1);
+    CHECK(scan.received[0][5] == 0x00 && node.received[0][5] == TNS_PACKET_FLAG_REDIRECT);
+
+    // A closed port alone reports UNREACHABLE promptly.
+    ConnectionConfig closed_only;
+    closed_only.host = "127.0.0.1";
+    closed_only.port = closed_port;
+    closed_only.service_name = "svc";
+    const auto closed_started = std::chrono::steady_clock::now();
+    ExpectConnectFailure(ConnectFailure::UNREACHABLE, [&] { (void)TnsClientConnection::Connect(closed_only); });
+    CHECK(std::chrono::steady_clock::now() - closed_started < std::chrono::seconds(5));
+}
+
+// A listener that accepts the TCP connection and then never answers. With a
+// 30-second read timeout and a 1-second budget the connect ends in about one
+// second: the deadline reaches the socket wait itself.
+static void TestSilentListenerIsBoundedByTheBudget() {
+    MockListener silent({std::vector<uint8_t>()}, std::chrono::milliseconds(3000));
+    ConnectionConfig config;
+    config.host = "127.0.0.1";
+    config.port = silent.Port();
+    config.service_name = "svc";
+    config.read_timeout_seconds = 30;
+    config.routing.connect_budget_seconds = 1;
+    const auto started = std::chrono::steady_clock::now();
+    ExpectConnectFailure(ConnectFailure::BUDGET_EXHAUSTED, [&] { (void)TnsClientConnection::Connect(config); });
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    CHECK(elapsed >= std::chrono::milliseconds(900) && elapsed < std::chrono::milliseconds(2500));
+}
+
+// The same against a real socket and the whole native session: the server
+// accepts and then says nothing. With a 30-second read timeout and a 1-second
+// budget, NativeOracleSession::Connect ends in about a second, on the budget.
+static void TestSilentServerAfterAcceptIsBoundedByTheBudget() {
+    MockListener listener({AcceptPacketBytes(false)}, std::chrono::milliseconds(3000));
+    ConnectionConfig config;
+    config.host = "127.0.0.1";
+    config.port = listener.Port();
+    config.service_name = "synthetic";
+    config.user = "placeholder";
+    config.read_timeout_seconds = 30;
+    config.routing.connect_budget_seconds = 1;
+    const auto started = std::chrono::steady_clock::now();
+    ExpectConnectFailure(ConnectFailure::BUDGET_EXHAUSTED,
+                         [&] { (void)NativeOracleSession::Connect(config, "placeholder"); });
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    CHECK(elapsed >= std::chrono::milliseconds(900) && elapsed < std::chrono::milliseconds(2500));
+}
+
+#endif // !_WIN32
 
 static void TestRepeatedRowsCarryNoValues() {
     OracleColumn label;
@@ -3815,6 +5446,39 @@ int main() {
     TestWriteToClosedPeerDoesNotKillTheProcess();
 #endif
     TestConnectRunsThroughTheTransportSeam();
+    TestRedirectDataSplitting();
+    TestRedirectPacketFraming();
+    TestRefusalCarriesTheOracleCode();
+    TestReconnectCarriesTheRedirectFlag();
+    TestDescriptorRoutingParameters();
+    TestRedirectAddressParsing();
+    TestConnectOrderPolicy();
+    TestRoutedConfigValidationAndDescriptors();
+    TestConnectFailsOverToTheNextAddress();
+    TestRefusalFailsOverAndKeepsTheCode();
+    TestEveryAddressUnreachableIsListed();
+    TestScanNameWithSeveralAddresses();
+    TestScanListenerRedirectsToANode();
+    TestRedirectWithoutReconnectDataIsRebuilt();
+    TestUnreachableRedirectTargetFallsBack();
+    TestRedirectCyclesAndLimits();
+    TestRedirectCannotChangeTheProtocol();
+    TestMalformedListenerAnswersAreNotFailedOver();
+    TestUnresolvableNameFailsOver();
+    TestRetriesDelaysAndTheBudget();
+    TestCancellationStopsTheConnect();
+    TestLoadBalanceShufflesEachConnection();
+    TestRedirectChainKeepsEachLevelsAlternatives();
+    TestBudgetHoldsThroughTheListenerExchange();
+    TestSlowNameResolutionIsCutOffByTheBudget();
+    TestResolverWorkersAreBounded();
+    TestBudgetHoldsUntilAuthentication();
+    TestRedirectTextStaysOutOfErrors();
+#if !defined(_WIN32)
+    TestLoopbackListenersFailoverAndRedirect();
+    TestSilentListenerIsBoundedByTheBudget();
+    TestSilentServerAfterAcceptIsBoundedByTheBudget();
+#endif
     TestTransportWithoutOutOfBandRefusesTheOobProbe();
     TestRepeatedRowsCarryNoValues();
     TestTtcErrorTailEndsTheResponse();

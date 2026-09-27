@@ -14,6 +14,10 @@ void ByteStream::SendUrgent(uint8_t value) {
     throw ProtocolError(ProtocolErrorKind::UNSUPPORTED, "this Oracle transport has no out-of-band channel");
 }
 
+void ByteStream::SetDeadline(std::optional<std::chrono::steady_clock::time_point> deadline) {
+    (void)deadline;
+}
+
 void ReadExact(ByteStream &stream, uint8_t *destination, size_t size) {
     size_t offset = 0;
     while (offset < size) {

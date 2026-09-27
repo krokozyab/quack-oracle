@@ -1,5 +1,6 @@
 #pragma once
 
+#include "oracle_scanner/protocol_error.hpp"
 #include "oracle_scanner/session.hpp"
 
 #include <cstddef>
@@ -11,6 +12,17 @@
 namespace oracle_scanner {
 
 class OracleSessionPool;
+
+// Every session the pool may hold is leased. A type of its own, not just
+// LIMIT_EXCEEDED, because a caller that falls back to an unpooled session on
+// this must not do so for a failed connect that happens to carry the same kind
+// — that would repeat the whole connect, retries and all.
+class OracleSessionPoolExhausted : public ProtocolError {
+public:
+    OracleSessionPoolExhausted()
+        : ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle session pool is exhausted") {
+    }
+};
 
 class OracleSessionLease {
 public:

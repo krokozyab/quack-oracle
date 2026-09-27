@@ -14,6 +14,7 @@ evidence itself.
 | DuckDB itself (submodule, pinned `v1.5.5`) | linked as a library; `duckdb_miniz` is compiled from its vendored copy for bounded in-memory wallet ZIP reading | MIT |
 | OpenSSL | linked, not vendored: TLS transport and the digest and cipher primitives O5LOGON needs | Apache-2.0 |
 | python-oracledb Thin | **reasoning and invariants, not code and not bytes.** It is the upstream of the protocol invariants recorded in comments throughout `src/`: which field, bit or length a client sends, and what breaks otherwise. | Apache-2.0 / UPL |
+| go-ora (`github.com/sijms/go-ora`, commit `360b4b7ac9e96cee3e443180f2d6412bcacee62a`) | **reasoning, not code and not bytes.** A second reading of the listener exchange for multi-address connects: where REDIRECT data sits (inline after a UB2 length, or in the next DATA packet), its NUL between address and reconnect data and the 0x02 flag that announces it, the 0x04 flag on a re-CONNECT, and `(ERR=...)` in a REFUSE. Checked against python-oracledb Thin at commit `4a6d3b393232f6c5d66a497b7d137aa427f289d8` (`connect.pyx`, `connection.pyx`, `connect_params.pyx`), which is also where the FAILOVER / LOAD_BALANCE selection rules come from. Where the two differ, the code says which it follows and why. | MIT |
 
 **No Oracle client software is used or distributed.** No OCI, Instant Client,
 ODPI-C, ODBC, JDBC, Python runtime, or helper process is linked, loaded, or
@@ -58,3 +59,11 @@ one that records what a server sent.
 Live test databases are external and are named here only by the environment
 variables that supply them; see [README.md](README.md). Nothing about an
 endpoint is recorded in this repository.
+
+## Synthetic fixtures
+
+The multi-address and redirect tests in `test/cpp/protocol_test.cpp` build
+their REDIRECT, REFUSE, ACCEPT and DATA packets in the test from the field
+layouts named above. They are not captures, carry no bytes from any server or
+client, and so are not inventoried with a hash; the tests say so where they
+are defined. None of them has been checked against a live RAC or SCAN listener.

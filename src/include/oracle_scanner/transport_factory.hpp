@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace oracle_scanner {
 
@@ -48,6 +49,39 @@ public:
 
 private:
     OracleTransportFactory previous;
+};
+
+// Name resolution, the other half of reaching a listener. It is a seam of its
+// own because the default transport cannot be trusted with a name that
+// resolves to several addresses: OpenSSL's connect BIO does move on after an
+// address that refuses at once, but an address that swallows the SYN holds it
+// until the whole timeout is gone, and BIO_do_connect_retry then starts the
+// list again from the top. A SCAN name with one dead IP would spend every
+// attempt on it. So the connect loop resolves the name itself and dials each
+// address as its own attempt, with its own timeout.
+//
+// The resolver returns numeric addresses in the order to try them. An IP
+// literal is never passed to it. With no resolver installed, a name goes to
+// the default resolver — unless a transport factory is installed, in which case
+// the name is handed to that transport unresolved: a scripted transport decides
+// for itself what a name means, and a test should not touch DNS by accident.
+using OracleHostResolver = std::function<std::vector<std::string>(const std::string &host, uint16_t port)>;
+
+// Resolves `host` for dialing. Throws OracleConnectError with
+// ConnectFailure::UNREACHABLE when the name does not resolve. Returns at most
+// MAX_RESOLVED_ADDRESSES addresses, duplicates removed, order kept.
+std::vector<std::string> ResolveOracleHost(const std::string &host, uint16_t port);
+
+class ScopedOracleHostResolver {
+public:
+    explicit ScopedOracleHostResolver(OracleHostResolver resolver);
+    ~ScopedOracleHostResolver();
+
+    ScopedOracleHostResolver(const ScopedOracleHostResolver &) = delete;
+    ScopedOracleHostResolver &operator=(const ScopedOracleHostResolver &) = delete;
+
+private:
+    OracleHostResolver previous;
 };
 
 } // namespace oracle_scanner

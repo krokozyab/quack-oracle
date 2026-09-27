@@ -35,8 +35,10 @@ namespace {
 // does not already have to be, and a caller reaching this key already holds the
 // connection whose credentials opened the session.
 std::string PoolKey(const std::string &secret_name, const ConnectionConfig &config) {
-    return secret_name + "\x1f" + config.host + "\x1f" + std::to_string(config.port) + "\x1f" + config.service_name +
-           "\x1f" + config.user + "\x1f" +
+    // The target key names every configured address, the service and the
+    // routing policy — never where one connect happened to land — so two
+    // sessions share a pool only when they would be opened the same way.
+    return secret_name + "\x1f" + oracle_scanner::ConnectionTargetKey(config) + "\x1f" + config.user + "\x1f" +
            (config.protocol == oracle_scanner::TransportProtocol::TCPS ? "tcps" : "tcp");
 }
 
@@ -111,10 +113,7 @@ OracleSessionHandle AcquireOracleReadSession(ClientContext &context, const std::
         try {
             handle.lease = pool.Acquire();
             return handle;
-        } catch (const oracle_scanner::ProtocolError &error) {
-            if (error.Kind() != oracle_scanner::ProtocolErrorKind::LIMIT_EXCEEDED) {
-                throw;
-            }
+        } catch (const oracle_scanner::OracleSessionPoolExhausted &) {
             // Every pooled session is busy. One query can hold several at once
             // — a join across two Oracle tables does — and failing it to keep a
             // bound would trade a real answer for a number in a setting.

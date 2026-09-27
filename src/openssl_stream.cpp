@@ -7,6 +7,7 @@
 #endif
 
 #include "oracle_scanner/byte_stream.hpp"
+#include "oracle_scanner/connect_error.hpp"
 #include "oracle_scanner/protocol_error.hpp"
 
 #include <openssl/bio.h>
@@ -15,10 +16,13 @@
 #include <openssl/ssl.h>
 
 #include <algorithm>
+#include <chrono>
 #include <ctime>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <sstream>
+#include <thread>
 #include <utility>
 
 #if defined(_WIN32)
@@ -101,6 +105,9 @@ struct OpenSslByteStream::Impl {
     int socket_fd = -1;
     bool use_tls = false;
     bool closed = false;
+    // Set by the connect loop while it talks to a listener; see
+    // ByteStream::SetDeadline.
+    std::optional<std::chrono::steady_clock::time_point> deadline;
 
     ~Impl() {
         if (bio) {
@@ -276,7 +283,24 @@ static bool IsIpAddress(const std::string &value) {
 #endif
 }
 
-static bool WaitForBio(BIO *bio, uint32_t timeout_seconds) {
+// The wait for one blocking step: the transport's own timeout, cut down to
+// whatever is left before `deadline` when there is one. An expired deadline is
+// no time at all.
+static timeval StepTimeout(uint32_t timeout_seconds,
+                           const std::optional<std::chrono::steady_clock::time_point> &deadline) {
+    auto wait = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::seconds(timeout_seconds));
+    if (deadline) {
+        const auto left =
+            std::chrono::duration_cast<std::chrono::microseconds>(*deadline - std::chrono::steady_clock::now());
+        wait = (std::max)(std::chrono::microseconds(0), (std::min)(wait, left));
+    }
+    const auto count = wait.count();
+    return {static_cast<decltype(timeval::tv_sec)>(count / 1000000),
+            static_cast<decltype(timeval::tv_usec)>(count % 1000000)};
+}
+
+static bool WaitForBio(BIO *bio, uint32_t timeout_seconds,
+                       const std::optional<std::chrono::steady_clock::time_point> &deadline) {
     int socket_fd = -1;
     if (BIO_get_fd(bio, &socket_fd) < 0 || socket_fd < 0) {
         return false;
@@ -296,9 +320,60 @@ static bool WaitForBio(BIO *bio, uint32_t timeout_seconds) {
     if (want_write) {
         FD_SET(socket_fd, &writable);
     }
-    timeval timeout {static_cast<time_t>(timeout_seconds), 0};
+    timeval timeout = StepTimeout(timeout_seconds, deadline);
     return select(socket_fd + 1, want_read ? &readable : nullptr, want_write ? &writable : nullptr, nullptr,
                   &timeout) > 0;
+}
+
+// Waits for the BIO's socket to become readable (or writable) until the
+// deadline. Before the socket exists — the connect BIO creates it on its first
+// step — there is nothing to wait on, so it naps briefly and lets the caller
+// step the BIO again.
+static bool WaitUntil(BIO *bio, bool for_read, std::chrono::steady_clock::time_point deadline) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+        return false;
+    }
+    int socket_fd = -1;
+    if (BIO_get_fd(bio, &socket_fd) < 0 || socket_fd < 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        return true;
+    }
+    const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - now).count();
+    fd_set ready;
+    FD_ZERO(&ready);
+    FD_SET(socket_fd, &ready);
+    timeval timeout {static_cast<decltype(timeval::tv_sec)>(remaining / 1000000),
+                     static_cast<decltype(timeval::tv_usec)>(remaining % 1000000)};
+    return select(socket_fd + 1, for_read ? &ready : nullptr, for_read ? nullptr : &ready, nullptr, &timeout) > 0;
+}
+
+std::vector<std::string> OpenSslResolveHost(const std::string &host, uint16_t port) {
+#ifdef __EMSCRIPTEN__
+    (void)host;
+    (void)port;
+    throw ProtocolError(ProtocolErrorKind::UNSUPPORTED,
+                        "the default Oracle resolver needs a socket library, which a WebAssembly build does not have");
+#else
+    BIO_ADDRINFO *resolved = nullptr;
+    const auto service = std::to_string(port);
+    if (BIO_lookup_ex(host.c_str(), service.c_str(), BIO_LOOKUP_CLIENT, AF_UNSPEC, SOCK_STREAM, IPPROTO_TCP,
+                      &resolved) != 1) {
+        ERR_clear_error();
+        throw OracleConnectError(ProtocolErrorKind::TRUNCATED, ConnectFailure::UNREACHABLE,
+                                 "Oracle host name '" + host + "' did not resolve");
+    }
+    std::vector<std::string> result;
+    for (const BIO_ADDRINFO *entry = resolved; entry; entry = BIO_ADDRINFO_next(entry)) {
+        char *text = BIO_ADDR_hostname_string(BIO_ADDRINFO_address(entry), 1);
+        if (text) {
+            result.emplace_back(text);
+            OPENSSL_free(text);
+        }
+    }
+    BIO_ADDRINFO_free(resolved);
+    return result;
+#endif
 }
 
 OpenSslByteStream::OpenSslByteStream(std::unique_ptr<Impl> implementation_p)
@@ -341,13 +416,40 @@ std::unique_ptr<OpenSslByteStream> OpenSslByteStream::Connect(const std::string 
     result->read_timeout_seconds = read_timeout_seconds;
     result->use_tls = use_tls;
     const auto endpoint = HostAndPort(host, port);
+    // One deadline for this attempt: the TCP connect and the TLS handshake
+    // share connect_timeout_seconds between them, as they always did.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(connect_timeout_seconds);
 
-    if (!use_tls) {
-        result->bio = BIO_new_connect(endpoint.c_str());
-        if (!result->bio) {
-            throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "OpenSSL could not allocate a TCP BIO");
+    // TCP first, on its own BIO, driven by hand rather than by
+    // BIO_do_connect_retry. That helper resets and retries a refused connect
+    // until the timeout, so a listener that is down — the most common thing a
+    // failover has to get past — cost the whole timeout instead of failing at
+    // once and letting the next address be tried.
+    result->bio = BIO_new_connect(endpoint.c_str());
+    if (!result->bio) {
+        throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "OpenSSL could not allocate a TCP BIO");
+    }
+    BIO_set_nbio(result->bio, 1);
+    // The handshake writes, so a peer that resets mid-negotiation would raise
+    // SIGPIPE here just as an ordinary write would.
+    const ScopedSigPipeBlock no_sigpipe;
+    while (true) {
+        if (BIO_do_connect(result->bio) > 0) {
+            break;
         }
-    } else {
+        if (!BIO_should_retry(result->bio)) {
+            const auto error_detail = DrainOpenSslErrors();
+            throw OracleConnectError(ProtocolErrorKind::TRUNCATED, ConnectFailure::UNREACHABLE,
+                                     "Oracle TCP connection to " + endpoint + " failed: " + error_detail);
+        }
+        if (!WaitUntil(result->bio, BIO_should_read(result->bio) != 0, deadline)) {
+            ERR_clear_error();
+            throw OracleConnectError(ProtocolErrorKind::TRUNCATED, ConnectFailure::UNREACHABLE,
+                                     "Oracle TCP connection to " + endpoint + " timed out");
+        }
+    }
+
+    if (use_tls) {
         result->context = SSL_CTX_new(TLS_client_method());
         if (!result->context) {
             throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "OpenSSL could not allocate a TLS context");
@@ -369,16 +471,21 @@ std::unique_ptr<OpenSslByteStream> OpenSslByteStream::Connect(const std::string 
         if (!tls.client_pem_contents.empty()) {
             LoadClientIdentityFromPem(result->context, tls.client_pem_contents, tls.client_pem_password);
         }
-        result->bio = BIO_new_ssl_connect(result->context);
-        if (!result->bio) {
+        BIO *ssl_bio = BIO_new_ssl(result->context, 1);
+        if (!ssl_bio) {
             throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "OpenSSL could not allocate a TLS BIO");
         }
-        RequireOpenSsl(BIO_set_conn_hostname(result->bio, endpoint.c_str()), "setting TLS endpoint");
+        // From here the chain owns the TCP BIO, and freeing its head frees
+        // both.
+        result->bio = BIO_push(ssl_bio, result->bio);
         SSL *ssl = nullptr;
         RequireOpenSsl(BIO_get_ssl(result->bio, &ssl), "retrieving TLS session");
         if (!ssl) {
             throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "OpenSSL returned no TLS session");
         }
+        // The connect loop dials a resolved address and passes the configured
+        // host name in `tls`, so the name checked is never the IP it happened
+        // to reach. A caller that passes neither gets the host it dialed.
         const auto &sni_name = tls.sni_name.empty() ? host : tls.sni_name;
         const auto &server_name = tls.server_name.empty() ? host : tls.server_name;
         if (!IsIpAddress(sni_name)) {
@@ -390,28 +497,39 @@ std::unique_ptr<OpenSslByteStream> OpenSslByteStream::Connect(const std::string 
         } else {
             RequireOpenSsl(SSL_set1_host(ssl, server_name.c_str()), "setting TLS hostname verification");
         }
-    }
-
-    BIO_set_nbio(result->bio, 1);
-    // The handshake writes, so a peer that resets mid-negotiation would raise
-    // SIGPIPE here just as an ordinary write would.
-    const ScopedSigPipeBlock no_sigpipe;
-    if (BIO_do_connect_retry(result->bio, static_cast<int>(connect_timeout_seconds), 100) != 1) {
-        const auto error_detail = DrainOpenSslErrors();
-        throw ProtocolError(ProtocolErrorKind::TRUNCATED,
-                            use_tls ? "Oracle TCP or TLS handshake failed or timed out: " + error_detail
-                                    : "Oracle TCP connection failed or timed out");
-    }
-    if (use_tls) {
-        SSL *ssl = nullptr;
-        RequireOpenSsl(BIO_get_ssl(result->bio, &ssl), "retrieving TLS session");
+        while (true) {
+            if (BIO_do_handshake(result->bio) > 0) {
+                break;
+            }
+            if (!BIO_should_retry(result->bio)) {
+                const auto verify_result = SSL_get_verify_result(ssl);
+                const auto error_detail = DrainOpenSslErrors();
+                if (verify_result != X509_V_OK) {
+                    // A certificate that does not verify is a fact about trust
+                    // and configuration, and it is reported as such so the
+                    // connect loop stops instead of trying the next address.
+                    throw OracleConnectError(ProtocolErrorKind::INVALID_STATE, ConnectFailure::TLS_VERIFICATION,
+                                             std::string("Oracle TLS certificate verification failed: ") +
+                                                 X509_verify_cert_error_string(verify_result));
+                }
+                throw OracleConnectError(ProtocolErrorKind::TRUNCATED, ConnectFailure::TLS_HANDSHAKE,
+                                         "Oracle TLS handshake with " + endpoint + " failed: " + error_detail);
+            }
+            if (!WaitUntil(result->bio, BIO_should_read(result->bio) != 0, deadline)) {
+                ERR_clear_error();
+                throw OracleConnectError(ProtocolErrorKind::TRUNCATED, ConnectFailure::TLS_HANDSHAKE,
+                                         "Oracle TLS handshake with " + endpoint + " timed out");
+            }
+        }
         if (SSL_get_verify_result(ssl) != X509_V_OK) {
-            throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "Oracle TLS certificate verification failed");
+            throw OracleConnectError(ProtocolErrorKind::INVALID_STATE, ConnectFailure::TLS_VERIFICATION,
+                                     "Oracle TLS certificate verification failed");
         }
         if (!tls.expected_server_dn.empty()) {
             CertificatePtr peer(SSL_get1_peer_certificate(ssl), X509_free);
             if (!peer) {
-                throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "Oracle TLS peer sent no certificate");
+                throw OracleConnectError(ProtocolErrorKind::INVALID_STATE, ConnectFailure::TLS_VERIFICATION,
+                                         "Oracle TLS peer sent no certificate");
             }
             const BioPtr rendered(BIO_new(BIO_s_mem()), BIO_free);
             if (!rendered ||
@@ -425,8 +543,8 @@ std::unique_ptr<OpenSslByteStream> OpenSslByteStream::Connect(const std::string 
             if (!OracleServerDnMatches(tls.expected_server_dn, subject)) {
                 // The DN is never reported back: it is the thing being checked,
                 // and echoing it turns a failed check into an oracle for it.
-                throw ProtocolError(ProtocolErrorKind::INVALID_STATE,
-                                    "Oracle TLS server certificate subject does not match the expected DN");
+                throw OracleConnectError(ProtocolErrorKind::INVALID_STATE, ConnectFailure::TLS_VERIFICATION,
+                                         "Oracle TLS server certificate subject does not match the expected DN");
             }
         }
     }
@@ -516,7 +634,8 @@ size_t OpenSslByteStream::Read(uint8_t *destination, size_t maximum_size) {
         if (count == 0 && BIO_eof(implementation->bio)) {
             return 0;
         }
-        if (!BIO_should_retry(implementation->bio) || !WaitForBio(implementation->bio, implementation->read_timeout_seconds)) {
+        if (!BIO_should_retry(implementation->bio) ||
+            !WaitForBio(implementation->bio, implementation->read_timeout_seconds, implementation->deadline)) {
             ERR_clear_error();
             throw ProtocolError(ProtocolErrorKind::TRUNCATED, "Oracle TCP read failed or timed out");
         }
@@ -534,7 +653,8 @@ size_t OpenSslByteStream::Write(const uint8_t *source, size_t size) {
         if (count > 0) {
             return static_cast<size_t>(count);
         }
-        if (!BIO_should_retry(implementation->bio) || !WaitForBio(implementation->bio, implementation->read_timeout_seconds)) {
+        if (!BIO_should_retry(implementation->bio) ||
+            !WaitForBio(implementation->bio, implementation->read_timeout_seconds, implementation->deadline)) {
             ERR_clear_error();
             throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "Oracle TCP write failed or timed out");
         }
@@ -564,7 +684,7 @@ void OpenSslByteStream::SendUrgent(uint8_t value) {
             fd_set writable;
             FD_ZERO(&writable);
             FD_SET(implementation->socket_fd, &writable);
-            timeval timeout {static_cast<time_t>(implementation->read_timeout_seconds), 0};
+            timeval timeout = StepTimeout(implementation->read_timeout_seconds, implementation->deadline);
             if (select(implementation->socket_fd + 1, nullptr, &writable, nullptr, &timeout) > 0) {
                 continue;
             }
@@ -572,6 +692,12 @@ void OpenSslByteStream::SendUrgent(uint8_t value) {
         throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "Oracle TCP urgent-byte send failed");
     }
 #endif
+}
+
+void OpenSslByteStream::SetDeadline(std::optional<std::chrono::steady_clock::time_point> deadline) {
+    if (implementation) {
+        implementation->deadline = deadline;
+    }
 }
 
 void OpenSslByteStream::Close() {

@@ -1574,6 +1574,108 @@ void TestParallelScanShardsOneSnapshot() {
     std::cout << "parallel scans shard one snapshot" << std::endl;
 }
 
+// CONNECT_DESCRIPTOR: a full descriptor in the secret, with no wallet needed.
+// What the adapter hands the session is checked field by field — the address
+// lists, the routing policy, the timeouts — since that is everything the
+// connect loop plans from. The endpoints are placeholders; nothing connects.
+void TestConnectDescriptorSecretReachesTheSession() {
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {Column("label", 1)};
+    script->rows = {{Text("only")}};
+    auto configs = std::make_shared<std::vector<ConnectionConfig>>();
+    oracle_scanner::ScopedOracleSessionFactory factory([script, configs](const ConnectionConfig &config,
+                                                                         const std::string &) {
+        configs->push_back(config);
+        return std::unique_ptr<OracleSession>(new FakeSession(script));
+    });
+    TestDatabase database;
+    database.Run("CREATE SECRET rac (TYPE oracle, USER 'app_user', PASSWORD 'placeholder', CONNECT_DESCRIPTOR "
+                 "'(DESCRIPTION=(CONNECT_TIMEOUT=90)(RETRY_COUNT=20)(RETRY_DELAY=3)(TRANSPORT_CONNECT_TIMEOUT=3)"
+                 "(ADDRESS_LIST=(LOAD_BALANCE=on)(ADDRESS=(PROTOCOL=TCP)(HOST=scan.example)(PORT=1521)))"
+                 "(ADDRESS_LIST=(ADDRESS=(PROTOCOL=TCP)(HOST=standby.example)(PORT=1522)))"
+                 "(CONNECT_DATA=(SERVICE_NAME=sales.example)(INSTANCE_NAME=sales1)))');");
+    CHECK(!database.Query("SELECT * FROM oracle_query('rac', 'SELECT label FROM app.items')")->HasError());
+    CHECK(configs->size() == 1);
+    const auto &config = configs->front();
+    CHECK(config.host.empty() && config.service_name == "sales.example" && config.instance_name == "sales1");
+    CHECK(config.routing.address_lists.size() == 2);
+    CHECK(config.routing.address_lists[0].load_balance && !config.routing.address_lists[1].load_balance);
+    CHECK(config.routing.address_lists[1].addresses[0].host == "standby.example" &&
+          config.routing.address_lists[1].addresses[0].port == 1522);
+    CHECK(config.routing.retry_count == 20 && config.routing.retry_delay_seconds == 3 &&
+          config.routing.connect_budget_seconds == 90 && config.connect_timeout_seconds == 3);
+    CHECK(config.protocol == oracle_scanner::TransportProtocol::TCP);
+    // The query's interrupt flag is wired in, and it is clear.
+    CHECK(config.connect_cancelled && !config.connect_cancelled());
+
+    // Conflicts are refused at bind, before any session is asked for.
+    const auto refused = [&](const std::string &secret_options, const std::string &expected) {
+        database.Run("CREATE OR REPLACE SECRET bad (TYPE oracle, USER 'app_user', PASSWORD 'placeholder', " +
+                     secret_options + ");");
+        const auto before = configs->size();
+        auto result = database.Query("SELECT * FROM oracle_query('bad', 'SELECT label FROM app.items')");
+        CHECK(result->HasError());
+        if (result->GetError().find(expected) == std::string::npos) {
+            std::cerr << "unexpected error: " << result->GetError() << "\n";
+            CHECK(false && "wrong error for a refused secret");
+        }
+        CHECK(configs->size() == before);
+    };
+    const std::string plain = "'(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=a.example)(PORT=1521))"
+                              "(CONNECT_DATA=(SERVICE_NAME=svc)))'";
+    refused("HOST 'a.example', CONNECT_DESCRIPTOR " + plain,
+            "CONNECT_DESCRIPTOR cannot be combined with HOST, PORT, or SERVICE_NAME");
+    refused("TNS_ALIAS 'x', CONNECT_DESCRIPTOR " + plain, "TNS_ALIAS and CONNECT_DESCRIPTOR cannot be combined");
+    refused("PROTOCOL 'tcps', CONNECT_DESCRIPTOR " + plain, "CONNECT_DESCRIPTOR protocol does not match PROTOCOL 'tcps'");
+    refused("TLS_SERVER_NAME 'a.example', CONNECT_DESCRIPTOR " + plain, "require PROTOCOL 'tcps'");
+    refused("CONNECT_TIMEOUT 5, CONNECT_DESCRIPTOR '(DESCRIPTION=(TRANSPORT_CONNECT_TIMEOUT=3)"
+            "(ADDRESS=(HOST=a.example)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=svc)))'",
+            "CONNECT_TIMEOUT disagrees with the CONNECT_DESCRIPTOR TRANSPORT_CONNECT_TIMEOUT");
+    refused("CONNECT_DESCRIPTOR '(DESCRIPTION_LIST=(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))"
+            "(CONNECT_DATA=(SERVICE_NAME=svc))))'",
+            "DESCRIPTION_LIST is not supported");
+    refused("CONNECT_DESCRIPTOR '(DESCRIPTION=(ADDRESS=(HOST=a)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=svc)"
+            "(FAILOVER_MODE=(TYPE=select))))'",
+            "FAILOVER_MODE (TAF) is not supported");
+
+    // A TCPS descriptor takes TLS settings, and a wallet is not required.
+    database.Run("CREATE SECRET secure (TYPE oracle, USER 'app_user', PASSWORD 'placeholder', "
+                 "TLS_SERVER_NAME 'cert.example', CONNECT_DESCRIPTOR '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)"
+                 "(HOST=a.example)(PORT=2484))(ADDRESS=(PROTOCOL=TCPS)(HOST=b.example)(PORT=2484))"
+                 "(CONNECT_DATA=(SERVICE_NAME=svc)))');");
+    CHECK(!database.Query("SELECT * FROM oracle_query('secure', 'SELECT label FROM app.items')")->HasError());
+    CHECK(configs->back().protocol == oracle_scanner::TransportProtocol::TCPS);
+    CHECK(configs->back().tls_server_name == "cert.example" && configs->back().wallet_pem_file.empty());
+
+    // The HOST/PORT/SERVICE_NAME form is untouched: one address, no routing.
+    CHECK(!database.Query("SELECT * FROM oracle_query('ora', 'SELECT label FROM app.items')")->HasError());
+    CHECK(configs->back().host == "127.0.0.1" && configs->back().routing.address_lists.empty());
+
+    std::cout << "connect descriptor secrets reach the session" << std::endl;
+}
+
+// Failover is for new connections only. A statement whose session fails after
+// its SQL went out is not sent again — not on the same session, and not on a
+// new one — and the next statement starts on a fresh session.
+void TestFailedStatementIsNotReplayed() {
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {Column("label", 1)};
+    script->rows = {{Text("only")}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    script->fetch_failure = oracle_scanner::ProtocolErrorKind::TRUNCATED;
+    script->fetch_failure_message = "connection closed mid-row";
+    auto result = database.Query("SELECT * FROM oracle_query('ora', 'SELECT label FROM app.items')");
+    CHECK(result->HasError());
+    CHECK(result->GetError().find("connection closed mid-row") != std::string::npos);
+    CHECK(script->queries.size() == 1 && script->sessions_opened == 1);
+
+    script->fetch_failure.reset();
+    CHECK(!database.Query("SELECT * FROM oracle_query('ora', 'SELECT label FROM app.items')")->HasError());
+    CHECK(script->queries.size() == 2 && script->sessions_opened == 2);
+    std::cout << "failed statements are not replayed" << std::endl;
+}
+
 int main() {
 
     TestQueryTypeMappingAndValues();
@@ -1599,6 +1701,8 @@ int main() {
     TestCallableSignatureResolution();
     TestAutomaticCallBindsFromTheSignature();
     TestFunctionsCanReturnARefCursor();
+    TestConnectDescriptorSecretReachesTheSession();
+    TestFailedStatementIsNotReplayed();
     std::cout << "oracle_scanner adapter tests passed\n";
     return 0;
 }

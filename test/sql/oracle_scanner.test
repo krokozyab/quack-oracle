@@ -126,6 +126,93 @@ SELECT * FROM oracle_query('oracle_tns_alias', 'DELETE FROM app.t');
 ----
 Binder Error: Oracle TNS_ALIAS cannot be combined with HOST, PORT, or SERVICE_NAME
 
+# CONNECT_DESCRIPTOR carries a full descriptor inline: several addresses, a
+# SCAN name, FAILOVER/LOAD_BALANCE/RETRY_*. No wallet is required for it.
+statement ok
+CREATE TEMPORARY SECRET oracle_rac (
+    TYPE oracle,
+    USER 'scott',
+    PASSWORD 'tiger',
+    CONNECT_DESCRIPTOR '(DESCRIPTION=(RETRY_COUNT=3)(RETRY_DELAY=1)(ADDRESS_LIST=(LOAD_BALANCE=on)(ADDRESS=(PROTOCOL=TCP)(HOST=scan.example)(PORT=1521)))(CONNECT_DATA=(SERVICE_NAME=sales.example)))'
+);
+
+query I
+SELECT count(*) FROM duckdb_secrets() WHERE name = 'oracle_rac' AND type = 'oracle';
+----
+1
+
+# It is one source of addresses, and HOST/PORT/SERVICE_NAME are another.
+statement ok
+CREATE TEMPORARY SECRET oracle_descriptor_and_host (
+    TYPE oracle,
+    HOST 'localhost',
+    USER 'scott',
+    PASSWORD 'tiger',
+    CONNECT_DESCRIPTOR '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=db.example)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=svc)))'
+);
+
+statement error
+SELECT * FROM oracle_query('oracle_descriptor_and_host', 'SELECT 1 FROM dual');
+----
+Binder Error: Oracle CONNECT_DESCRIPTOR cannot be combined with HOST, PORT, or SERVICE_NAME
+
+statement ok
+CREATE TEMPORARY SECRET oracle_descriptor_and_alias (
+    TYPE oracle,
+    USER 'scott',
+    PASSWORD 'tiger',
+    TNS_ALIAS 'mydb_high',
+    CONNECT_DESCRIPTOR '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=db.example)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=svc)))'
+);
+
+statement error
+SELECT * FROM oracle_query('oracle_descriptor_and_alias', 'SELECT 1 FROM dual');
+----
+Binder Error: Oracle TNS_ALIAS and CONNECT_DESCRIPTOR cannot be combined
+
+# PROTOCOL beside a descriptor has to hold for every address in it.
+statement ok
+CREATE TEMPORARY SECRET oracle_descriptor_protocol (
+    TYPE oracle,
+    USER 'scott',
+    PASSWORD 'tiger',
+    PROTOCOL 'tcps',
+    CONNECT_DESCRIPTOR '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=a.example)(PORT=2484))(ADDRESS=(PROTOCOL=TCP)(HOST=b.example)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=svc)))'
+);
+
+statement error
+SELECT * FROM oracle_query('oracle_descriptor_protocol', 'SELECT 1 FROM dual');
+----
+Binder Error: Oracle CONNECT_DESCRIPTOR protocol does not match PROTOCOL 'tcps'
+
+# What would silently change meaning is refused by name: TAF, and
+# DESCRIPTION_LIST.
+statement ok
+CREATE TEMPORARY SECRET oracle_descriptor_taf (
+    TYPE oracle,
+    USER 'scott',
+    PASSWORD 'tiger',
+    CONNECT_DESCRIPTOR '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=db.example)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=svc)(FAILOVER_MODE=(TYPE=select)(METHOD=basic))))'
+);
+
+statement error
+SELECT * FROM oracle_query('oracle_descriptor_taf', 'SELECT 1 FROM dual');
+----
+FAILOVER_MODE (TAF) is not supported
+
+statement ok
+CREATE TEMPORARY SECRET oracle_descriptor_list (
+    TYPE oracle,
+    USER 'scott',
+    PASSWORD 'tiger',
+    CONNECT_DESCRIPTOR '(DESCRIPTION_LIST=(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=db.example)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=svc))))'
+);
+
+statement error
+SELECT * FROM oracle_query('oracle_descriptor_list', 'SELECT 1 FROM dual');
+----
+DESCRIPTION_LIST is not supported
+
 # Isolated Oracle DML owns and commits its native session, so it cannot be
 # presented as part of a DuckDB transaction.
 statement ok

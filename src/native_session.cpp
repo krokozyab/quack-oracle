@@ -190,8 +190,10 @@ std::unique_ptr<NativeOracleSession> NativeOracleSession::Connect(const Connecti
     }
     TlsConfiguration tls;
     if (config.protocol == TransportProtocol::TCPS) {
+        // The names checked and sent are settled per attempt by the connect
+        // loop, from these or from the address being dialed.
         tls.server_name = config.tls_server_name;
-        tls.sni_name = config.tls_sni_name.empty() ? config.host : config.tls_sni_name;
+        tls.sni_name = config.tls_sni_name;
         if (!config.tls_ca_file.empty()) {
             tls.ca_pem_contents = ReadPemFile(config.tls_ca_file);
         }

@@ -9,6 +9,7 @@
 #include "oracle_scanner/ttc_o5logon.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 
 namespace oracle_scanner {
@@ -40,11 +41,25 @@ public:
     // only the TTC decoder can tell where a response ends.
     bool EndOfResponseNegotiated() const;
     OracleConnectionState State() const;
+    // The connect data the accepted CONNECT carried, and what O5LOGON will send
+    // as AUTH_CONNECT_STRING. After a redirect the first is the listener's
+    // reconnect data or the rebuilt descriptor; the second always names the
+    // configured address and service.
+    const std::string &ConnectDescriptor() const {
+        return connect_descriptor;
+    }
+    const std::string &AuthConnectString() const {
+        return auth_connect_string;
+    }
     TtcProtocolInfo Negotiate(const TtcNegotiationOptions &options = {});
     O5LogonResponse AuthenticateO5Logon(const std::string &username, const std::string &password,
                                         uint32_t auth_mode = 1,
                                         const std::vector<TtcParameter> &phase_one_parameters = {});
     void Close();
+    // Lifts the connect budget and cancellation, which otherwise keep bounding
+    // every read and write until O5LOGON completes. AuthenticateO5Logon calls it
+    // on success; a caller that stops short of authentication may call it too.
+    void EndEstablishment();
 
 private:
     TnsClientConnection(std::unique_ptr<ByteStream> stream, uint16_t negotiated_sdu, std::string connect_descriptor,
@@ -61,6 +76,7 @@ private:
     std::string connect_descriptor;
     std::string auth_connect_string;
     OracleClientIdentity client_identity;
+    std::function<void()> end_establishment;
     OracleConnectionState state = OracleConnectionState::TRANSPORT_CONNECTED;
 };
 

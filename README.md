@@ -171,6 +171,11 @@ The wallet ZIP needs no password: its `cwallet.sso` is an auto-login store, the
 same one SQL\*Plus and JDBC open. Add `WALLET_PASSWORD` only for a bare
 `ewallet.pem` whose key is encrypted.
 
+The wallet's own descriptor usually carries `(retry_count=20)(retry_delay=3)`.
+Those are honoured: a database that is asleep or briefly unreachable is
+retried, within the 60-second connect budget described under
+[RAC, SCAN, and several addresses](#rac-scan-and-several-addresses).
+
 ### Encrypted connection without a wallet
 
 ```sql
@@ -181,6 +186,111 @@ CREATE SECRET ora_tls (
 );
 ```
 
+### RAC, SCAN, and several addresses
+
+> **Not yet verified against a live RAC.** Everything in this section is
+> covered by offline tests — a scripted listener and transport, plus loopback
+> sockets — built from the packet layouts other thin clients use. No real SCAN
+> listener or RAC node has answered it yet. Treat it as untested in production
+> until you have tried it on yours, and please report what you see.
+
+Give the whole descriptor inline with `CONNECT_DESCRIPTOR`. No wallet is
+needed for it (a `TNS_ALIAS` from a wallet can now name several addresses too):
+
+```sql
+-- A SCAN name: every IP it resolves to is tried in turn, and the SCAN
+-- listener's redirect to a node listener is followed.
+CREATE SECRET ora_rac (
+    TYPE oracle, USER 'scott', PASSWORD 'tiger',
+    CONNECT_DESCRIPTOR '(DESCRIPTION=
+        (CONNECT_TIMEOUT=90)(RETRY_COUNT=3)(RETRY_DELAY=3)(TRANSPORT_CONNECT_TIMEOUT=3)
+        (ADDRESS=(PROTOCOL=TCP)(HOST=sales-scan.example.com)(PORT=1521))
+        (CONNECT_DATA=(SERVICE_NAME=sales.example.com)))'
+);
+
+-- Several listeners, spread across new connections, with a standby list
+-- tried only when the first list has nothing left.
+CREATE SECRET ora_multi (
+    TYPE oracle, USER 'scott', PASSWORD 'tiger',
+    CONNECT_DESCRIPTOR '(DESCRIPTION=
+        (ADDRESS_LIST=(LOAD_BALANCE=on)
+            (ADDRESS=(PROTOCOL=TCP)(HOST=node1.example.com)(PORT=1521))
+            (ADDRESS=(PROTOCOL=TCP)(HOST=node2.example.com)(PORT=1521)))
+        (ADDRESS_LIST=
+            (ADDRESS=(PROTOCOL=TCP)(HOST=standby.example.com)(PORT=1521)))
+        (CONNECT_DATA=(SERVICE_NAME=sales.example.com)))'
+);
+```
+
+What each setting does here, with its default:
+
+| Descriptor setting | Meaning in this client | Default |
+| --- | --- | --- |
+| `ADDRESS`, `ADDRESS_LIST` | Where to connect. A DESCRIPTION's own `ADDRESS` entries form one list; up to 16 addresses in all. `PROTOCOL` defaults to TCP, `PORT` to 1521 | — |
+| `FAILOVER` | On: every address is tried in turn. Off: only one address is tried | on |
+| `LOAD_BALANCE` | On: the order is shuffled for every new physical connection (with `FAILOVER=off`: one address picked at random). Off: the written order | off |
+| `RETRY_COUNT` | Extra passes over the whole address order after a pass fails (at most 100) | 0 |
+| `RETRY_DELAY` | Seconds to wait before each extra pass | 1 |
+| `TRANSPORT_CONNECT_TIMEOUT` | Per attempt: TCP connect plus TLS handshake to one resolved address. The same as the secret's `CONNECT_TIMEOUT`, which it must agree with if both are set | 10 |
+| `CONNECT_TIMEOUT` | **The overall budget** for one physical connection: every attempt, redirect and retry delay together. Oracle reads it per attempt; here it bounds the whole connect, so a long `RETRY_COUNT` cannot run on for minutes | 60, or `TRANSPORT_CONNECT_TIMEOUT` if larger |
+| `INSTANCE_NAME`, `SERVER` in `CONNECT_DATA` | Passed on to the listener. `SERVER` is `DEDICATED` or `SHARED` | — |
+| `SECURITY` | `SSL_SERVER_CERT_DN` is honoured as before | — |
+
+The budget is an absolute deadline for everything up to a usable connection:
+name resolution, each TCP connect and TLS handshake, every read and write of the
+listener exchange (however slowly the bytes arrive), the redirects, the retry
+delays, and then protocol negotiation and authentication with the server that
+accepted. A connect that is not authenticated by the time it runs out is
+closed, not returned; once authenticated, the session is bounded by
+`READ_TIMEOUT` only.
+The one wait that can overrun it is a TCP connect or TLS handshake already in
+progress, by less than a second, because that timeout is set in whole seconds.
+Name lookups run on a small fixed pool (4 workers, 16 queued), so a DNS server
+that hangs costs at most those threads however many connects give up on it.
+
+How a connect proceeds: the addresses are ordered by `FAILOVER` and
+`LOAD_BALANCE`; each host name is resolved and **every IP it resolves to is a
+separate attempt** with its own timeout, so one dead SCAN IP costs one attempt,
+not the whole connect. An attempt that fails for a reason another listener
+might not share — refused TCP connect, timeout, a dropped connection, a
+listener `REFUSE` (its `ORA-` code is kept), a TLS handshake that broke off — moves on to
+the next IP, then the next address, then the next pass. A listener `REDIRECT`
+(the SCAN listener handing the connection to a node listener) is followed, up
+to 3 hops, with loops refused; if the node it names is unreachable, the other
+nodes that listener named, then the remaining SCAN IPs and addresses, are still
+tried. When everything fails, the
+error names every attempt and what happened to it — addresses and outcomes only,
+never credentials or connect data.
+
+These stop the connect at once instead of trying elsewhere: a certificate that
+does not verify, a listener answer that does not parse, a redirect that would
+change the protocol (a TCPS connection is never sent to TCP), and cancellation
+(Ctrl+C / interrupt, checked before every attempt, during name resolution and
+retry delays, and on every read and write until authentication completes; a
+TCP connect or TLS handshake in progress finishes or times out first).
+
+With TCPS, every hop — redirect targets included — is verified against
+`TLS_SERVER_NAME` if you set it, otherwise against the host name you
+configured for that address (the SCAN name, not an IP it resolved to, and not
+a host a listener named). `TLS_SERVER_CERT_DN` applies to every hop.
+
+**What this is not: failover of a running session.** There is no Transparent
+Application Failover, Application Continuity, FAN/ONS, and no automatic retry of
+SQL or transaction recovery. If an established session is lost, the statement
+running on it fails with an error and nothing is re-sent; the next statement
+opens a new connection, which may land on another address. Descriptor settings
+that would promise otherwise are refused by name rather than ignored:
+`FAILOVER_MODE` (TAF), `DESCRIPTION_LIST`, `SOURCE_ROUTE=ON`, `SID`,
+`SERVER=POOLED`, `HTTPS_PROXY`, and any other key this client does not know.
+`ENABLE`, `EXPIRE_TIME`, `SDU`, `TDU`, `SEND_BUF_SIZE`, `RECV_BUF_SIZE`,
+`TYPE_OF_SERVICE` and `USE_SNI` are accepted and ignored.
+
+**Still to be checked on a real RAC:** a SCAN listener's redirect to a node
+listener (plain and TCPS); a node down while its SCAN listener still redirects
+to it; `ORA-12514` / `ORA-12516` / `ORA-12520` refusals during service
+relocation with `RETRY_COUNT`; `INSTANCE_NAME` pinning; a service running on a
+subset of instances; TCPS with per-node certificates.
+
 ### All the fields
 
 | Field | What it is |
@@ -189,13 +299,14 @@ CREATE SECRET ora_tls (
 | `USER`, `PASSWORD` | Your Oracle credentials |
 | `PROTOCOL` | `tcp` (the default) or `tcps` for TLS |
 | `TNS_ALIAS` | An alias from the `tnsnames.ora` inside the wallet ZIP — use *instead of* HOST/PORT/SERVICE_NAME |
+| `CONNECT_DESCRIPTOR` | A full `(DESCRIPTION=...)` given inline — use *instead of* HOST/PORT/SERVICE_NAME and TNS_ALIAS. See [RAC, SCAN, and several addresses](#rac-scan-and-several-addresses) |
 | `WALLET_FILE` | A cloud wallet ZIP, an `ewallet.pem` bundle, or an auto-login `cwallet.sso` |
 | `WALLET_PASSWORD` | The password the wallet's encrypted `ewallet.pem` is locked with. Not needed when the wallet carries `cwallet.sso` — every wallet OCI hands out does |
 | `TLS_SERVER_NAME` | The name checked against the server certificate |
 | `TLS_SNI_NAME` | Only when the endpoint is an IP or a different virtual host |
 | `TLS_CA_FILE` | An explicit PEM trust list; system roots are then not used |
 | `TLS_SERVER_CERT_DN` | Require this exact certificate subject, in addition to the hostname |
-| `CONNECT_TIMEOUT`, `READ_TIMEOUT` | Socket timeouts in seconds |
+| `CONNECT_TIMEOUT`, `READ_TIMEOUT` | Socket timeouts in seconds. `CONNECT_TIMEOUT` is per attempt (TCP connect plus TLS handshake, default 10); the whole connect is bounded separately (see the RAC section) |
 
 **The database's character set does not matter.** There is nothing to configure
 and nothing to convert on your side: the client asks Oracle for AL32UTF8 and the

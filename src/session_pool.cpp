@@ -89,7 +89,7 @@ OracleSessionLease OracleSessionPool::Acquire() {
             idle.pop_back();
         } else {
             if (live_sessions == maximum_sessions) {
-                throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle session pool is exhausted");
+                throw OracleSessionPoolExhausted();
             }
             live_sessions++;
         }

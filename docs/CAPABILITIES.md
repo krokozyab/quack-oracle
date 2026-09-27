@@ -107,11 +107,12 @@ CREATE SECRET ora (
 | --- | --- |
 | `HOST`, `PORT`, `SERVICE_NAME` | The endpoint, given directly |
 | `TNS_ALIAS` | An alias resolved from `tnsnames.ora` **inside the wallet ZIP** |
+| `CONNECT_DESCRIPTOR` | A full `(DESCRIPTION=...)` inline; no wallet needed |
 | `USER`, `PASSWORD` | Credentials |
 | `PROTOCOL` | `tcp` (default) or `tcps` |
 | `WALLET_FILE`, `WALLET_PASSWORD` | A cloud wallet ZIP, read in memory only |
 | `TLS_CA_FILE`, `TLS_SERVER_NAME`, `TLS_SNI_NAME`, `TLS_SERVER_CERT_DN` | TLS material and the identity to check |
-| `CONNECT_TIMEOUT`, `READ_TIMEOUT` | Socket timeouts |
+| `CONNECT_TIMEOUT`, `READ_TIMEOUT` | Socket timeouts; `CONNECT_TIMEOUT` is per attempt |
 
 **Works**
 
@@ -120,12 +121,32 @@ CREATE SECRET ora (
 - Server DN matching (`TLS_SERVER_CERT_DN`), compared attribute by attribute so
   the RDN order OpenSSL prints and the order `tnsnames.ora` uses both match.
 - The wallet ZIP is parsed in memory. Nothing is ever extracted to disk.
+- **Several addresses, SCAN, and listener redirects — offline-tested only.**
+  A descriptor (`CONNECT_DESCRIPTOR`, or a `TNS_ALIAS`) may name up to 16
+  addresses in `ADDRESS` / `ADDRESS_LIST` entries. `FAILOVER`, `LOAD_BALANCE`
+  (shuffled per new physical connection), `RETRY_COUNT`, `RETRY_DELAY`,
+  `TRANSPORT_CONNECT_TIMEOUT` (per attempt) and `CONNECT_TIMEOUT` (read here as
+  the budget for the whole connect) are honoured. Every IP a host name resolves
+  to is its own attempt. A listener REDIRECT is followed — inline or in a DATA
+  continuation, with or without reconnect data, re-CONNECT flagged 0x04 — for
+  up to 3 hops, with loops refused and the rest of the configured addresses
+  kept if the redirect target is down. A REFUSE's `ORA-` code is kept in the
+  error. **None of this has run against a live RAC or SCAN listener yet**; it
+  is covered by a scripted listener and transport and by loopback sockets.
 
 **Refused, by design**
 
-- `TNS_ALIAS` together with `HOST`/`PORT`/`SERVICE_NAME` — one or the other.
-- `TNS_ALIAS` without `WALLET_FILE`; an alias resolving to more than one
-  `ADDRESS`; an alias whose protocol disagrees with `PROTOCOL`.
+- `TNS_ALIAS`, `CONNECT_DESCRIPTOR` and `HOST`/`PORT`/`SERVICE_NAME` — exactly
+  one of the three.
+- `TNS_ALIAS` without `WALLET_FILE`; a descriptor with an address whose
+  protocol disagrees with `PROTOCOL`; a `TRANSPORT_CONNECT_TIMEOUT` that
+  disagrees with the secret's `CONNECT_TIMEOUT`.
+- Descriptor settings whose meaning this client would silently drop:
+  `DESCRIPTION_LIST`, `FAILOVER_MODE` (TAF), `SOURCE_ROUTE=ON`, `SID`,
+  `SERVER=POOLED`, `HTTPS_PROXY`, a millisecond timeout, and any key it does
+  not know. (`ENABLE`, `EXPIRE_TIME`, `SDU`, `TDU`, `SEND_BUF_SIZE`,
+  `RECV_BUF_SIZE`, `TYPE_OF_SERVICE`, `USE_SNI` are accepted and ignored.)
+- A listener redirect that changes the protocol — TCPS is never sent to TCP.
 - Any `TLS_*` or `WALLET_*` field with `PROTOCOL 'tcp'`.
 - Any `PROTOCOL` other than `tcp` or `tcps`.
 
@@ -133,8 +154,9 @@ CREATE SECRET ora (
 setting to turn it off, deliberately.
 
 **Not supported:** the 11g SHA-1 verifier, Native Network Encryption (ANO),
-`ewallet.p12`/`cwallet.sso` outside a cloud wallet ZIP, SEPS, IAM tokens, RAC
-failover, Application Continuity, and proxy authentication.
+`ewallet.p12`/`cwallet.sso` outside a cloud wallet ZIP, SEPS, IAM tokens, failover of an established session (TAF), Application
+Continuity, FAN/ONS, automatic retry of SQL, and proxy authentication. A lost
+session fails the statement running on it; only new connections fail over.
 
 ---
 

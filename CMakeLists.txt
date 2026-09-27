@@ -94,6 +94,7 @@ set(EXTENSION_SOURCES
     src/validating_session.cpp
     src/session_factory.cpp
     src/transport_factory.cpp
+    src/connect_plan.cpp
     src/statement_registry.cpp
     src/call_registry.cpp
     src/transaction.cpp
@@ -171,6 +172,7 @@ if(ORACLE_SCANNER_BUILD_TESTS)
                  src/validating_session.cpp
                  src/session_factory.cpp
     src/transport_factory.cpp
+    src/connect_plan.cpp
                  src/statement_registry.cpp
                  src/call_registry.cpp
                  src/transaction.cpp

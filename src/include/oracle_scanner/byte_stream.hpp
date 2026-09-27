@@ -2,10 +2,13 @@
 
 #include "oracle_scanner/tns_packet.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace oracle_scanner {
 
@@ -22,6 +25,15 @@ public:
     // transport with no out-of-band channel — TLS, and anything tunnelled —
     // has to be able to say so by kind rather than by type.
     virtual void SendUrgent(uint8_t value);
+
+    // Bounds every blocking wait in Read, Write and SendUrgent by an absolute
+    // deadline, on top of the transport's own timeout; std::nullopt removes
+    // it. The connect loop sets one while it talks to a listener, so that the
+    // overall connect budget holds however slowly bytes arrive, and clears it
+    // before the session takes the stream over. A transport that cannot bound
+    // its waits may ignore it: the connect loop also checks the deadline around
+    // every call, which bounds the damage to one wait.
+    virtual void SetDeadline(std::optional<std::chrono::steady_clock::time_point> deadline);
 };
 
 void ReadExact(ByteStream &stream, uint8_t *destination, size_t size);
@@ -55,6 +67,11 @@ struct TlsConfiguration {
 // testing, since a live server offers only its own DN.
 bool OracleServerDnMatches(const std::string &expected, const std::string &actual);
 
+// The default resolver: every address OpenSSL's BIO_lookup_ex returns for
+// `host`, as numeric text, in the order returned. Throws OracleConnectError
+// (UNREACHABLE) when the name does not resolve.
+std::vector<std::string> OpenSslResolveHost(const std::string &host, uint16_t port);
+
 // Cross-platform TCP/TCPS stream implemented with OpenSSL BIO. It is kept
 // separate from TNS so all protocol tests can use deterministic fake streams.
 class OpenSslByteStream final : public ByteStream {
@@ -69,6 +86,7 @@ public:
     size_t Write(const uint8_t *source, size_t size) override;
     // TNS over TLS has no equivalent, and this rejects it explicitly.
     void SendUrgent(uint8_t value) override;
+    void SetDeadline(std::optional<std::chrono::steady_clock::time_point> deadline) override;
     void Close() override;
 
 private:
