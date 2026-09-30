@@ -95,8 +95,9 @@ LOAD oracle_scanner;
 
 A signed binary for your platform is downloaded once and stays installed; no
 `-unsigned` flag, no build, and nothing from an Oracle client comes with it.
-Version 0.2.0 targets **DuckDB v1.5.5**, which is the DuckDB version that will
-load it.
+Version 0.3.0 targets **DuckDB v1.5.6**, which is the DuckDB version that will
+load it. On DuckDB v1.5.5 the same command still installs 0.2.2, the last
+release built for it.
 
 Prefer to build from source — to hack on it, or to run against a DuckDB you
 built yourself? That path still works:
@@ -696,9 +697,9 @@ you need it. Writing a LOB is not supported.
 
 ## 10. Troubleshooting
 
-### `The file was built specifically for DuckDB version 'v1.5.5'`
+### `The file was built specifically for DuckDB version 'v1.5.6'`
 
-Your DuckDB is a different version. Install DuckDB v1.5.5 and run
+Your DuckDB is a different version. Install DuckDB v1.5.6 and run
 `INSTALL oracle_scanner FROM community` again, or, if you built from source,
 use the shell this project produced (`./build/release/duckdb`).
 
