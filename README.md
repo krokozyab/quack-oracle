@@ -95,7 +95,7 @@ LOAD oracle_scanner;
 
 A signed binary for your platform is downloaded once and stays installed; no
 `-unsigned` flag, no build, and nothing from an Oracle client comes with it.
-Version 0.3.0 targets **DuckDB v1.5.6**, which is the DuckDB version that will
+Version 0.3.1 targets **DuckDB v1.5.6**, which is the DuckDB version that will
 load it. On DuckDB v1.5.5 the same command still installs 0.2.2, the last
 release built for it.
 
