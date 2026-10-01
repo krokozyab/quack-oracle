@@ -12,8 +12,10 @@
 #include <openssl/sha.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <limits>
 #include <memory>
+#include <string>
 #include <utility>
 
 namespace oracle_scanner {
@@ -178,6 +180,35 @@ std::vector<uint8_t> DecodeHex(const std::string &value, size_t maximum_bytes) {
     return output;
 }
 
+void RequireSupportedO5LogonVerifier(uint32_t verifier_type) {
+    if (verifier_type == O5LOGON_VERIFIER_12C) {
+        return;
+    }
+    char type[16];
+    std::snprintf(type, sizeof(type), "0x%04X", static_cast<unsigned>(verifier_type));
+    std::string kind;
+    std::string remedy;
+    if (verifier_type == O5LOGON_VERIFIER_11G_1 || verifier_type == O5LOGON_VERIFIER_11G_2) {
+        kind = "the 11G password verifier";
+        remedy = "The account needs a 12C password version: see PASSWORD_VERSIONS in DBA_USERS";
+    } else if (verifier_type == O5LOGON_VERIFIER_10G) {
+        // The server picks the case-insensitive 10G verifier whenever the
+        // database runs with SEC_CASE_SENSITIVE_LOGON = FALSE, even for an
+        // account that also has 11G and 12C versions. python-oracledb Thin
+        // fails the same way (DPY-3015).
+        kind = "the case-insensitive 10G password verifier";
+        remedy = "The database most likely runs with SEC_CASE_SENSITIVE_LOGON = FALSE, which makes the server offer "
+                 "10G even to accounts that have a 12C password version; ask the DBA";
+    } else {
+        kind = "an unknown password verifier";
+        remedy = "The account needs a 12C password version: see PASSWORD_VERSIONS in DBA_USERS";
+    }
+    throw ProtocolError(ProtocolErrorKind::UNSUPPORTED,
+                        "Oracle offered " + kind + " (type " + type +
+                            ") for this account; oracle_scanner authenticates only with the 12C verifier (type 0x4815). " +
+                            remedy);
+}
+
 O5LogonResponse BuildO5LogonResponse(const std::string &password, const O5LogonChallenge &challenge,
                                      const std::vector<uint8_t> &client_session_key,
                                      const std::vector<uint8_t> &password_salt,
@@ -186,17 +217,25 @@ O5LogonResponse BuildO5LogonResponse(const std::string &password, const O5LogonC
         speedy_key_salt.size() != 16) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "invalid O5LOGON password or random material");
     }
+    // The verifier first: an account whose verifier this client does not
+    // implement is unsupported, not malformed, and has to be reported so.
+    // There is no default — a challenge that does not say 12C is not 12C.
+    RequireSupportedO5LogonVerifier(challenge.verifier_type);
     auto verifier = DecodeHex(challenge.verifier_data_hex, 64);
     auto encrypted_server_key = DecodeHex(challenge.server_session_key_hex, 64);
     auto combo_salt = DecodeHex(challenge.combo_key_salt_hex, 64);
-    // 0x4815 is the 12c PBKDF2-SHA512 verifier used by the generated
-    // response below. Treat an absent flag as 12c for the deterministic unit
-    // fixtures retained from before verifier flags were decoded.
-    if ((challenge.verifier_type != 0 && challenge.verifier_type != 0x4815) || verifier.size() != 16 ||
-        encrypted_server_key.size() != 32 || combo_salt.size() != 16 ||
-        challenge.verifier_iterations == 0 || challenge.verifier_iterations > 10000000 ||
+    // Lengths, never contents: the values are key material.
+    if (verifier.size() != 16 || encrypted_server_key.size() != 32 || combo_salt.size() != 16) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                            "malformed 12C O5LOGON challenge: verifier data " + std::to_string(verifier.size()) +
+                                " bytes, session key " + std::to_string(encrypted_server_key.size()) +
+                                " bytes, combo-key salt " + std::to_string(combo_salt.size()) +
+                                " bytes; expected 16, 32 and 16");
+    }
+    if (challenge.verifier_iterations == 0 || challenge.verifier_iterations > 10000000 ||
         challenge.combo_key_iterations == 0 || challenge.combo_key_iterations > 10000000) {
-        throw ProtocolError(ProtocolErrorKind::MALFORMED, "unsupported or malformed 12c O5LOGON challenge");
+        throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                            "malformed 12C O5LOGON challenge: a PBKDF2 iteration count is outside 1..10000000");
     }
 
     std::vector<uint8_t> password_bytes(password.begin(), password.end());

@@ -22,6 +22,18 @@ std::vector<uint8_t> AesCbcDecryptRaw(const std::vector<uint8_t> &key, const std
 std::string UpperHex(const std::vector<uint8_t> &value);
 std::vector<uint8_t> DecodeHex(const std::string &value, size_t maximum_bytes);
 
+// The password verifier a challenge is built on, from the flags of its
+// AUTH_VFR_DATA parameter. Only 12C is supported. The others are named so an
+// unsupported account is reported as what it is, not as a malformed message;
+// the values are the ones python-oracledb Thin's constants.pxi lists.
+constexpr uint32_t O5LOGON_VERIFIER_12C = 0x4815;
+constexpr uint32_t O5LOGON_VERIFIER_11G_1 = 0xB152;
+constexpr uint32_t O5LOGON_VERIFIER_11G_2 = 0x1B25;
+constexpr uint32_t O5LOGON_VERIFIER_10G = 0x0939;
+
+// Throws UNSUPPORTED, naming the verifier by type, unless it is 12C.
+void RequireSupportedO5LogonVerifier(uint32_t verifier_type);
+
 struct O5LogonChallenge {
     std::string verifier_data_hex;
     std::string server_session_key_hex;

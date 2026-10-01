@@ -31,8 +31,12 @@ void RunCheckOobProbe(ByteStream &stream, uint16_t negotiated_sdu) {
     const auto reply = packets.Receive();
     // The two-byte CONTROL body is listener-version dependent (19c emits a
     // different value than newer Free builds); it is an acknowledgement, not
-    // a negotiated value. Its exact width and framing are the contract.
-    if (reply.type != TnsPacketType::CONTROL || reply.flags != 0x20 || reply.payload.size() != 2) {
+    // a negotiated value. Its type and width are the contract; the header
+    // flags are not. 19c and Free answer with flags 0x20, but a node listener
+    // reached through a SCAN redirect answers 0x24 — the 0x04 redirect bit of
+    // the re-CONNECT carried over — and python-oracledb Thin reads CONTROL
+    // packets without looking at their flags at all.
+    if (reply.type != TnsPacketType::CONTROL || reply.payload.size() != 2) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED,
                             "Oracle CHECK_OOB probe returned invalid CONTROL reply (type " +
                                 std::to_string(static_cast<uint8_t>(reply.type)) + ", flags " +
@@ -425,7 +429,11 @@ private:
                 continue;
             } catch (const ProtocolError &error) {
                 attempts.Add(target, address, std::string("unusable redirect (") + error.what() + ")");
-                throw;
+                // Say where the text came from: a bare parser message reads
+                // as if the user's own configuration were at fault.
+                throw ProtocolError(error.Kind(), std::string("Oracle listener sent a redirect this client could not "
+                                                              "follow: ") +
+                                                  error.what());
             }
             // What was parsed, never what was received: the listener's text
             // can carry its whole CONNECT_DATA, which is not diagnostics.

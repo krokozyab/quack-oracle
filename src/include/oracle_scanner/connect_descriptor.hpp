@@ -76,7 +76,7 @@ struct ConnectionConfig {
     uint16_t port = 1521;
     std::string service_name;
     // Optional CONNECT_DATA elements a descriptor may carry. INSTANCE_NAME pins
-    // the connection to one RAC instance; SERVER is DEDICATED or SHARED.
+    // the connection to one database instance; SERVER is DEDICATED or SHARED.
     std::string instance_name;
     std::string server_type;
     std::string user;

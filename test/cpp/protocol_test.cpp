@@ -779,17 +779,62 @@ static void TestTtcErrorDiagnostics() {
 
 static void TestTtcParameters() {
     const std::vector<TtcParameter> parameters = {
-        {"AUTH_VFR_DATA", "00112233445566778899AABBCCDDEEFF", 0x0c},
+        {"AUTH_VFR_DATA", "00112233445566778899AABBCCDDEEFF", O5LOGON_VERIFIER_12C},
         {"AUTH_SESSKEY", "00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF", 0},
         {"AUTH_PBKDF2_CSK_SALT", "00112233445566778899AABBCCDDEEFF", 0},
         {"AUTH_PBKDF2_VGEN_COUNT", "4096", 0},
         {"AUTH_PBKDF2_SDER_COUNT", "3", 0}};
     auto decoded = DecodeTtcParameters(EncodeTtcParameters(parameters));
-    CHECK(decoded.size() == parameters.size() && decoded[0].flags == 0x0c);
+    CHECK(decoded.size() == parameters.size() && decoded[0].flags == O5LOGON_VERIFIER_12C);
     auto challenge = O5LogonChallengeFromParameters(decoded);
     CHECK(challenge.verifier_iterations == 4096 && challenge.combo_key_iterations == 3);
     decoded.push_back(decoded.front());
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { O5LogonChallengeFromParameters(decoded); });
+
+    // The verifier type is read before any 12C field is required, so an
+    // account on another verifier is reported as that, by type, rather than as
+    // a malformed or incomplete challenge. An 11G challenge need not carry the
+    // PBKDF2 fields at all.
+    const auto message_for = [](const std::vector<TtcParameter> &challenge) {
+        try {
+            (void)O5LogonChallengeFromParameters(challenge);
+        } catch (const ProtocolError &error) {
+            CHECK(error.Kind() == ProtocolErrorKind::UNSUPPORTED);
+            return std::string(error.what());
+        }
+        CHECK(false && "expected the verifier to be refused");
+        return std::string();
+    };
+    const auto verifier_only = [](uint32_t type) {
+        return std::vector<TtcParameter> {{"AUTH_VFR_DATA", "00112233445566778899AABBCCDDEEFF", type},
+                                          {"AUTH_SESSKEY", std::string(96, 'A'), 0}};
+    };
+    auto message = message_for(verifier_only(O5LOGON_VERIFIER_11G_1));
+    CHECK(message.find("11G password verifier (type 0xB152)") != std::string::npos);
+    CHECK(message.find("12C verifier (type 0x4815)") != std::string::npos);
+    CHECK(message_for(verifier_only(O5LOGON_VERIFIER_11G_2)).find("11G password verifier (type 0x1B25)") !=
+          std::string::npos);
+    const auto ten_g = message_for(verifier_only(O5LOGON_VERIFIER_10G));
+    CHECK(ten_g.find("10G password verifier (type 0x0939)") != std::string::npos);
+    CHECK(ten_g.find("SEC_CASE_SENSITIVE_LOGON") != std::string::npos);
+    CHECK(message_for(verifier_only(0x1234)).find("unknown password verifier (type 0x1234)") != std::string::npos);
+    // A flag of zero is not taken to mean 12C any more.
+    CHECK(message_for(verifier_only(0)).find("type 0x0000") != std::string::npos);
+    // Nothing from the challenge's values reaches the message.
+    CHECK(message.find("00112233") == std::string::npos && message.find("AAAA") == std::string::npos);
+
+    // A 12C challenge missing a field names the field, not its value.
+    auto incomplete = parameters;
+    incomplete.erase(incomplete.begin() + 2);
+    try {
+        (void)O5LogonChallengeFromParameters(incomplete);
+        CHECK(false && "expected a missing field");
+    } catch (const ProtocolError &error) {
+        CHECK(error.Kind() == ProtocolErrorKind::MALFORMED);
+        CHECK(std::string(error.what()).find("AUTH_PBKDF2_CSK_SALT") != std::string::npos);
+    }
+    ExpectError(ProtocolErrorKind::MALFORMED,
+                [&] { (void)O5LogonChallengeFromParameters({{"AUTH_SESSKEY", "00", 0}}); });
     ExpectError(ProtocolErrorKind::MALFORMED, [] { DecodeTtcParameters({7, 0}); });
 
     // A parameter's declared size is an upper bound, not its length. A database
@@ -1666,7 +1711,7 @@ static void TestO5LogonFlow() {
     std::vector<uint8_t> proof(16, 0);
     proof.insert(proof.end(), {'S', 'E', 'R', 'V', 'E', 'R', '_', 'T', 'O', '_', 'C', 'L', 'I', 'E', 'N', 'T'});
     const std::vector<TtcParameter> challenge_parameters = {
-        {"AUTH_VFR_DATA", challenge.verifier_data_hex, 0},
+        {"AUTH_VFR_DATA", challenge.verifier_data_hex, O5LOGON_VERIFIER_12C},
         {"AUTH_SESSKEY", challenge.server_session_key_hex, 0},
         {"AUTH_PBKDF2_CSK_SALT", challenge.combo_key_salt_hex, 0},
         {"AUTH_PBKDF2_VGEN_COUNT", "4096", 0},
@@ -3386,13 +3431,13 @@ static void TestTransportWithoutOutOfBandRefusesTheOobProbe() {
 }
 
 // ---------------------------------------------------------------------------
-// Multi-address connects, listener redirects and failover (RAC / SCAN).
+// Multi-address connects, SCAN names, listener redirects and failover.
 //
 // Every packet below is SYNTHETIC: built here from the field layouts that
 // python-oracledb Thin (commit 4a6d3b39, connect.pyx and connection.pyx) and
 // go-ora (commit 360b4b7a, network/redirect_packet.go, refuse_packet.go and
-// session.go) read and write. None is a capture, and none has been checked
-// against a live RAC listener — which is the limit of what these tests prove.
+// session.go) read and write. None is a capture, which is the limit of what
+// these tests prove.
 // ---------------------------------------------------------------------------
 
 // REDIRECT: a UB2 length, then the data inline — or, when `inline_data` is
@@ -3813,16 +3858,24 @@ public:
 
     class Transport : public ScriptedTransport {
     public:
-        Transport(std::vector<uint8_t> input, std::vector<uint8_t> *sink, int &live_p)
-            : ScriptedTransport(std::move(input), sink), live(live_p) {
+        Transport(std::vector<uint8_t> input, std::vector<uint8_t> *sink, int &live_p, bool urgent_p)
+            : ScriptedTransport(std::move(input), sink), live(live_p), urgent(urgent_p) {
             live++;
         }
         ~Transport() override {
             live--;
         }
+        // A plain TCP transport has an out-of-band channel; when the network
+        // says so, the CHECK_OOB probe's urgent byte is simply accepted.
+        void SendUrgent(uint8_t value) override {
+            if (!urgent) {
+                ScriptedTransport::SendUrgent(value);
+            }
+        }
 
     private:
         int &live;
+        bool urgent;
     };
 
     void Script(const std::string &address, uint16_t port, std::vector<Behaviour> behaviours) {
@@ -3863,7 +3916,7 @@ public:
                 break;
             }
             written.emplace_back();
-            return std::make_unique<Transport>(std::move(behaviour.bytes), &written.back(), live);
+            return std::make_unique<Transport>(std::move(behaviour.bytes), &written.back(), live, supports_urgent);
         };
     }
 
@@ -3881,6 +3934,7 @@ public:
     // wrote to it.
     std::deque<std::vector<uint8_t>> written;
     int live = 0;
+    bool supports_urgent = false;
 };
 
 // A clock that moves only when the connect sleeps or a scripted black hole
@@ -4406,6 +4460,120 @@ static void TestLoadBalanceShufflesEachConnection() {
     CHECK(network.Opened() == std::vector<std::string>({"a", "a"}));
 }
 
+// What a SCAN listener really sends back: its reconnect data echoes the
+// client's own CONNECT data, so it carries this client's CONNECTION_ID — base64,
+// ending in "==" and possibly holding '+' and '/' — and its CID, whose PROGRAM
+// is an executable path that may contain spaces. The first release parsed that
+// echo with the strict grammar meant for user-written descriptors and refused
+// the '=' ("Oracle descriptor atom contains an invalid character"), which broke
+// every redirected connect. Hand-written reconnect data in
+// the tests above never carried either field.
+static std::string EchoedConnectData(const std::string &host) {
+    ConnectionConfig echoed;
+    echoed.host = host;
+    echoed.service_name = "svc";
+    echoed.connection_id = "q0N+/Zy1AbCdEfGhIjKlMn==";
+    echoed.client_program = "/Applications/My Tools/duckdb";
+    return BuildConnectDescriptor(echoed);
+}
+
+static void TestListenerEchoOfTheClientsConnectData() {
+    const auto reconnect = EchoedConnectData("scan.example");
+    CHECK(reconnect.find("(CONNECTION_ID=q0N+/Zy1AbCdEfGhIjKlMn==)") != std::string::npos);
+    CHECK(reconnect.find("/Applications/My Tools/duckdb") != std::string::npos);
+    // The strict grammar still refuses it — which is right for a descriptor a
+    // user typed — and the listener grammar accepts it.
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)ParseConnectDescriptor(reconnect); });
+    ValidateRedirectReconnectData(reconnect);
+    ValidateRedirectReconnectData("(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=svc)(SERVER=dedicated)"
+                                  "(CID=(PROGRAM=C:\\Program Files\\DuckDB\\duckdb.exe)(HOST=WORKSTATION)"
+                                  "(USER=John Smith))(CONNECTION_ID=a+b/c==)))");
+    // A redirect address given as a whole DESCRIPTION echoing the same data.
+    const auto addresses =
+        ParseRedirectAddresses("(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=node1-vip)(PORT=1521))"
+                               "(CONNECT_DATA=(SERVICE_NAME=svc)(CONNECTION_ID=a+b/c==)))");
+    CHECK(addresses.size() == 1 && addresses[0].address.host == "node1-vip");
+    // Leniency covers values, not the fields that are used: a host is still
+    // checked on its own, and structure is still structure.
+    ExpectError(ProtocolErrorKind::MALFORMED,
+                [] { (void)ParseRedirectAddresses("(ADDRESS=(PROTOCOL=TCP)(HOST=node=1)(PORT=1521))"); });
+    ExpectError(ProtocolErrorKind::MALFORMED,
+                [] { (void)ParseRedirectAddresses("(ADDRESS=(PROTOCOL=TCP)(HOST=node1)(PORT=15 21))"); });
+    ExpectError(ProtocolErrorKind::MALFORMED,
+                [] { ValidateRedirectReconnectData("(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=a(b)))"); });
+    ExpectError(ProtocolErrorKind::MALFORMED,
+                [] { ValidateRedirectReconnectData("(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=)))"); });
+
+    // End to end: SCAN redirects with the echo as reconnect data, the node
+    // accepts, and the echo is what the re-CONNECT carries, byte for byte.
+    FakeClock clock;
+    ScopedOracleConnectEnvironment environment(clock.Environment());
+    FakeNetwork network;
+    network.Answer("scan.example", 1521,
+                   RedirectPacketBytes(RedirectData("(ADDRESS=(PROTOCOL=TCP)(HOST=node1-vip)(PORT=1521))", reconnect),
+                                       TNS_REDIRECT_FLAG_HAS_RECONNECT_DATA));
+    network.Answer("node1-vip", 1521, AcceptPacketBytes(false));
+    ScopedOracleTransportFactory installed(network.Factory());
+    ConnectionConfig config;
+    config.host = "scan.example";
+    config.service_name = "svc";
+    const auto connection = TnsClientConnection::Connect(config);
+    CHECK(network.Opened() == std::vector<std::string>({"scan.example", "node1-vip"}));
+    const auto second = FirstConnect(network.written[1]);
+    CHECK(second.flags == TNS_PACKET_FLAG_REDIRECT && second.data == reconnect);
+
+    // And a redirect that cannot be followed says so, rather than surfacing a
+    // bare parser message that reads as if the user's secret were at fault.
+    network.opens.clear();
+    network.Answer("scan.example", 1521, RedirectPacketBytes("(ADDRESS=(PROTOCOL=TCP)(HOST=node1)(PORT=x))"));
+    try {
+        (void)TnsClientConnection::Connect(config);
+        CHECK(false && "expected the redirect to be refused");
+    } catch (const ProtocolError &error) {
+        CHECK(std::string(error.what()).find("Oracle listener sent a redirect this client could not follow") !=
+              std::string::npos);
+    }
+}
+
+// A node listener reached through a SCAN redirect asks for the CHECK_OOB probe and
+// answers it with a CONTROL packet whose header flags are 0x24, not the 0x20
+// 19c and Free send: the re-CONNECT's 0x04 redirect bit comes back with it.
+// Seen live; 0.3.0 refused it as an invalid CONTROL reply. The
+// type and the two-byte body are what the probe checks.
+static void TestOobProbeAfterRedirectAcceptsTheRedirectFlag() {
+    const auto accept_then_control = [](uint8_t flags, std::vector<uint8_t> body) {
+        auto wire = AcceptPacketBytes(true);
+        const auto control = EncodeTnsPacket(TnsPacketType::CONTROL, flags, body, true);
+        wire.insert(wire.end(), control.begin(), control.end());
+        return wire;
+    };
+    FakeClock clock;
+    ScopedOracleConnectEnvironment environment(clock.Environment());
+    FakeNetwork network;
+    network.supports_urgent = true;
+    network.Answer("scan", 1521, RedirectPacketBytes("(ADDRESS=(PROTOCOL=TCP)(HOST=node1)(PORT=1521))"));
+    network.Answer("node1", 1521, accept_then_control(0x24, {0x00, 0x09}));
+    ScopedOracleTransportFactory installed(network.Factory());
+    auto connection = TnsClientConnection::Connect(RoutedConfig({{"scan"}}));
+    CHECK(connection->State() == OracleConnectionState::TRANSPORT_CONNECTED);
+    // The probe's reset marker went out after the re-CONNECT.
+    const auto &node_bytes = network.written.back();
+    const std::vector<uint8_t> reset_marker {0x01, 0x00, 0x02};
+    CHECK(std::search(node_bytes.begin(), node_bytes.end(), reset_marker.begin(), reset_marker.end()) != node_bytes.end());
+
+    // The plain 0x20 answer still works, and what the probe does check still
+    // holds: a CONTROL body of the wrong width, or a reply that is not CONTROL.
+    network.Answer("scan", 1521, accept_then_control(0x20, {0x00, 0x09}));
+    (void)TnsClientConnection::Connect(RoutedConfig({{"scan"}}));
+    network.Answer("scan", 1521, accept_then_control(0x24, {0x00, 0x09, 0x00}));
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)TnsClientConnection::Connect(RoutedConfig({{"scan"}})); });
+    auto not_control = AcceptPacketBytes(true);
+    const auto marker = EncodeTnsPacket(TnsPacketType::MARKER, 0x24, {0x01, 0x00, 0x02}, true);
+    not_control.insert(not_control.end(), marker.begin(), marker.end());
+    network.Answer("scan", 1521, not_control);
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)TnsClientConnection::Connect(RoutedConfig({{"scan"}})); });
+}
+
 // Review regressions. A redirect chain keeps every level's untried addresses:
 // when one node's own redirect leads nowhere, the next node the SCAN listener
 // named is still tried.
@@ -4769,7 +4937,7 @@ static void TestRedirectTextStaysOutOfErrors() {
 // one TNS packet from each, keeps it, and answers with the next scripted reply.
 // It is what the default transport — a real socket through OpenSSL — needs to
 // be exercised end to end offline. It is a mock of the listener's first
-// exchange and nothing more: not a RAC, not a database.
+// exchange and nothing more, not a database.
 class MockListener {
 public:
     // `hold` is how long each accepted connection is kept open after the
@@ -5190,6 +5358,7 @@ static void TestAuthCrypto() {
     challenge.combo_key_salt_hex = UpperHex(combo_salt);
     challenge.verifier_iterations = 4096;
     challenge.combo_key_iterations = 3;
+    challenge.verifier_type = O5LOGON_VERIFIER_12C;
     std::vector<uint8_t> speedy_key_salt(16, 6);
     auto response = BuildO5LogonResponse("password", challenge, client_key, password_salt, speedy_key_salt);
     CHECK(AesCbcDecryptRaw(password_hash, DecodeHex(response.client_session_key_hex, 32)) == client_key);
@@ -5207,9 +5376,23 @@ static void TestAuthCrypto() {
     ExpectError(ProtocolErrorKind::MALFORMED,
                 [&] { BuildO5LogonResponse("password", challenge, client_key, password_salt, speedy_key_salt); });
     challenge.verifier_iterations = 4096;
-    challenge.verifier_type = 0xb152;
-    ExpectError(ProtocolErrorKind::MALFORMED,
-                [&] { BuildO5LogonResponse("password", challenge, client_key, password_salt, speedy_key_salt); });
+    // Unsupported, not malformed: the response is never built for another
+    // verifier, and the type is checked before anything else.
+    for (const uint32_t type : {O5LOGON_VERIFIER_11G_1, O5LOGON_VERIFIER_11G_2, O5LOGON_VERIFIER_10G, uint32_t(0)}) {
+        challenge.verifier_type = type;
+        ExpectError(ProtocolErrorKind::UNSUPPORTED,
+                    [&] { BuildO5LogonResponse("password", challenge, client_key, password_salt, speedy_key_salt); });
+    }
+    // A 12C challenge of the wrong shape says which lengths it had.
+    challenge.verifier_type = O5LOGON_VERIFIER_12C;
+    challenge.server_session_key_hex += "00112233445566778899AABBCCDDEEFF";
+    try {
+        (void)BuildO5LogonResponse("password", challenge, client_key, password_salt, speedy_key_salt);
+        CHECK(false && "expected the session key length to be refused");
+    } catch (const ProtocolError &error) {
+        CHECK(error.Kind() == ProtocolErrorKind::MALFORMED);
+        CHECK(std::string(error.what()).find("session key 48 bytes") != std::string::npos);
+    }
 }
 
 // Builds a wallet in the shape Oracle's auto-login store has, from a throwaway
@@ -5469,6 +5652,8 @@ int main() {
     TestCancellationStopsTheConnect();
     TestLoadBalanceShufflesEachConnection();
     TestRedirectChainKeepsEachLevelsAlternatives();
+    TestListenerEchoOfTheClientsConnectData();
+    TestOobProbeAfterRedirectAcceptsTheRedirectFlag();
     TestBudgetHoldsThroughTheListenerExchange();
     TestSlowNameResolutionIsCutOffByTheBudget();
     TestResolverWorkersAreBounded();

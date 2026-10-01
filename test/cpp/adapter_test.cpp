@@ -1623,12 +1623,12 @@ void TestConnectDescriptorSecretReachesTheSession() {
         return std::unique_ptr<OracleSession>(new FakeSession(script));
     });
     TestDatabase database;
-    database.Run("CREATE SECRET rac (TYPE oracle, USER 'app_user', PASSWORD 'placeholder', CONNECT_DESCRIPTOR "
+    database.Run("CREATE SECRET multi (TYPE oracle, USER 'app_user', PASSWORD 'placeholder', CONNECT_DESCRIPTOR "
                  "'(DESCRIPTION=(CONNECT_TIMEOUT=90)(RETRY_COUNT=20)(RETRY_DELAY=3)(TRANSPORT_CONNECT_TIMEOUT=3)"
                  "(ADDRESS_LIST=(LOAD_BALANCE=on)(ADDRESS=(PROTOCOL=TCP)(HOST=scan.example)(PORT=1521)))"
                  "(ADDRESS_LIST=(ADDRESS=(PROTOCOL=TCP)(HOST=standby.example)(PORT=1522)))"
                  "(CONNECT_DATA=(SERVICE_NAME=sales.example)(INSTANCE_NAME=sales1)))');");
-    CHECK(!database.Query("SELECT * FROM oracle_query('rac', 'SELECT label FROM app.items')")->HasError());
+    CHECK(!database.Query("SELECT * FROM oracle_query('multi', 'SELECT label FROM app.items')")->HasError());
     CHECK(configs->size() == 1);
     const auto &config = configs->front();
     CHECK(config.host.empty() && config.service_name == "sales.example" && config.instance_name == "sales1");

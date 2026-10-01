@@ -758,6 +758,37 @@ That column's type is not supported. List the columns you need instead of
 altered too recently to read as of an earlier moment. Wait a few minutes, or use
 a plain `oracle_query`.
 
+### `Oracle offered the … password verifier (type 0x…) for this account`
+
+The connection itself worked; the server asked to authenticate with an older
+password format than the 12C one this extension signs in with. The type in the
+message says which case you are in.
+
+**`10G` (type `0x0939`).** The database most likely runs with
+`SEC_CASE_SENSITIVE_LOGON = FALSE` (case-insensitive passwords). The server then
+offers the 10G verifier even to accounts that also have a 12C password version,
+so every account on that database is affected. Check it with your DBA:
+
+```sql
+SHOW PARAMETER sec_case_sensitive_logon
+```
+
+Switching to case-sensitive passwords is a database-wide decision for the DBA,
+made through whatever procedure the applications on that database require.
+python-oracledb in thin mode stops at the same point (DPY-3015); only clients
+built on OCI or JDBC accept the 10G verifier.
+
+**`11G` (type `0xB152` or `0x1B25`).** The account's password is stored only in
+older formats. Ask your DBA which versions it has:
+
+```sql
+SELECT username, password_versions FROM dba_users WHERE username = 'SCOTT';
+```
+
+`12C` has to be among them. An account showing only `10G 11G` needs its
+password version upgraded by the DBA, through whatever tool your application
+requires for password changes.
+
 ### `ORA-28000: the account is locked`
 
 Too many failed logins locked the Oracle account. Ask a DBA to unlock it — and

@@ -165,13 +165,21 @@ O5LogonChallenge O5LogonChallengeFromParameters(const std::vector<TtcParameter> 
             verifier_type = parameter.flags;
         }
     }
+    // Which parameter is missing is named; its value never is.
     auto required = [&](const char *key) -> const std::string & {
         const auto found = values.find(key);
         if (found == values.end()) {
-            throw ProtocolError(ProtocolErrorKind::MALFORMED, "O5LOGON response is missing a required parameter");
+            throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                                std::string("O5LOGON challenge is missing its ") + key + " parameter");
         }
         return found->second;
     };
+    // The verifier type decides which other parameters a challenge must carry,
+    // so it is read before any of them is required: an 11G challenge does not
+    // have to carry the 12C PBKDF2 fields, and should be reported as the
+    // unsupported verifier it is rather than as a missing field.
+    (void)required("AUTH_VFR_DATA");
+    RequireSupportedO5LogonVerifier(verifier_type);
     O5LogonChallenge result;
     result.verifier_data_hex = required("AUTH_VFR_DATA");
     result.server_session_key_hex = required("AUTH_SESSKEY");

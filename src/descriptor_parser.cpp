@@ -18,9 +18,21 @@ struct Node {
     std::vector<Node> children;
 };
 
+// How values are read. A descriptor the user wrote is held to the strict atom
+// grammar: an unexpected character there is more likely a typo than intent.
+// Text a listener sends back — a redirect address or reconnect data — is the
+// listener's own, and it routinely carries values the strict grammar refuses:
+// Oracle echoes the client's CONNECTION_ID, which is base64 and so ends in
+// '=', and the client's CID, whose PROGRAM is a path that may contain spaces.
+// There a value runs to the ')' that closes its node; only '(' and characters
+// outside printable ASCII are refused, and any field that is used afterwards
+// (a host, a port) is validated on its own.
+enum class ValueGrammar { STRICT, LISTENER };
+
 class Parser {
 public:
-    explicit Parser(const std::string &input_p) : input(input_p) {
+    explicit Parser(const std::string &input_p, ValueGrammar grammar_p = ValueGrammar::STRICT)
+        : input(input_p), grammar(grammar_p) {
         if (input.empty() || input.size() > 65535) {
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle descriptor has an invalid size");
         }
@@ -104,6 +116,9 @@ private:
             }
             return value;
         }
+        if (terminator == ')' && grammar == ValueGrammar::LISTENER) {
+            return ParseListenerValue();
+        }
         const auto start = position;
         while (position < input.size() && input[position] != terminator) {
             const auto byte = static_cast<unsigned char>(input[position]);
@@ -127,6 +142,34 @@ private:
         return input.substr(start, position - start);
     }
 
+    // See ValueGrammar::LISTENER: everything up to the node's ')', trimmed.
+    std::string ParseListenerValue() {
+        const auto start = position;
+        while (position < input.size() && input[position] != ')') {
+            const auto byte = static_cast<unsigned char>(input[position]);
+            if (input[position] == '(' || (byte < 0x20 && !std::isspace(byte)) || byte > 0x7e) {
+                throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                                    "Oracle listener descriptor value contains an invalid character");
+            }
+            position++;
+        }
+        if (position == input.size()) {
+            throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle listener descriptor value is unterminated");
+        }
+        auto end = position;
+        auto first = start;
+        while (first < end && std::isspace(static_cast<unsigned char>(input[first]))) {
+            first++;
+        }
+        while (end > first && std::isspace(static_cast<unsigned char>(input[end - 1]))) {
+            end--;
+        }
+        if (first == end) {
+            throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle listener descriptor value is empty");
+        }
+        return input.substr(first, end - first);
+    }
+
     void SkipWhitespace() {
         while (position < input.size() && std::isspace(static_cast<unsigned char>(input[position]))) {
             position++;
@@ -141,6 +184,7 @@ private:
     }
 
     const std::string &input;
+    ValueGrammar grammar;
     size_t position = 0;
 };
 
@@ -492,7 +536,7 @@ ParsedConnectDescriptor ParseConnectDescriptor(const std::string &descriptor) {
 }
 
 std::vector<RedirectAddress> ParseRedirectAddresses(const std::string &text) {
-    auto root = Parser(text).Parse();
+    auto root = Parser(text, ValueGrammar::LISTENER).Parse();
     std::vector<const Node *> addresses;
     if (root.key == "ADDRESS") {
         addresses.push_back(&root);
@@ -545,7 +589,7 @@ void ValidateRedirectReconnectData(const std::string &text) {
     if (text.size() > MAX_RECONNECT_DATA_BYTES) {
         throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle redirect reconnect data is too large");
     }
-    auto root = Parser(text).Parse();
+    auto root = Parser(text, ValueGrammar::LISTENER).Parse();
     if (root.key != "DESCRIPTION" || !root.value.empty()) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle redirect reconnect data is not a DESCRIPTION");
     }
