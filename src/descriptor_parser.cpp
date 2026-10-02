@@ -27,11 +27,11 @@ struct Node {
 // There a value runs to the ')' that closes its node; only '(' and characters
 // outside printable ASCII are refused, and any field that is used afterwards
 // (a host, a port) is validated on its own.
-enum class ValueGrammar { STRICT, LISTENER };
+enum class ValueGrammar { USER_WRITTEN, LISTENER_SUPPLIED };
 
 class Parser {
 public:
-    explicit Parser(const std::string &input_p, ValueGrammar grammar_p = ValueGrammar::STRICT)
+    explicit Parser(const std::string &input_p, ValueGrammar grammar_p = ValueGrammar::USER_WRITTEN)
         : input(input_p), grammar(grammar_p) {
         if (input.empty() || input.size() > 65535) {
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle descriptor has an invalid size");
@@ -116,7 +116,7 @@ private:
             }
             return value;
         }
-        if (terminator == ')' && grammar == ValueGrammar::LISTENER) {
+        if (terminator == ')' && grammar == ValueGrammar::LISTENER_SUPPLIED) {
             return ParseListenerValue();
         }
         const auto start = position;
@@ -142,7 +142,7 @@ private:
         return input.substr(start, position - start);
     }
 
-    // See ValueGrammar::LISTENER: everything up to the node's ')', trimmed.
+    // See ValueGrammar::LISTENER_SUPPLIED: everything up to the node's ')', trimmed.
     std::string ParseListenerValue() {
         const auto start = position;
         while (position < input.size() && input[position] != ')') {
@@ -536,7 +536,7 @@ ParsedConnectDescriptor ParseConnectDescriptor(const std::string &descriptor) {
 }
 
 std::vector<RedirectAddress> ParseRedirectAddresses(const std::string &text) {
-    auto root = Parser(text, ValueGrammar::LISTENER).Parse();
+    auto root = Parser(text, ValueGrammar::LISTENER_SUPPLIED).Parse();
     std::vector<const Node *> addresses;
     if (root.key == "ADDRESS") {
         addresses.push_back(&root);
@@ -589,7 +589,7 @@ void ValidateRedirectReconnectData(const std::string &text) {
     if (text.size() > MAX_RECONNECT_DATA_BYTES) {
         throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle redirect reconnect data is too large");
     }
-    auto root = Parser(text, ValueGrammar::LISTENER).Parse();
+    auto root = Parser(text, ValueGrammar::LISTENER_SUPPLIED).Parse();
     if (root.key != "DESCRIPTION" || !root.value.empty()) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle redirect reconnect data is not a DESCRIPTION");
     }
