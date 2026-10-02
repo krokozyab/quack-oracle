@@ -193,6 +193,15 @@ if(ORACLE_SCANNER_BUILD_TESTS)
   # also carries this extension's own OpenSSL and miniz dependencies.
   target_link_libraries(oracle_scanner_adapter_test PRIVATE duckdb_static)
   link_extension_libraries(oracle_scanner_adapter_test PRIVATE)
+  # DuckDB 2.0 resolves which extensions are linked only after every extension
+  # directory is processed, so the call above sees an empty list here. Name this
+  # extension's own archive, and core_functions, which holds list_value and the
+  # rest of what the tests' SQL calls; on 1.5 both are already in that list.
+  # core_functions is declared after this directory, so it is named rather than
+  # passed to duckdb_link_extensions, which would find no target yet; the test
+  # loads it explicitly, as it loads this extension.
+  target_link_libraries(oracle_scanner_adapter_test PRIVATE ${EXTENSION_NAME} core_functions_extension)
+  target_include_directories(oracle_scanner_adapter_test PRIVATE ${CMAKE_SOURCE_DIR}/extension/core_functions/include)
   target_include_directories(oracle_scanner_adapter_test PRIVATE src/include)
   target_compile_features(oracle_scanner_adapter_test PRIVATE cxx_std_17)
   add_test(NAME oracle_scanner_adapter_test COMMAND oracle_scanner_adapter_test)

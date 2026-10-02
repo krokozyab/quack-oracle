@@ -355,7 +355,12 @@ CreateTableFunctionInfo OracleParallelScanFunctionInfo() {
                            {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
                            OracleParallelFunction, OracleParallelBind, OracleParallelInitGlobal,
                            OracleParallelInitLocal);
-    function.named_parameters["shards"] = LogicalType::BIGINT;
+    // DuckDB 2.0: an optional named argument is an option of a typed "**options"
+    // parameter, as read_csv declares its own; the bind still finds it in
+    // input.named_parameters.
+    function.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+        options.Add("shards", LogicalType::BIGINT);
+    });
     // The named parameter is listed after the positional ones, which is where
     // duckdb_functions() puts it; without a name for it, it would show as col3.
     return DocumentedTableFunctionInfo(

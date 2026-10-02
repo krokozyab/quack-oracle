@@ -1625,6 +1625,18 @@ void OracleQueryFunction(ClientContext &, TableFunctionInput &input, DataChunk &
 
 
 CreateTableFunctionInfo DocumentedTableFunctionInfo(TableFunction function, OracleFunctionDocumentation documentation) {
+    // DuckDB 2.0 reports a parameter's name from the signature rather than from
+    // the description, so the documented names go there too. Only the
+    // positional-only parameters are renamed, which keeps them positional-only:
+    // no call gains a keyword form it did not have.
+    auto &signature = function.GetSignature();
+    for (idx_t index = 0; index < signature.GetParameterCount() && index < documentation.parameter_names.size();
+         index++) {
+        auto &parameter = signature.GetParameter(index);
+        if (parameter.GetKind() == FunctionParameterKind::POSITIONAL_ONLY) {
+            parameter.SetName(Identifier(documentation.parameter_names[index]));
+        }
+    }
     CreateTableFunctionInfo info(std::move(function));
     info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
     FunctionDescription description;
@@ -1645,7 +1657,9 @@ vector<CreateTableFunctionInfo> OracleQueryFunctionInfos() {
     vector<CreateTableFunctionInfo> infos;
     TableFunction query("oracle_query", {LogicalType::VARCHAR, LogicalType::VARCHAR}, OracleQueryFunction, OracleQueryBind,
                         OracleQueryInit);
-    query.varargs = LogicalType::ANY;
+    // DuckDB 2.0 declares the optional bind collection as a "*params" parameter
+    // of the signature, where 1.5 had a varargs type on the function.
+    query.GetSignature().AddArgs("params", LogicalType::ANY);
     infos.push_back(DocumentedTableFunctionInfo(
         std::move(query),
         {{"secret_name", "sql", "params"},
@@ -1655,7 +1669,7 @@ vector<CreateTableFunctionInfo> OracleQueryFunctionInfos() {
 
     TableFunction execute("oracle_execute", {LogicalType::VARCHAR, LogicalType::VARCHAR}, OracleExecuteFunction,
                           OracleExecuteBind, OracleExecuteInit);
-    execute.varargs = LogicalType::ANY;
+    execute.GetSignature().AddArgs("params", LogicalType::ANY);
     infos.push_back(DocumentedTableFunctionInfo(
         std::move(execute),
         {{"secret_name", "sql", "params"},

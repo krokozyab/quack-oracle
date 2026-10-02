@@ -402,8 +402,13 @@ public:
     OracleAttachedTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, unique_ptr<CreateTableInfo> info,
                              shared_ptr<OracleAttachedState> state_p, std::string object_name_p,
                              std::vector<OracleColumn> oracle_columns_p)
-        : TableCatalogEntry(catalog, schema, *info), state(std::move(state_p)), object_name(std::move(object_name_p)),
-          oracle_columns(std::move(oracle_columns_p)) {
+        : TableCatalogEntry(catalog, schema, *info), columns(std::move(info->columns)), state(std::move(state_p)),
+          object_name(std::move(object_name_p)), oracle_columns(std::move(oracle_columns_p)) {
+    }
+
+    // DuckDB 2.0 leaves the columns to the entry, as DuckTableEntry keeps its own.
+    const ColumnList &GetColumns() const override {
+        return columns;
     }
 
     static unique_ptr<OracleAttachedTableEntry> Create(Catalog &catalog, SchemaCatalogEntry &schema,
@@ -522,6 +527,7 @@ public:
     }
 
 private:
+    ColumnList columns;
     shared_ptr<OracleAttachedState> state;
     std::string object_name;
     std::vector<OracleColumn> oracle_columns;

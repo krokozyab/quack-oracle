@@ -11,6 +11,7 @@
 #include "oracle_scanner/session_factory.hpp"
 #include "oracle_scanner/value_codec.hpp"
 #include "oracle_scanner_extension.hpp"
+#include "core_functions_extension.hpp"
 #include "oracle_adapter.hpp"
 #include "oracle_scanner/call_registry.hpp"
 #include "oracle_scanner/ttc_execute.hpp"
@@ -25,6 +26,7 @@
 #include "duckdb/planner/filter/optional_filter.hpp"
 
 #include "duckdb.hpp"
+#include "duckdb/main/query_result_stream.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
@@ -410,8 +412,78 @@ ScopedOracleSessionFactory InstallFake(const std::shared_ptr<FakeScript> &script
     });
 }
 
+// DuckDB 2.0 returns a QueryResult read unit by unit, with no (column, row)
+// access. These tests read results that way after the fact, so this collects
+// one up front: every row as Values, or the error, whether it surfaced when the
+// query was submitted or while its rows were fetched.
+class MaterializedQueryResult {
+public:
+    explicit MaterializedQueryResult(duckdb::unique_ptr<duckdb::QueryResult> result) {
+        if (result->HasError()) {
+            error = result->GetError();
+            return;
+        }
+        column_count = result->ColumnCount();
+        types = result->GetTypes();
+        for (const auto &name : result->GetNames()) {
+            names.push_back(static_cast<const std::string &>(name));
+        }
+        try {
+            while (auto chunk = result->Fetch()) {
+                if (chunk->size() == 0) {
+                    break;
+                }
+                for (duckdb::idx_t row = 0; row < chunk->size(); row++) {
+                    std::vector<duckdb::Value> values;
+                    for (duckdb::idx_t column = 0; column < column_count; column++) {
+                        values.push_back(chunk->GetValue(column, row));
+                    }
+                    rows.push_back(std::move(values));
+                }
+            }
+        } catch (const std::exception &exception) {
+            error = duckdb::ErrorData(exception).Message();
+            rows.clear();
+        }
+        if (result->HasError() && error.empty()) {
+            error = result->GetError();
+        }
+    }
+    bool HasError() const {
+        return !error.empty();
+    }
+    const std::string &GetError() const {
+        return error;
+    }
+    duckdb::idx_t RowCount() const {
+        return rows.size();
+    }
+    duckdb::idx_t ColumnCount() const {
+        return column_count;
+    }
+    duckdb::Value GetValue(duckdb::idx_t column, duckdb::idx_t row) const {
+        return rows.at(row).at(column);
+    }
+    const std::vector<duckdb::LogicalType> &GetTypes() const {
+        return types;
+    }
+    const std::vector<std::string> &GetNames() const {
+        return names;
+    }
+
+private:
+    std::string error;
+    duckdb::idx_t column_count = 0;
+    std::vector<duckdb::LogicalType> types;
+    std::vector<std::string> names;
+    std::vector<std::vector<duckdb::Value>> rows;
+};
+
 struct TestDatabase {
     TestDatabase() : db(nullptr), con(db) {
+        // DuckDB 2.0 keeps list_value and the other core functions in an
+        // extension that is no longer linked by default.
+        db.LoadStaticExtension<duckdb::CoreFunctionsExtension>();
         db.LoadStaticExtension<OracleScannerExtension>();
         // The endpoint is never contacted: the installed factory answers before
         // any transport work, so these are placeholders, not credentials.
@@ -419,12 +491,12 @@ struct TestDatabase {
             "SERVICE_NAME 'service', USER 'app_user', PASSWORD 'placeholder');");
     }
 
-    std::unique_ptr<duckdb::MaterializedQueryResult> Query(const std::string &sql) {
-        return con.Query(sql);
+    std::unique_ptr<MaterializedQueryResult> Query(const std::string &sql) {
+        return std::make_unique<MaterializedQueryResult>(con.Query(sql));
     }
 
     void Run(const std::string &sql) {
-        auto result = con.Query(sql);
+        auto result = Query(sql);
         if (result->HasError()) {
             std::cerr << "adapter test setup failed: " << result->GetError() << "\n";
             CHECK(false && "setup statement failed");
@@ -762,10 +834,12 @@ void TestNullsSurviveAboveTheScan() {
     TestDatabase database;
     const std::string scan = "oracle_query('ora', 'SELECT id, label FROM app.items')";
 
-    auto streamed = database.con.SendQuery("SELECT id, label, label IS NULL AS n FROM " + scan);
-    CHECK(!streamed->HasError());
-    CHECK(streamed->GetResultType() == duckdb::QueryResultType::STREAM_RESULT);
-    auto chunk = streamed->Fetch();
+    // Submitted and read as a stream, chunk by chunk, which is what the shell
+    // and every pipeline operator consume in DuckDB 2.0.
+    auto submitted = database.con.Submit("SELECT id, label, label IS NULL AS n FROM " + scan);
+    CHECK(!submitted->HasError());
+    duckdb::QueryResultStream<> streamed(std::move(submitted));
+    auto chunk = streamed.Fetch();
     CHECK(chunk != nullptr && chunk->size() == 3);
     CHECK(chunk->GetValue(1, 1).IsNull());
     CHECK(chunk->GetValue(2, 0).GetValue<bool>() == false);
@@ -1798,11 +1872,10 @@ struct FunctionExampleCase {
     // Statements run first, on the same connection, as the README's function
     // reference tells a reader to.
     std::vector<std::string> prerequisites;
-    std::function<void(FakeScript &, duckdb::MaterializedQueryResult &)> verify;
+    std::function<void(FakeScript &, MaterializedQueryResult &)> verify;
 };
 
 static std::map<std::string, FunctionExampleCase> FunctionExampleCases() {
-    using duckdb::MaterializedQueryResult;
     using oracle_scanner::BindDirection;
     using oracle_scanner::OracleCallableKind;
     const auto departments = [](FakeScript &script) {
@@ -2150,11 +2223,11 @@ void TestFunctionExamplesRun() {
 // registers are inspected directly, all twenty of them.
 void TestDocumentedRegistrationsAlterOnConflict() {
     std::vector<std::string> names;
-    const auto check = [&](const duckdb::CreateFunctionInfo &info, const std::string &name) {
+    const auto check = [&](const duckdb::CreateFunctionInfo &info, const duckdb::Identifier &name) {
         CHECK(info.on_conflict == duckdb::OnCreateConflict::ALTER_ON_CONFLICT);
         CHECK(info.descriptions.size() == 1 && !info.descriptions[0].description.empty() &&
               info.descriptions[0].examples.size() == 1);
-        names.push_back(name);
+        names.push_back(static_cast<const std::string &>(name));
     };
     const auto version = duckdb::OracleScannerVersionFunctionInfo();
     check(version, version.functions.name);
@@ -2174,7 +2247,7 @@ void TestDocumentedRegistrationsAlterOnConflict() {
         return duckdb::TableFunction("oracle_arguments", {duckdb::LogicalType::INTEGER}, nullptr,
                                      [](duckdb::ClientContext &, duckdb::TableFunctionBindInput &,
                                         duckdb::vector<duckdb::LogicalType> &,
-                                        duckdb::vector<std::string> &) -> duckdb::unique_ptr<duckdb::FunctionData> {
+                                        duckdb::vector<duckdb::Identifier> &) -> duckdb::unique_ptr<duckdb::FunctionData> {
                                          return nullptr;
                                      });
     };

@@ -66,7 +66,7 @@ ConnectionConfig ConnectionFromSecret(ClientContext &context, const std::string 
     const weak_ptr<ClientContext> weak_context = context.shared_from_this();
     config.connect_cancelled = [weak_context]() {
         const auto live = weak_context.lock();
-        return live && live->interrupted.load();
+        return live && live->IsInterrupted();
     };
     config.read_timeout_seconds = OptionalUInt(*secret, "read_timeout", 30);
 
