@@ -13,4 +13,4 @@ extension:
 repo:
   github: krokozyab/quack-oracle
   # The commit tagged v0.3.1, pinned by SHA so what is built cannot move.
-  ref: 70a308a1e8c7d10e3359c2b9cf08a6be553d5b78
+  ref: fc1f9e930b0dd6dfd8824c6ce6f7a6cd12daab11
