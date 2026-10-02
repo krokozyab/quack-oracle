@@ -491,7 +491,7 @@ public:
         }
         source_state.emitted = true;
         chunk.SetChildCardinality(1);
-        chunk.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(global_state.inserted_rows)));
+        chunk.data[0].SetValue(0, Value::BIGINT(NumericCast<int64_t>(global_state.inserted_rows)));
         return SourceResultType::FINISHED;
     }
 
@@ -534,7 +534,7 @@ private:
             }
             const auto row = row_chunk.size();
             for (idx_t column_index = 0; column_index < returned_columns.size(); column_index++) {
-                row_chunk.SetValue(column_index, row,
+                row_chunk.data[column_index].SetValue(row,
                                    TranslatingOracleErrors("Oracle could not convert a RETURNING value", [&] {
                                        return ValueFor(returned_columns[column_index], values[column_index].value);
                                    }));
@@ -632,7 +632,7 @@ public:
         source_state.emitted = true;
         auto &global_state = sink_state->Cast<OracleInsertGlobalState>();
         chunk.SetChildCardinality(1);
-        chunk.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(global_state.inserted_rows)));
+        chunk.data[0].SetValue(0, Value::BIGINT(NumericCast<int64_t>(global_state.inserted_rows)));
         return SourceResultType::FINISHED;
     }
 
@@ -772,7 +772,7 @@ PhysicalOperator &PlanOracleInsert(ClientContext &, PhysicalPlanGenerator &plann
             column_list += ", ";
             value_list += ", ";
         }
-        column_list += KeywordHelper::WriteQuoted(columns[position].name, '"');
+        column_list += KeywordHelper::WriteQuotedAndEscaped(columns[position].name, '"');
         value_list += ":" + std::to_string(bound_columns.size() + 1);
         source_indexes.push_back(source_index);
         bound_columns.push_back(columns[position]);
@@ -780,7 +780,7 @@ PhysicalOperator &PlanOracleInsert(ClientContext &, PhysicalPlanGenerator &plann
     if (bound_columns.empty()) {
         throw NotImplementedException("Oracle INSERT needs at least one column");
     }
-    auto sql = "INSERT INTO " + KeywordHelper::WriteQuoted(target.object_name, '"') + " (" + column_list +
+    auto sql = "INSERT INTO " + KeywordHelper::WriteQuotedAndEscaped(target.object_name, '"') + " (" + column_list +
               ") VALUES (" + value_list + ")";
     // RETURNING asks Oracle for the row it actually stored. Echoing back what
     // was sent would be wrong for exactly the cases the clause exists for: a
@@ -800,7 +800,7 @@ PhysicalOperator &PlanOracleInsert(ClientContext &, PhysicalPlanGenerator &plann
                 returned_list += ", ";
                 into_list += ", ";
             }
-            returned_list += KeywordHelper::WriteQuoted(columns[position].name, '"');
+            returned_list += KeywordHelper::WriteQuotedAndEscaped(columns[position].name, '"');
             into_list += ":r" + std::to_string(returned_columns.size() + 1);
             returned_columns.push_back(columns[position]);
         }
@@ -818,7 +818,7 @@ PhysicalOperator &PlanOracleDelete(ClientContext &, PhysicalPlanGenerator &plann
     if (op.return_chunk) {
         throw NotImplementedException("Oracle DELETE does not support RETURNING yet");
     }
-    const auto sql = "DELETE FROM " + KeywordHelper::WriteQuoted(target.object_name, '"') + " WHERE ROWID = " +
+    const auto sql = "DELETE FROM " + KeywordHelper::WriteQuotedAndEscaped(target.object_name, '"') + " WHERE ROWID = " +
                      "CHARTOROWID(:1)";
     auto &deletion = planner.Make<OracleDeleteOperator>(op.types, op.estimated_cardinality, std::move(target), sql);
     deletion.children.push_back(plan);
@@ -848,7 +848,7 @@ PhysicalOperator &PlanOracleUpdate(ClientContext &, PhysicalPlanGenerator &plann
         if (!assignments.empty()) {
             assignments += ", ";
         }
-        assignments += KeywordHelper::WriteQuoted(columns[position].name, '"') + " = ";
+        assignments += KeywordHelper::WriteQuotedAndEscaped(columns[position].name, '"') + " = ";
         if (op.expressions[index]->GetExpressionType() == ExpressionType::VALUE_DEFAULT) {
             // Oracle's own DEFAULT for the column, which is the right answer and
             // not the same as the NULL this catalog would otherwise supply: it
@@ -866,7 +866,7 @@ PhysicalOperator &PlanOracleUpdate(ClientContext &, PhysicalPlanGenerator &plann
     if (assignments.empty()) {
         throw NotImplementedException("Oracle UPDATE needs at least one column to set");
     }
-    const auto sql = "UPDATE " + KeywordHelper::WriteQuoted(target.object_name, '"') + " SET " + assignments +
+    const auto sql = "UPDATE " + KeywordHelper::WriteQuotedAndEscaped(target.object_name, '"') + " SET " + assignments +
                      " WHERE ROWID = CHARTOROWID(:" + std::to_string(set_columns.size() + 1) + ")";
     auto &update = planner.Make<OracleUpdateOperator>(op.types, op.estimated_cardinality, std::move(target), sql,
                                                       std::move(source_indexes), std::move(set_columns));

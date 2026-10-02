@@ -542,7 +542,7 @@ public:
     vector<Identifier> GetDefaultEntries() override {
         vector<Identifier> result;
         for (auto &name : state->ListObjects()) {
-            result.emplace_back(Identifier(name));
+            result.emplace_back(name);
         }
         return result;
     }
@@ -672,9 +672,9 @@ void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const 
             select_list += ORACLE_ROWID_EXPRESSION;
             continue;
         }
-        select_list += KeywordHelper::WriteQuoted(bind.columns[column_id].name, '"');
+        select_list += KeywordHelper::WriteQuotedAndEscaped(bind.columns[column_id].name, '"');
     }
-    auto sql = "SELECT " + select_list + " FROM " + KeywordHelper::WriteQuoted(bind.object_name, '"');
+    auto sql = "SELECT " + select_list + " FROM " + KeywordHelper::WriteQuotedAndEscaped(bind.object_name, '"');
     // The translated predicates, when filter pushdown is enabled and every
     // filter could be proven. An empty clause means nothing was pushed.
     if (!bind.where_clause.empty()) {

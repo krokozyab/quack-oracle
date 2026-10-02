@@ -138,7 +138,7 @@ unique_ptr<FunctionData> OracleParallelBind(ClientContext &context, TableFunctio
         if (!object.empty()) {
             object += ".";
         }
-        object += KeywordHelper::WriteQuoted(part, '"');
+        object += KeywordHelper::WriteQuotedAndEscaped(part, '"');
     }
     const auto key_parts = TranslatingOracleErrors("oracle_scan_parallel key column is invalid", [&] {
         return oracle_scanner::SplitOracleCallableName(input.inputs[2].GetValue<std::string>());
@@ -147,7 +147,7 @@ unique_ptr<FunctionData> OracleParallelBind(ClientContext &context, TableFunctio
         throw BinderException("oracle_scan_parallel takes one key column");
     }
     const auto &key_name = key_parts[0];
-    const auto key = KeywordHelper::WriteQuoted(key_name, '"');
+    const auto key = KeywordHelper::WriteQuotedAndEscaped(key_name, '"');
 
     idx_t shards = 0;
     for (const auto &parameter : input.named_parameters) {
@@ -249,7 +249,7 @@ unique_ptr<FunctionData> OracleParallelBind(ClientContext &context, TableFunctio
         if (!select_list.empty()) {
             select_list += ", ";
         }
-        select_list += KeywordHelper::WriteQuoted(column.name, '"');
+        select_list += KeywordHelper::WriteQuotedAndEscaped(column.name, '"');
     }
 
     // Ranges are half-open except the last, which closes on the maximum, so
@@ -330,7 +330,7 @@ void OracleParallelFunction(ClientContext &context, TableFunctionInput &input, D
                                   static_cast<uint64_t>(row.size()), static_cast<uint64_t>(bind.columns.size()));
             }
             for (idx_t column_index = 0; column_index < bind.columns.size(); column_index++) {
-                output.SetValue(column_index, row_index,
+                output.data[column_index].SetValue(row_index,
                                 TranslatingOracleErrors("oracle_scan_parallel could not convert an Oracle value", [&] {
                                     return ValueFor(bind.columns[column_index], row[column_index]);
                                 }));

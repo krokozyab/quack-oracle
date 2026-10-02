@@ -411,7 +411,7 @@ std::string OracleWhereClause(const TableFilterSet &filters, const std::vector<O
         const auto &column = columns[column_index];
         // A column this client cannot read cannot be reasoned about either.
         RequireReadableColumn(column);
-        const auto quoted_name = KeywordHelper::WriteQuoted(column.name, '"');
+        const auto quoted_name = KeywordHelper::WriteQuotedAndEscaped(column.name, '"');
         const auto translated = TranslateOptional(entry.Filter(), column, quoted_name);
         if (!translated) {
             continue;

@@ -563,7 +563,7 @@ unique_ptr<GlobalTableFunctionState> OracleExecuteInit(ClientContext &, TableFun
 void OracleExecuteFunction(ClientContext &, TableFunctionInput &input, DataChunk &output) {
     auto &state = input.global_state->Cast<OracleExecuteGlobalState>();
     if (!state.emitted) {
-        output.SetValue(0, 0, Value::UBIGINT(state.affected_rows));
+        output.data[0].SetValue(0, Value::UBIGINT(state.affected_rows));
         output.SetChildCardinality(1);
         state.emitted = true;
     }
@@ -712,7 +712,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallNumberArgsInit(ClientContext &, T
 void OracleCallNumberFunction(ClientContext &, TableFunctionInput &input, DataChunk &output) {
     auto &state = input.global_state->Cast<OracleCallScalarGlobalState>();
     if (!state.emitted) {
-        output.SetValue(0, 0, state.value ? Value(*state.value) : Value());
+        output.data[0].SetValue(0, state.value ? Value(*state.value) : Value());
         output.SetChildCardinality(1);
         state.emitted = true;
     }
@@ -922,7 +922,7 @@ void OracleCallFunction(ClientContext &, TableFunctionInput &input, DataChunk &o
     const auto remaining = state.handles.size() - state.next_handle;
     const auto count = std::min<idx_t>(remaining, STANDARD_VECTOR_SIZE);
     for (idx_t index = 0; index < count; index++) {
-        output.SetValue(0, index, Value(state.handles[state.next_handle + index]));
+        output.data[0].SetValue(index, Value(state.handles[state.next_handle + index]));
     }
     state.next_handle += count;
     output.SetChildCardinality(count);
@@ -1106,13 +1106,13 @@ void OracleArgumentsFunction(ClientContext &, TableFunctionInput &input, DataChu
         } else if (argument.direction == oracle_scanner::BindDirection::BIND_IN_OUT) {
             direction = "inout";
         }
-        output.SetValue(0, index, row.overload.empty() ? Value() : Value(row.overload));
-        output.SetValue(1, index, Value::INTEGER(argument.position));
-        output.SetValue(2, index, Value(argument.name));
-        output.SetValue(3, index, Value(direction));
-        output.SetValue(4, index, argument.dictionary_type.empty() ? Value() : Value(argument.dictionary_type));
-        output.SetValue(5, index, argument.bind_type_name.empty() ? Value() : Value(argument.bind_type_name));
-        output.SetValue(6, index,
+        output.data[0].SetValue(index, row.overload.empty() ? Value() : Value(row.overload));
+        output.data[1].SetValue(index, Value::INTEGER(argument.position));
+        output.data[2].SetValue(index, Value(argument.name));
+        output.data[3].SetValue(index, Value(direction));
+        output.data[4].SetValue(index, argument.dictionary_type.empty() ? Value() : Value(argument.dictionary_type));
+        output.data[5].SetValue(index, argument.bind_type_name.empty() ? Value() : Value(argument.bind_type_name));
+        output.data[6].SetValue(index,
                         argument.unsupported_reason.empty() ? Value() : Value(argument.unsupported_reason));
     }
     state.next_row += count;
@@ -1131,11 +1131,11 @@ struct OracleCallAutoBindData final : TableFunctionData {
 // caller's spelling may not have been, and a synonym has already been followed
 // to the object it names.
 std::string ResolvedCallableName(const OracleCallableSignature &signature) {
-    std::string result = KeywordHelper::WriteQuoted(signature.owner, '"');
+    std::string result = KeywordHelper::WriteQuotedAndEscaped(signature.owner, '"');
     if (!signature.package.empty()) {
-        result += "." + KeywordHelper::WriteQuoted(signature.package, '"');
+        result += "." + KeywordHelper::WriteQuotedAndEscaped(signature.package, '"');
     }
-    return result + "." + KeywordHelper::WriteQuoted(signature.object, '"');
+    return result + "." + KeywordHelper::WriteQuotedAndEscaped(signature.object, '"');
 }
 
 unique_ptr<FunctionData> OracleCallAutoBind(ClientContext &context, TableFunctionBindInput &input,
@@ -1348,9 +1348,9 @@ void OracleCallNamedFunction(ClientContext &, TableFunctionInput &input, DataChu
     const auto count = std::min<idx_t>(state.rows.size() - state.next_row, STANDARD_VECTOR_SIZE);
     for (idx_t index = 0; index < count; index++) {
         const auto &row = state.rows[state.next_row + index];
-        output.SetValue(0, index, Value(row.name));
-        output.SetValue(1, index, row.value ? Value(*row.value) : Value());
-        output.SetValue(2, index, row.cursor_handle ? Value(*row.cursor_handle) : Value());
+        output.data[0].SetValue(index, Value(row.name));
+        output.data[1].SetValue(index, row.value ? Value(*row.value) : Value());
+        output.data[2].SetValue(index, row.cursor_handle ? Value(*row.cursor_handle) : Value());
     }
     state.next_row += count;
     output.SetChildCardinality(count);
@@ -1503,7 +1503,7 @@ unique_ptr<GlobalTableFunctionState> OracleCloseCallInit(ClientContext &, TableF
 void OracleCloseCallFunction(ClientContext &, TableFunctionInput &input, DataChunk &output) {
     auto &state = input.global_state->Cast<OracleCloseCallGlobalState>();
     if (!state.emitted) {
-        output.SetValue(0, 0, Value::BOOLEAN(state.closed));
+        output.data[0].SetValue(0, Value::BOOLEAN(state.closed));
         output.SetChildCardinality(1);
         state.emitted = true;
     }
@@ -1608,7 +1608,7 @@ void OracleQueryFunction(ClientContext &, TableFunctionInput &input, DataChunk &
             throw InternalException("oracle_query row has a different column count from its describe metadata");
         }
         for (idx_t vector_index = 0; vector_index < state.chunk_columns; vector_index++) {
-            output.SetValue(vector_index, row_index,
+            output.data[vector_index].SetValue(row_index,
                             TranslatingOracleErrors("oracle_query could not convert an Oracle value", [&] {
                                 return ValueFor(state.columns[vector_index], row[vector_index]);
                             }));
