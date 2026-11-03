@@ -2026,6 +2026,73 @@ void TestAttachedCatalogAgainstAFakeSession() {
 // adapter builds, the binds it sends, and the session it sends them on. Until
 // the fake could answer a projection of a scripted table, none of this could be
 // reached without a live Oracle.
+// INSERT reads the common column types straight from DuckDB's vectors instead
+// of one Value at a time. Each bind it sends must be the one OracleBindForColumn
+// makes from the same value, which stays the statement of the conversion rules.
+void TestInsertBindsMatchTheValuePath() {
+    const auto text_columns = [](std::initializer_list<const char *> names) {
+        std::vector<OracleColumn> result;
+        for (const auto *name : names) {
+            result.push_back(Column(name, 1));
+        }
+        return result;
+    };
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {text_columns({"USER"}), {{Text("APP")}}}});
+    script->routes.push_back({"FROM user_tables", {text_columns({"TABLE_NAME"}), {{Text("T")}}}});
+    script->routes.push_back({"FROM user_views", {text_columns({"VIEW_NAME"}), {}}});
+    const auto row = [](const char *name, const char *type, const char *precision, const char *scale) {
+        return std::vector<WireValue>{Text("T"),   Text(name), Text(type), Number("22"),
+                                       precision ? Number(precision) : WireValue(),
+                                       scale ? Number(scale) : WireValue(), Text("Y")};
+    };
+    script->routes.push_back(
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {row("N", "NUMBER", "18", "0"), row("D", "NUMBER", "15", "2"), row("W", "NUMBER", "38", "10"),
+           row("S", "VARCHAR2", nullptr, nullptr), row("C", "CHAR", nullptr, nullptr),
+           row("DT", "DATE", nullptr, nullptr),
+           row("TS", "TIMESTAMP(6)", nullptr, "6"), row("BD", "BINARY_DOUBLE", nullptr, nullptr),
+           row("BF", "BINARY_FLOAT", nullptr, nullptr), row("FLAG", "BOOLEAN", nullptr, nullptr)}}});
+    script->routes.push_back({"FROM user_constraints", {text_columns({"TABLE_NAME", "COLUMN_NAME"}), {}}});
+    const std::vector<OracleColumn> columns = {Column("N", 2, 18, 0), Column("D", 2, 15, 2), Column("W", 2, 38, 10),
+                                               Column("S", 1),         Column("C", 96),        Column("DT", 12),
+                                               Column("TS", 180, 0, 6), Column("BD", 101),     Column("BF", 100),
+                                               Column("FLAG", 252)};
+    script->tables["T"] = {columns, {}};
+    script->affected_rows = 3;
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS ora (TYPE oracle_scanner);");
+
+    const std::string values =
+        "(-999999999999999999, -9999999999999.99, 1234567890123456789012345678.0123456789, 'h\xC3\xA9', 'ab', "
+        "TIMESTAMP '0001-01-01 00:00:00', TIMESTAMP '1969-12-31 23:59:59.999999', -1.5e300, 3.4e38, true), "
+        "(0, 0.01, -0.0000000001, '', ' ', TIMESTAMP '9999-12-31 23:59:59', TIMESTAMP '2024-02-29 00:00:00.5', "
+        "-0.0, -1.17e-38, false), "
+        "(NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)";
+    database.Run("INSERT INTO ora.main.T VALUES " + values + ";");
+    // The values as the attached table's own types, which is what the insert
+    // casts them to before it binds them.
+    auto typed = database.Query(
+        "SELECT N::BIGINT, D::DECIMAL(15,2), W::DECIMAL(38,10), S::VARCHAR, C::VARCHAR, DT::TIMESTAMP, TS::TIMESTAMP, "
+        "BD::DOUBLE, BF::FLOAT, FLAG::BOOLEAN FROM (VALUES " + values + ") v(N, D, W, S, C, DT, TS, BD, BF, FLAG)");
+    CHECK(!typed->HasError());
+    CHECK(script->batch_rows.size() == 3 && typed->RowCount() == 3);
+    for (duckdb::idx_t row_index = 0; row_index < 3 && script->batch_rows.size() == 3; row_index++) {
+        CHECK(script->batch_rows[row_index].size() == columns.size());
+        for (duckdb::idx_t column_index = 0; column_index < columns.size(); column_index++) {
+            const auto &actual = script->batch_rows[row_index][column_index];
+            const auto wanted = duckdb::OracleBindForColumn(typed->GetValue(column_index, row_index),
+                                                            columns[column_index], std::to_string(column_index + 1));
+            CHECK(actual.name == wanted.name && actual.oracle_type == wanted.oracle_type &&
+                  actual.character_set_form == wanted.character_set_form && actual.lob_content == wanted.lob_content &&
+                  actual.direction == wanted.direction && actual.value == wanted.value);
+        }
+    }
+}
+
 // The dictionary names a column's type in words, and the attached catalog's
 // write and filter paths work from that, not from the describe. Types it did
 // not name used to arrive as "Oracle type 0 has no mapping". These now map, so
@@ -4573,6 +4640,7 @@ int main() {
     TestAttachedCatalogAgainstAFakeSession();
     TestAttachedWritesAgainstAFakeSession();
     TestAttachedCatalogNamesTheNewTypes();
+    TestInsertBindsMatchTheValuePath();
     TestAttachToAnotherSchema();
     TestUntranslatableFiltersRunLocally();
     TestJsonAndVectorColumnsThroughSql();

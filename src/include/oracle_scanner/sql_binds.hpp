@@ -17,5 +17,10 @@ void ValidateOracleStatementBinds(const std::string &sql, const std::vector<Orac
 // the SQL placeholders, preserving each original bind name and wire value.
 std::vector<OracleBind> OrderOracleStatementBinds(const std::string &sql, const std::vector<OracleBind> &binds,
                                                   OracleBindUse use);
+// The same validation and order as OrderOracleStatementBinds, returned as the
+// index into `binds` of each placeholder in turn, so that the rows of a batch,
+// which share their names, are put in order without parsing the SQL again.
+std::vector<size_t> OracleStatementBindOrder(const std::string &sql, const std::vector<OracleBind> &binds,
+                                             OracleBindUse use);
 
 } // namespace oracle_scanner

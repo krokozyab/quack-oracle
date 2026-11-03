@@ -41,6 +41,44 @@ std::string CanonicalOracleBindName(const std::string &value) {
     return result;
 }
 
+namespace {
+
+// What every bind must satisfy on its own, apart from its name: direction,
+// buffer and value bounds. `total_value_bytes` accumulates across the binds of
+// one execution.
+void ValidateOracleBindValue(const OracleBind &bind, OracleBindUse use, size_t &total_value_bytes) {
+    if (use != OracleBindUse::CALL && bind.direction != BindDirection::BIND_IN) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle query and DML binds must be input-only");
+    }
+    if (use == OracleBindUse::CALL && bind.direction != BindDirection::BIND_IN && bind.oracle_type == 0) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle OUT bind must declare a wire type");
+    }
+    if (bind.maximum_bytes > MAX_BIND_VALUE_BYTES) {
+        throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle bind output buffer exceeds supported bounds");
+    }
+    if (bind.value && bind.lob_content != 0) {
+        // LOB content past what an ordinary bind carries goes through a
+        // temporary LOB, so it answers to the LOB bound instead and does
+        // not count toward the statement's inline budget.
+        if (bind.value->size() > TEMP_LOB_MAXIMUM_BYTES) {
+            throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle LOB value exceeds supported bounds");
+        }
+        if (bind.value->size() <= TEMP_LOB_THRESHOLD_BYTES) {
+            if (total_value_bytes > MAX_BIND_VALUE_BYTES - bind.value->size()) {
+                throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle bind values exceed supported bounds");
+            }
+            total_value_bytes += bind.value->size();
+        }
+    } else if (bind.value) {
+        if (bind.value->size() > MAX_BIND_VALUE_BYTES || total_value_bytes > MAX_BIND_VALUE_BYTES - bind.value->size()) {
+            throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle bind values exceed supported bounds");
+        }
+        total_value_bytes += bind.value->size();
+    }
+}
+
+} // namespace
+
 void ValidateOracleBinds(const std::vector<OracleBind> &binds, OracleBindUse use) {
     if (binds.size() > MAX_BIND_COUNT) {
         throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle bind count exceeds supported bounds");
@@ -51,34 +89,26 @@ void ValidateOracleBinds(const std::vector<OracleBind> &binds, OracleBindUse use
         if (!names.emplace(CanonicalOracleBindName(bind.name)).second) {
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle bind names must be unique");
         }
-        if (use != OracleBindUse::CALL && bind.direction != BindDirection::BIND_IN) {
-            throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle query and DML binds must be input-only");
+        ValidateOracleBindValue(bind, use, total_value_bytes);
+    }
+}
+
+void ValidateOracleBatchRow(const std::vector<OracleBind> &first, const std::vector<OracleBind> &row) {
+    if (row.size() != first.size()) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle DML batch rows have different bind counts");
+    }
+    size_t total_value_bytes = 0;
+    for (size_t bind_index = 0; bind_index < first.size(); bind_index++) {
+        const auto &expected = first[bind_index];
+        const auto &actual = row[bind_index];
+        // The first row's names were checked whole, so a name spelled the same
+        // needs no second look; one spelled differently must still fold to it.
+        const bool same_name = actual.name == expected.name ||
+                               CanonicalOracleBindName(actual.name) == CanonicalOracleBindName(expected.name);
+        if (!same_name || actual.oracle_type != expected.oracle_type || actual.direction != expected.direction) {
+            throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle DML batch bind metadata differs between rows");
         }
-        if (use == OracleBindUse::CALL && bind.direction != BindDirection::BIND_IN && bind.oracle_type == 0) {
-            throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle OUT bind must declare a wire type");
-        }
-        if (bind.maximum_bytes > MAX_BIND_VALUE_BYTES) {
-            throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle bind output buffer exceeds supported bounds");
-        }
-        if (bind.value && bind.lob_content != 0) {
-            // LOB content past what an ordinary bind carries goes through a
-            // temporary LOB, so it answers to the LOB bound instead and does
-            // not count toward the statement's inline budget.
-            if (bind.value->size() > TEMP_LOB_MAXIMUM_BYTES) {
-                throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle LOB value exceeds supported bounds");
-            }
-            if (bind.value->size() <= TEMP_LOB_THRESHOLD_BYTES) {
-                if (total_value_bytes > MAX_BIND_VALUE_BYTES - bind.value->size()) {
-                    throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle bind values exceed supported bounds");
-                }
-                total_value_bytes += bind.value->size();
-            }
-        } else if (bind.value) {
-            if (bind.value->size() > MAX_BIND_VALUE_BYTES || total_value_bytes > MAX_BIND_VALUE_BYTES - bind.value->size()) {
-                throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle bind values exceed supported bounds");
-            }
-            total_value_bytes += bind.value->size();
-        }
+        ValidateOracleBindValue(actual, OracleBindUse::DML, total_value_bytes);
     }
 }
 
@@ -91,18 +121,7 @@ void ValidateOracleBindBatch(const std::vector<std::vector<OracleBind>> &rows) {
     }
     ValidateOracleBinds(rows.front(), OracleBindUse::DML);
     for (size_t row_index = 1; row_index < rows.size(); row_index++) {
-        ValidateOracleBinds(rows[row_index], OracleBindUse::DML);
-        if (rows[row_index].size() != rows.front().size()) {
-            throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle DML batch rows have different bind counts");
-        }
-        for (size_t bind_index = 0; bind_index < rows.front().size(); bind_index++) {
-            const auto &expected = rows.front()[bind_index];
-            const auto &actual = rows[row_index][bind_index];
-            if (CanonicalOracleBindName(actual.name) != CanonicalOracleBindName(expected.name) ||
-                actual.oracle_type != expected.oracle_type || actual.direction != expected.direction) {
-                throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle DML batch bind metadata differs between rows");
-            }
-        }
+        ValidateOracleBatchRow(rows.front(), rows[row_index]);
     }
 }
 

@@ -120,19 +120,30 @@ void ValidateOracleStatementBinds(const std::string &sql, const std::vector<Orac
     }
 }
 
-std::vector<OracleBind> OrderOracleStatementBinds(const std::string &sql, const std::vector<OracleBind> &binds,
-                                                  OracleBindUse use) {
+std::vector<size_t> OracleStatementBindOrder(const std::string &sql, const std::vector<OracleBind> &binds,
+                                             OracleBindUse use) {
     ValidateOracleStatementBinds(sql, binds, use);
     std::unordered_map<std::string, size_t> indexes;
     indexes.reserve(binds.size());
     for (size_t index = 0; index < binds.size(); index++) {
         indexes.emplace(CanonicalOracleBindName(binds[index].name), index);
     }
-    std::vector<OracleBind> result;
+    std::vector<size_t> result;
     const auto placeholders = ExtractOracleBindPlaceholders(sql);
     result.reserve(placeholders.size());
     for (const auto &placeholder : placeholders) {
-        result.push_back(binds[indexes.at(placeholder)]);
+        result.push_back(indexes.at(placeholder));
+    }
+    return result;
+}
+
+std::vector<OracleBind> OrderOracleStatementBinds(const std::string &sql, const std::vector<OracleBind> &binds,
+                                                  OracleBindUse use) {
+    std::vector<OracleBind> result;
+    const auto order = OracleStatementBindOrder(sql, binds, use);
+    result.reserve(order.size());
+    for (const auto index : order) {
+        result.push_back(binds[index]);
     }
     return result;
 }

@@ -579,16 +579,28 @@ uint64_t NativeOracleSession::ExecuteBatch(const std::string &sql, const std::ve
                 if (use_converted) {
                     lobs.ConvertRows(converted);
                 }
-                auto ordered_first = OrderOracleStatementBinds(sql, row_at(start), OracleBindUse::DML);
+                // The SQL is parsed for its placeholders once per group; every
+                // later row has to carry the first row's names in the same places,
+                // so the same order puts it right.
+                const auto &first = row_at(start);
+                const auto order = OracleStatementBindOrder(sql, first, OracleBindUse::DML);
+                const auto ordered = [&](const std::vector<OracleBind> &row) {
+                    std::vector<OracleBind> result;
+                    result.reserve(order.size());
+                    for (const auto index : order) {
+                        result.push_back(row[index]);
+                    }
+                    return result;
+                };
                 const auto handle = statements.Open(OracleSqlKind::DML);
                 TtcExecuteBindsRequest execute;
                 execute.sequence = NextSequence();
                 execute.sql = sql;
-                execute.binds = std::move(ordered_first);
+                execute.binds = ordered(first);
                 execute.additional_iterations.reserve(end - start - 1);
                 for (size_t index = start + 1; index < end; index++) {
-                    execute.additional_iterations.push_back(
-                        OrderOracleStatementBinds(sql, row_at(index), OracleBindUse::DML));
+                    ValidateOracleBatchRow(first, row_at(index));
+                    execute.additional_iterations.push_back(ordered(row_at(index)));
                 }
                 channel->ExecuteBinds(handle, execute);
                 TtcErrorInfo completion;

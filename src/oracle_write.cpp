@@ -26,6 +26,7 @@
 #include "duckdb/main/client_context_state.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/exception/conversion_exception.hpp"
+#include "duckdb/common/types/decimal.hpp"
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
@@ -313,6 +314,9 @@ auto EncodingFor(const OracleColumn &column, FUNCTION function) -> decltype(func
 // Our own DATE and TIMESTAMP columns arrive as VARCHAR because that is how they
 // are read today, so a row copied out of Oracle and back in goes through here.
 // DuckDB's parser is ISO and NLS-independent, which is the whole point.
+oracle_scanner::OracleDateTime DateTimeFromTimestamp(timestamp_t timestamp, int64_t extra_nanoseconds,
+                                                     const OracleColumn &column);
+
 oracle_scanner::OracleDateTime DateTimeFromValue(const Value &value, const OracleColumn &column) {
     timestamp_t timestamp;
     // Oracle keeps nanoseconds and DuckDB's timestamp_t keeps microseconds, so
@@ -357,6 +361,13 @@ oracle_scanner::OracleDateTime DateTimeFromValue(const Value &value, const Oracl
         RefuseBind(column, value,
                    "only DATE, TIMESTAMP, TIMESTAMP_NS and ISO text can be written to a date or timestamp column");
     }
+    return DateTimeFromTimestamp(timestamp, extra_nanoseconds, column);
+}
+
+// The Oracle date-time of a DuckDB timestamp, plus the nanoseconds below its
+// microsecond that a TIMESTAMP_NS or ISO text carried.
+oracle_scanner::OracleDateTime DateTimeFromTimestamp(timestamp_t timestamp, int64_t extra_nanoseconds,
+                                                     const OracleColumn &column) {
     if (!timestamp.IsFinite()) {
         RefuseValue(column, "Oracle has no infinite date");
     }
@@ -486,7 +497,11 @@ std::vector<uint8_t> VectorImage(const Value &value, const OracleColumn &column)
 }
 } // namespace
 
-OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, const std::string &name) {
+namespace {
+
+// The part of a column's bind that does not depend on the value: its name, how
+// it goes on the wire, and whether it stands for a LOB.
+OracleBind OracleBindSkeleton(const OracleColumn &column, const std::string &name) {
     // A column this client cannot read is one it cannot reason about writing
     // either, and it refuses with the type named.
     RequireReadableColumn(column);
@@ -527,6 +542,13 @@ OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, c
     } else if (column.oracle_type == 113) {
         bind.lob_content = 113;
     }
+    return bind;
+}
+
+} // namespace
+
+OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, const std::string &name) {
+    auto bind = OracleBindSkeleton(column, name);
     if (value.IsNull()) {
         return bind;
     }
@@ -725,6 +747,193 @@ OracleBind OracleBindForColumn(const Value &value, const OracleColumn &column, c
     RefuseBind(column, value, "Oracle type " + std::to_string(column.oracle_type) + " cannot be written");
 }
 
+namespace {
+
+// How AppendChunkBinds reads one column: straight from the vector for the
+// pairings an attached table's own columns produce, value by value through
+// OracleBindForColumn for everything else.
+enum class ChunkBindPath { BY_VALUE, TEXT, SIGNED, UNSIGNED, DECIMAL, DATE_TIME, BINARY_DOUBLE, BINARY_FLOAT, BOOLEAN };
+
+ChunkBindPath ChunkBindPathFor(const LogicalType &type, const OracleColumn &column) {
+    const auto id = type.id();
+    switch (column.oracle_type) {
+    case 1:
+    case 96:
+        // The national form is re-encoded as UTF-16; that stays on the value path.
+        return id == LogicalTypeId::VARCHAR && column.character_set_form != 2 ? ChunkBindPath::TEXT
+                                                                              : ChunkBindPath::BY_VALUE;
+    case 2:
+        switch (id) {
+        case LogicalTypeId::TINYINT:
+        case LogicalTypeId::SMALLINT:
+        case LogicalTypeId::INTEGER:
+        case LogicalTypeId::BIGINT:
+            return ChunkBindPath::SIGNED;
+        case LogicalTypeId::UTINYINT:
+        case LogicalTypeId::USMALLINT:
+        case LogicalTypeId::UINTEGER:
+        case LogicalTypeId::UBIGINT:
+            return ChunkBindPath::UNSIGNED;
+        case LogicalTypeId::DECIMAL:
+            return ChunkBindPath::DECIMAL;
+        default:
+            return ChunkBindPath::BY_VALUE;
+        }
+    case 12:
+    case 180:
+        return id == LogicalTypeId::TIMESTAMP || id == LogicalTypeId::DATE ? ChunkBindPath::DATE_TIME
+                                                                          : ChunkBindPath::BY_VALUE;
+    case 101:
+        return id == LogicalTypeId::DOUBLE ? ChunkBindPath::BINARY_DOUBLE : ChunkBindPath::BY_VALUE;
+    case 100:
+        return id == LogicalTypeId::FLOAT ? ChunkBindPath::BINARY_FLOAT : ChunkBindPath::BY_VALUE;
+    case 252:
+        return id == LogicalTypeId::BOOLEAN ? ChunkBindPath::BOOLEAN : ChunkBindPath::BY_VALUE;
+    default:
+        return ChunkBindPath::BY_VALUE;
+    }
+}
+
+int64_t SignedAt(const Vector &vector, idx_t row) {
+    switch (vector.GetType().id()) {
+    case LogicalTypeId::TINYINT:
+        return FlatVector::GetData<int8_t>(vector)[row];
+    case LogicalTypeId::SMALLINT:
+        return FlatVector::GetData<int16_t>(vector)[row];
+    case LogicalTypeId::INTEGER:
+        return FlatVector::GetData<int32_t>(vector)[row];
+    default:
+        return FlatVector::GetData<int64_t>(vector)[row];
+    }
+}
+
+uint64_t UnsignedAt(const Vector &vector, idx_t row) {
+    switch (vector.GetType().id()) {
+    case LogicalTypeId::UTINYINT:
+        return FlatVector::GetData<uint8_t>(vector)[row];
+    case LogicalTypeId::USMALLINT:
+        return FlatVector::GetData<uint16_t>(vector)[row];
+    case LogicalTypeId::UINTEGER:
+        return FlatVector::GetData<uint32_t>(vector)[row];
+    default:
+        return FlatVector::GetData<uint64_t>(vector)[row];
+    }
+}
+
+// The decimal text DuckDB's own cast to VARCHAR gives, which is what the value
+// path hands the NUMBER codec.
+std::string DecimalTextAt(const Vector &vector, idx_t row) {
+    const auto &type = vector.GetType();
+    const auto width = DecimalType::GetWidth(type);
+    const auto scale = DecimalType::GetScale(type);
+    switch (type.InternalType()) {
+    case PhysicalType::INT16:
+        return Decimal::ToString(FlatVector::GetData<int16_t>(vector)[row], width, scale);
+    case PhysicalType::INT32:
+        return Decimal::ToString(FlatVector::GetData<int32_t>(vector)[row], width, scale);
+    case PhysicalType::INT64:
+        return Decimal::ToString(FlatVector::GetData<int64_t>(vector)[row], width, scale);
+    default:
+        return Decimal::ToString(FlatVector::GetData<hugeint_t>(vector)[row], width, scale);
+    }
+}
+
+// The binds of every row of a flat chunk, appended to `rows`. The direct paths
+// produce the same bytes OracleBindForColumn would for the same value; that
+// function stays the one statement of the conversion rules, and any pairing not
+// listed in ChunkBindPathFor goes through it.
+void AppendChunkBinds(DataChunk &chunk, const std::vector<idx_t> &source_indexes,
+                      const std::vector<OracleColumn> &columns, std::vector<std::vector<OracleBind>> &rows) {
+    const auto first_row = rows.size();
+    const auto count = chunk.size();
+    rows.resize(first_row + count);
+    for (idx_t row = 0; row < count; row++) {
+        rows[first_row + row].reserve(source_indexes.size());
+    }
+    for (idx_t column_index = 0; column_index < source_indexes.size(); column_index++) {
+        const auto &column = columns[column_index];
+        auto &vector = chunk.data[source_indexes[column_index]];
+        const auto name = std::to_string(column_index + 1);
+        const auto path = ChunkBindPathFor(vector.GetType(), column);
+        if (path == ChunkBindPath::BY_VALUE) {
+            for (idx_t row = 0; row < count; row++) {
+                rows[first_row + row].push_back(OracleBindForColumn(vector.GetValue(row), column, name));
+            }
+            continue;
+        }
+        const auto skeleton = OracleBindSkeleton(column, name);
+        const auto &validity = FlatVector::Validity(vector);
+        for (idx_t row = 0; row < count; row++) {
+            auto bind = skeleton;
+            if (validity.RowIsValid(row)) {
+                switch (path) {
+                case ChunkBindPath::TEXT: {
+                    const auto text = FlatVector::GetData<string_t>(vector)[row];
+                    // Empty text is NULL in Oracle, as on the value path.
+                    if (text.GetSize() > 0) {
+                        const auto data = reinterpret_cast<const uint8_t *>(text.GetData());
+                        bind.value = std::vector<uint8_t>(data, data + text.GetSize());
+                    }
+                    break;
+                }
+                case ChunkBindPath::SIGNED: {
+                    const auto text = std::to_string(SignedAt(vector, row));
+                    bind.value = EncodingFor(column, [&] { return oracle_scanner::EncodeOracleNumber(text); });
+                    break;
+                }
+                case ChunkBindPath::UNSIGNED: {
+                    const auto text = std::to_string(UnsignedAt(vector, row));
+                    bind.value = EncodingFor(column, [&] { return oracle_scanner::EncodeOracleNumber(text); });
+                    break;
+                }
+                case ChunkBindPath::DECIMAL: {
+                    const auto text = DecimalTextAt(vector, row);
+                    bind.value = EncodingFor(column, [&] { return oracle_scanner::EncodeOracleNumber(text); });
+                    break;
+                }
+                case ChunkBindPath::DATE_TIME: {
+                    const auto timestamp =
+                        vector.GetType().id() == LogicalTypeId::DATE
+                            ? Timestamp::FromDatetime(FlatVector::GetData<date_t>(vector)[row], dtime_t(0))
+                            : FlatVector::GetData<timestamp_t>(vector)[row];
+                    const auto date_time = DateTimeFromTimestamp(timestamp, 0, column);
+                    bind.value = EncodingFor(column, [&] {
+                        return column.oracle_type == 12 ? oracle_scanner::EncodeOracleDate(date_time)
+                                                        : oracle_scanner::EncodeOracleTimestamp(date_time, false);
+                    });
+                    break;
+                }
+                case ChunkBindPath::BINARY_DOUBLE: {
+                    const auto number = FlatVector::GetData<double>(vector)[row];
+                    if (!std::isfinite(number)) {
+                        RefuseValue(column, "Oracle BINARY_DOUBLE has no infinity in this codec");
+                    }
+                    bind.value = oracle_scanner::EncodeOracleBinaryDouble(number);
+                    break;
+                }
+                case ChunkBindPath::BINARY_FLOAT: {
+                    const auto number = FlatVector::GetData<float>(vector)[row];
+                    if (!std::isfinite(number)) {
+                        RefuseValue(column, "Oracle BINARY_FLOAT has no infinity in this codec");
+                    }
+                    bind.value = oracle_scanner::EncodeOracleBinaryFloat(number);
+                    break;
+                }
+                case ChunkBindPath::BOOLEAN:
+                    bind.value =
+                        std::vector<uint8_t> {1, static_cast<uint8_t>(FlatVector::GetData<bool>(vector)[row] ? 1 : 0)};
+                    break;
+                default:
+                    break;
+                }
+            }
+            rows[first_row + row].push_back(std::move(bind));
+        }
+    }
+}
+
+} // namespace
+
 OracleSession &TransactionSession(ClientContext &context, const OracleWriteTarget &target) {
     auto &catalog = Catalog::GetCatalog(context, Identifier(target.catalog_name));
     Transaction::Get(context, catalog);
@@ -921,16 +1130,7 @@ public:
             return SinkReturning(context, chunk, global_state);
         }
         std::vector<std::vector<OracleBind>> rows;
-        rows.reserve(chunk.size());
-        for (idx_t row_index = 0; row_index < chunk.size(); row_index++) {
-            std::vector<OracleBind> binds;
-            binds.reserve(source_indexes.size());
-            for (idx_t column_index = 0; column_index < source_indexes.size(); column_index++) {
-                binds.push_back(OracleBindForColumn(chunk.GetValue(source_indexes[column_index], row_index),
-                                                    bound_columns[column_index], std::to_string(column_index + 1)));
-            }
-            rows.push_back(std::move(binds));
-        }
+        AppendChunkBinds(chunk, source_indexes, bound_columns, rows);
         // A failed write leaves this session in a state we cannot classify from
         // here: an ORA- error and a transport failure reach the adapter as the
         // same exception. Discarding the session is the conservative reading of
