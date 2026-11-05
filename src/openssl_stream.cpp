@@ -350,7 +350,7 @@ static int WaitForSocket(int socket_fd, bool for_read, bool for_write, std::chro
         const auto milliseconds = (std::max)(int64_t {0}, (static_cast<int64_t>(left.count()) + 999) / 1000);
         pollfd entry {};
         entry.fd = socket_fd;
-        entry.events = static_cast<short>((for_read ? POLLIN : 0) | (for_write ? POLLOUT : 0));
+        entry.events = static_cast<decltype(entry.events)>((for_read ? POLLIN : 0) | (for_write ? POLLOUT : 0));
         const auto ready =
             poll(&entry, 1, static_cast<int>((std::min)(milliseconds, int64_t {(std::numeric_limits<int>::max)()})));
         if (ready >= 0 || errno != EINTR) {
