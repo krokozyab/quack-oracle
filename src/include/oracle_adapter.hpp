@@ -94,6 +94,9 @@ struct NumberMapping {
 	uint8_t scale = 0;
 };
 NumberMapping MapNumber(const OracleColumn &column);
+//! True when the column reads as a rounding of the stored value, so nothing that
+//! compares its values may be sent to Oracle; see oracle_types.cpp.
+bool OracleColumnRoundsOnRead(const OracleColumn &column);
 //! Stamps the oracle_unconstrained_number setting onto columns that have no
 //! declared precision. Called wherever a statement's or a table's columns are
 //! first described, so the type a column gets is settled once.

@@ -1607,6 +1607,11 @@ void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const 
                        std::vector<OracleColumn> &columns, bool schema_only, OracleScanOpening *opening) {
     const auto select_list = ProjectedSelectList(bind, selected);
     auto sql = "SELECT " + select_list + " FROM " + OracleObjectReference(bind.schema_name, bind.object_name);
+    if (!schema_only) {
+        // Oracle takes the sample clause before AS OF and refuses it after
+        // (ORA-00933, 19c): `t SAMPLE (10) AS OF SCN n`.
+        sql += bind.sample_clause;
+    }
     if (!bind.flashback_scn.empty()) {
         sql += " AS OF SCN " + bind.flashback_scn;
     }
@@ -1614,7 +1619,6 @@ void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const 
         // Only the describe is wanted: the shape of the columns, with no row read.
         sql += " WHERE 1 = 0";
     } else {
-        sql += bind.sample_clause;
         // The translated predicates, when filter pushdown is enabled and every
         // filter could be proven. An empty clause means nothing was pushed.
         if (!bind.where_clause.empty()) {

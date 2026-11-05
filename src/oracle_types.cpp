@@ -168,6 +168,19 @@ NumberMapping MapNumber(const OracleColumn &column) {
     return result;
 }
 
+// A NUMBER with no declared precision that the user mapped to DECIMAL or DOUBLE
+// (oracle_unconstrained_number) reads as a rounding of what Oracle stores: 1.21
+// and 1.24 both read as 1.2 under decimal(10,1). Oracle compares, groups, joins
+// and ranks the stored values, so a filter, group key, join key or sort key on
+// such a column means something different there than in DuckDB.
+bool OracleColumnRoundsOnRead(const OracleColumn &column) {
+    if (column.oracle_type != 2 || column.precision >= 1) {
+        return false;
+    }
+    const auto kind = MapNumber(column).kind;
+    return kind == NumberMapping::DECIMAL || kind == NumberMapping::DOUBLE;
+}
+
 LogicalType MappedType(const OracleColumn &column) {
     switch (column.oracle_type) {
     case 119: // JSON
@@ -411,7 +424,9 @@ Value ValueFor(const OracleColumn &column, const std::optional<std::vector<uint8
     case 180:
         return TimestampValueFor(column, oracle_scanner::DecodeOracleTimestamp(*wire));
     case 181:
-        return Value(FormatDateTime(oracle_scanner::DecodeOracleTimestamp(*wire)));
+        // Printed on the wall clock of its own offset, as Oracle prints it.
+        return Value(
+            FormatDateTime(oracle_scanner::OracleZonedWallClock(oracle_scanner::DecodeOracleTimestamp(*wire))));
     case 231: {
         // The session time zone is UTC (see the auth parameters), so this wall
         // time is the instant. DuckDB's TIMESTAMPTZ keeps microseconds.
@@ -758,6 +773,7 @@ std::string FormatCallScalar(uint16_t oracle_type, const std::vector<uint8_t> &w
         return std::string(text.begin(), text.end());
     }
     switch (oracle_type) {
+    case 181:
     case 182:
     case 183:
     case 252: {

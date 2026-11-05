@@ -663,7 +663,7 @@ To keep a copy of Oracle data in DuckDB that you control, build it explicitly:
 ```sql
 SELECT * FROM oracle_snapshot('o', 'sales_eu', 'SELECT * FROM o.main.SALES WHERE region = ''EU''');
 -- table_name | row_count | scn        | taken_at
-SELECT * FROM oracle_snapshots();                 -- every snapshot: catalog, SCN, when, rows, the query
+SELECT * FROM oracle_snapshots();                 -- every snapshot: where it is, catalog, SCN, when, rows, the query
 SELECT * FROM oracle_snapshot_refresh('sales_eu'); -- run the query again, at a new SCN
 ```
 
@@ -672,7 +672,10 @@ SELECT * FROM oracle_snapshot_refresh('sales_eu'); -- run the query again, at a 
 pushed down as usual) with every table of that catalog read `AS OF` that number, and writes the result with
 `CREATE OR REPLACE TABLE`. What it came from (catalog, SCN, time, query) is kept in the table's own comment, so
 there is no hidden state: the result is an ordinary DuckDB table you can query, index, export or `DROP`, it lives
-in the database file if you use one, and `oracle_snapshots()` finds it again by that comment. Tables of other
+in the database file if you use one, and `oracle_snapshots()` finds it again by that comment, in every attached
+database. The table is made where an unqualified `CREATE TABLE` would go (the database and schema `USE` points
+at), and a refresh rebuilds it there; `oracle_snapshot_refresh` takes `table`, `schema.table` or
+`database.schema.table`, and refuses a name that two snapshots share rather than pick one. Tables of other
 attached catalogs in the same query are read as they are now. It runs on a connection of its own, so it cannot
 be part of the transaction that asked for it; the Oracle user needs flashback on the tables. Fewer moving parts
 than a materialized view, and unlike one it never changes by itself.
@@ -1215,7 +1218,7 @@ handshake and an authentication round trip: against a cloud endpoint that was
 | `DATE` | `TIMESTAMP` | an Oracle `DATE` carries a time, so it is not a DuckDB `DATE` |
 | `TIMESTAMP(0–6)` | `TIMESTAMP` | |
 | `TIMESTAMP(7–9)` | `TIMESTAMP_NS` | |
-| `TIMESTAMP WITH TIME ZONE` | `VARCHAR` | keeps its offset, which `TIMESTAMPTZ` would drop |
+| `TIMESTAMP WITH TIME ZONE` | `VARCHAR` | keeps its offset, which `TIMESTAMPTZ` would drop; the time is on that offset's clock, as Oracle prints it (`2026-03-28 15:30:00+03:00`) |
 | `RAW` | `BLOB` | |
 | `BINARY_FLOAT`, `BINARY_DOUBLE` | `FLOAT`, `DOUBLE` | |
 | `CLOB`, `NCLOB` | `VARCHAR` | see the warning below |
@@ -1276,7 +1279,11 @@ It applies to every `NUMBER` that has no declared precision, in `oracle_query`,
 `oracle_scan_parallel` and attached tables, read when the query is bound or the
 table is first used. `'double'` and a `DECIMAL` round what does not fit — digits
 past the scale, or past 15 or 17 significant digits — which is the trade;
-a `DECIMAL` that cannot hold a value's integer digits raises instead.
+a `DECIMAL` that cannot hold a value's integer digits raises instead. Since the
+value DuckDB then holds is a rounding of the stored one, a filter, `GROUP BY` key,
+join key or `ORDER BY ... LIMIT` key on such a column is evaluated in DuckDB and not
+sent to Oracle, which would compare the stored values: under `'decimal(10,1)'`,
+1.21 and 1.24 are one group and neither is `> 1.2`.
 
 ⚠️ **LOB columns are expensive.** A `CLOB`/`BLOB` value is not in the row; the
 row carries only a pointer, and fetching the content costs extra round trips per

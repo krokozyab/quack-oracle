@@ -369,7 +369,7 @@ TtcFetchResponse TtcStatementChannel::ReceiveDecodedFetchResponse(OracleStatemen
                                     "Oracle response spans more fragments than this client will join");
             }
             const auto next = channel.Receive();
-            if (accumulated.size() > MAX_RESPONSE_BYTES - next.size()) {
+            if (next.size() > MAX_RESPONSE_BYTES || accumulated.size() > MAX_RESPONSE_BYTES - next.size()) {
                 throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED,
                                     "Oracle response exceeds the configured reassembly limit");
             }

@@ -1153,12 +1153,21 @@ void TestUnsupportedColumnTypesAreRefusedAtBind() {
     // offset, so nothing has to be assumed about a session zone.
     auto script = std::make_shared<FakeScript>();
     script->columns = {Column("v", 181)};
-    script->rows = {{oracle_scanner::EncodeOracleTimestamp({2026, 8, 20, 10, 42, 55, 0, 120, true}, true)}};
+    // The wire carries UTC beside the offset, and the value reads on the wall
+    // clock of that offset: 10:42 UTC at +02:00 is 12:42, the late evening of
+    // New Year's Eve at +01:30 is already the next year, and 01:00 UTC at
+    // -05:00 is still the previous day, the last of a non-leap February.
+    script->rows = {{oracle_scanner::EncodeOracleTimestamp({2026, 8, 20, 10, 42, 55, 0, 120, true}, true)},
+                    {oracle_scanner::EncodeOracleTimestamp({2026, 12, 31, 23, 30, 0, 500000000, 90, true}, true)},
+                    {oracle_scanner::EncodeOracleTimestamp({2026, 3, 1, 1, 0, 0, 0, -300, true}, true)}};
     auto factory = InstallFake(script);
     TestDatabase database;
     auto accepted = database.Query("SELECT * FROM oracle_query('ora', 'SELECT v FROM app.items')");
     CHECK(!accepted->HasError());
-    CHECK(accepted->GetValue(0, 0).ToString().find("+02:00") != std::string::npos);
+    CHECK(accepted->RowCount() == 3);
+    CHECK(accepted->GetValue(0, 0).ToString() == "2026-08-20 12:42:55+02:00");
+    CHECK(accepted->GetValue(0, 1).ToString() == "2027-01-01 01:00:00.500000000+01:30");
+    CHECK(accepted->GetValue(0, 2).ToString() == "2026-02-28 20:00:00-05:00");
 }
 
 // BOOLEAN (type 252, one byte) and TIMESTAMP WITH LOCAL TIME ZONE (type 231, a
@@ -2501,6 +2510,13 @@ void TestHeavyColumnsAreReadAfterTheFilter() {
         pinned += query.find("FROM \"DOCS\" AS OF SCN 100") != std::string::npos ? 1 : 0;
     }
     CHECK(pinned == 2);
+    // A sample is read at that change number too. It used to drop it, so the
+    // statement read now instead of at the moment it promised. Oracle takes the
+    // sample clause only ahead of AS OF.
+    script->queries.clear();
+    CHECK(!database.Query("SELECT count(*) FROM ora.main.DOCS TABLESAMPLE SYSTEM (10%) REPEATABLE (3);")->HasError());
+    CHECK(!script->queries.empty() &&
+          script->queries.back().find("FROM \"DOCS\" SAMPLE (10.000000) SEED (3) AS OF SCN 100") != std::string::npos);
     database.Run("SET oracle_consistent_read = false;");
     std::cout << "heavy columns are read after the filter" << std::endl;
 }
@@ -3446,6 +3462,125 @@ static std::vector<WireRow> QuackDemoAddDictionary() {
     return {row("0", "", "OUT"), row("1", "P_A", "IN"), row("2", "P_B", "IN")};
 }
 
+// An attached catalog with one table, QUACK_DEMO_DEPARTMENTS, and a change
+// number to read it at: what oracle_snapshot needs from Oracle.
+static void AddSnapshotRoutes(FakeScript &script) {
+    script.routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+    script.routes.push_back({"dbms_flashback", {{Column("SCN", 2)}, {{Number("4242")}}}});
+    script.routes.push_back({"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("QUACK_DEMO_DEPARTMENTS")}}}});
+    script.routes.push_back({"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}});
+    script.routes.push_back(
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {{Text("QUACK_DEMO_DEPARTMENTS"), Text("DEPARTMENT_ID"), Text("NUMBER"), Number("22"), Number("6"), Number("0"), Text("Y")}}}});
+    script.routes.push_back({"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}});
+    script.tables["QUACK_DEMO_DEPARTMENTS"] = {{Column("DEPARTMENT_ID", 2, 6, 0)}, {{Number("20")}, {Number("30")}, {Number("40")}}};
+}
+
+// oracle_snapshots lists tables from every attached database, and a refresh
+// used to rebuild the snapshot by schema and table name alone, in the default
+// database. A snapshot in an attached database file then replaced an ordinary
+// table of the same name in the default one and left itself as it was. The
+// snapshot is made where this session's USE points, refreshed where it is, and
+// a name two snapshots share is refused rather than guessed.
+void TestSnapshotRefreshStaysInItsDatabase() {
+    auto script = std::make_shared<FakeScript>();
+    AddSnapshotRoutes(*script);
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS ora (TYPE oracle_scanner);");
+    database.Run("ATTACH ':memory:' AS other;");
+    const std::string make =
+        "SELECT * FROM oracle_snapshot('ora', 'snap', 'SELECT * FROM ora.main.QUACK_DEMO_DEPARTMENTS');";
+    database.Run("USE other;");
+    database.Run(make);
+    database.Run("USE memory;");
+    // The first value of a query, or its error, so a check fails by saying so.
+    const auto scalar = [&database](const std::string &sql) {
+        auto result = database.Query(sql);
+        if (result->HasError()) {
+            return "error: " + result->GetError();
+        }
+        return result->RowCount() == 0 ? std::string("no rows") : result->GetValue(0, 0).ToString();
+    };
+    CHECK(scalar("SELECT count(*) FROM other.main.snap") == "3");
+    CHECK(scalar("SELECT count(*) FROM duckdb_tables() WHERE database_name = 'memory' AND table_name = 'snap'") == "0");
+
+    database.Run("CREATE TABLE snap AS SELECT 'mine' AS v;");
+    auto listed = database.Query("SELECT database_name, schema_name, table_name FROM oracle_snapshots()");
+    CHECK(!listed->HasError() && listed->RowCount() == 1 && listed->GetValue(0, 0).ToString() == "other" &&
+          listed->GetValue(1, 0).ToString() == "main" && listed->GetValue(2, 0).ToString() == "snap");
+    auto refreshed = database.Query("SELECT * FROM oracle_snapshot_refresh('snap')");
+    CHECK(!refreshed->HasError() && refreshed->RowCount() == 1);
+    CHECK(scalar("SELECT v FROM memory.main.snap") == "mine");
+    CHECK(scalar("SELECT count(*) FROM other.main.snap") == "3");
+
+    // A second snapshot of the same name, in the default database, makes the
+    // bare name ambiguous; the qualified one still names exactly one table.
+    database.Run("DROP TABLE memory.main.snap;");
+    database.Run(make);
+    auto ambiguous = database.Query("SELECT * FROM oracle_snapshot_refresh('snap')");
+    CHECK(ambiguous->HasError() && ambiguous->GetError().find("more than one") != std::string::npos &&
+          ambiguous->GetError().find("other.main.snap") != std::string::npos);
+    CHECK(!database.Query("SELECT * FROM oracle_snapshot_refresh('other.main.snap')")->HasError());
+    CHECK(!database.Query("SELECT * FROM oracle_snapshot_refresh('memory.main.snap')")->HasError());
+    std::cout << "a snapshot refresh rebuilds its own table and no other" << std::endl;
+}
+
+// A NUMBER with no declared precision under oracle_unconstrained_number =
+// 'decimal(10,1)' reads 1.21 and 1.24 as 1.2. Oracle compares the stored values,
+// so a group key, a filter, a join key or a sort key on it sent to Oracle gave a
+// different answer from the one DuckDB gives over what it read: GROUP BY x made
+// two groups of 1.2, and x > 1.2 kept both rows. All of it now stays in DuckDB,
+// and a column with a declared precision is still sent.
+void TestRoundedNumberIsComparedInDuckDb() {
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+    script->routes.push_back({"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("R")}}}});
+    script->routes.push_back({"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}});
+    script->routes.push_back(
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {{Text("R"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("Y")},
+           {Text("R"), Text("X"), Text("NUMBER"), Number("22"), WireValue(), WireValue(), Text("Y")}}}});
+    script->routes.push_back({"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}});
+    script->tables["R"] = {{Column("ID", 2, 10, 0), Column("X", 2)},
+                           {{Number("1"), Number("1.21")}, {Number("2"), Number("1.24")}, {Number("3"), Number("2")}}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("SET oracle_unconstrained_number = 'decimal(10,1)';");
+    database.Run("SET oracle_aggregate_pushdown = true;");
+    database.Run("SET oracle_join_pushdown = true;");
+    database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner);");
+
+    auto grouped = database.Query("SELECT X, count(*) FROM o.main.R GROUP BY X ORDER BY X;");
+    CHECK(!grouped->HasError() && grouped->RowCount() == 2);
+    CHECK(grouped->GetValue(0, 0).ToString() == "1.2" && grouped->GetValue(1, 0).ToString() == "2");
+    CHECK(script->queries.back().find("GROUP BY") == std::string::npos);
+
+    auto filtered = database.Query("SELECT count(*) FROM o.main.R WHERE X > 1.2;");
+    CHECK(!filtered->HasError() && filtered->GetValue(0, 0).ToString() == "1");
+    CHECK(script->queries.back().find("WHERE") == std::string::npos);
+
+    // Ranked by the rounded value, the two 1.2 rows tie and ID decides.
+    auto ranked = database.Query("SELECT ID FROM o.main.R ORDER BY X, ID DESC LIMIT 1;");
+    CHECK(!ranked->HasError() && ranked->GetValue(0, 0).ToString() == "2");
+    CHECK(script->queries.back().find("FETCH FIRST") == std::string::npos);
+
+    auto joined = database.Query("SELECT count(*) FROM o.main.R a JOIN o.main.R b ON a.X = b.X;");
+    CHECK(!joined->HasError() && joined->GetValue(0, 0).ToString() == "5");
+    for (const auto &query : script->queries) {
+        CHECK(query.find("a.\"X\"") == std::string::npos);
+    }
+
+    // The declared column is exact, and its filter still goes to Oracle.
+    CHECK(!database.Query("SELECT ID FROM o.main.R WHERE ID > 1;")->HasError());
+    CHECK(script->queries.back().find("WHERE \"ID\" > 1") != std::string::npos);
+    std::cout << "a rounded NUMBER is compared in DuckDB, not in Oracle" << std::endl;
+}
+
 static std::string Decoded(const std::optional<std::vector<uint8_t>> &wire) {
     CHECK(wire.has_value());
     return std::string(wire->begin(), wire->end());
@@ -3614,19 +3749,7 @@ static std::map<std::string, FunctionExampleCase> FunctionExampleCases() {
             CHECK(result.RowCount() == 1 && result.GetValue(0, 0).ToString() == "n" &&
                   result.GetValue(1, 0).ToString() == "2");
         }};
-    const auto snapshot_setup = [](FakeScript &script) {
-        script.routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
-        script.routes.push_back({"dbms_flashback", {{Column("SCN", 2)}, {{Number("4242")}}}});
-        script.routes.push_back({"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("QUACK_DEMO_DEPARTMENTS")}}}});
-        script.routes.push_back({"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}});
-        script.routes.push_back(
-            {"FROM user_tab_columns",
-             {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
-               Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
-              {{Text("QUACK_DEMO_DEPARTMENTS"), Text("DEPARTMENT_ID"), Text("NUMBER"), Number("22"), Number("6"), Number("0"), Text("Y")}}}});
-        script.routes.push_back({"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}});
-        script.tables["QUACK_DEMO_DEPARTMENTS"] = {{Column("DEPARTMENT_ID", 2, 6, 0)}, {{Number("20")}, {Number("30")}, {Number("40")}}};
-    };
+    const auto snapshot_setup = [](FakeScript &script) { AddSnapshotRoutes(script); };
     const std::string snapshot_attach = "ATTACH 'demo' AS ora (TYPE oracle_scanner);";
     const std::string snapshot_made =
         "SELECT * FROM oracle_snapshot('ora', 'departments_snapshot', 'SELECT * FROM ora.main.QUACK_DEMO_DEPARTMENTS WHERE department_id > 10');";
@@ -3647,8 +3770,10 @@ static std::map<std::string, FunctionExampleCase> FunctionExampleCases() {
                                         }};
     cases["oracle_snapshots"] = {snapshot_setup, {snapshot_attach, snapshot_made},
                                  [](FakeScript &, MaterializedQueryResult &result) {
-                                     CHECK(result.RowCount() == 1 && result.GetValue(1, 0).ToString() == "departments_snapshot" &&
-                                           result.GetValue(2, 0).ToString() == "ora" && result.GetValue(3, 0).ToString() == "4242");
+                                     CHECK(result.RowCount() == 1 && result.GetValue(0, 0).ToString() == "memory" &&
+                                           result.GetValue(2, 0).ToString() == "departments_snapshot" &&
+                                           result.GetValue(3, 0).ToString() == "ora" &&
+                                           result.GetValue(4, 0).ToString() == "4242");
                                  }};
     cases["oracle_vector_search"] = {
         [](FakeScript &script) {
@@ -4660,6 +4785,8 @@ int main() {
     TestDsnSecretReachesTheSession();
     TestFailedStatementIsNotReplayed();
     TestFunctionExamplesRun();
+    TestSnapshotRefreshStaysInItsDatabase();
+    TestRoundedNumberIsComparedInDuckDb();
     TestDocumentedRegistrationsAlterOnConflict();
     std::cout << "oracle_scanner adapter tests passed\n";
     return 0;

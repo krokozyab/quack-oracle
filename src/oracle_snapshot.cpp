@@ -8,8 +8,12 @@
 
 #include "duckdb.hpp"
 
+#include "duckdb/catalog/catalog_search_path.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/main/client_data.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/database_manager.hpp"
 
 namespace duckdb {
 
@@ -18,6 +22,7 @@ namespace {
 constexpr const char *SNAPSHOT_MARK = "oracle_snapshot\n";
 
 struct SnapshotInfo {
+    std::string database;
     std::string schema;
     std::string name;
     std::string catalog;
@@ -41,6 +46,10 @@ struct SnapshotBindData final : TableFunctionData {
 
 std::string QuotedName(const std::string &name) {
     return KeywordHelper::WriteQuotedAndEscaped(name, '"');
+}
+
+std::string QualifiedName(const std::string &database, const std::string &schema, const std::string &name) {
+    return QuotedName(database) + "." + QuotedName(schema) + "." + QuotedName(name);
 }
 
 std::string Comment(const SnapshotInfo &info) {
@@ -150,20 +159,22 @@ SnapshotInfo CreateSnapshot(ClientContext &context, const std::string &catalog, 
 
 std::vector<SnapshotInfo> ListSnapshots(ClientContext &context) {
     Connection connection(*context.db);
-    auto result = Run(connection, "SELECT schema_name, table_name, comment, estimated_size FROM duckdb_tables() "
-                                   "WHERE comment LIKE 'oracle_snapshot%' ORDER BY schema_name, table_name");
+    auto result = Run(connection, "SELECT database_name, schema_name, table_name, comment, estimated_size "
+                                   "FROM duckdb_tables() WHERE comment LIKE 'oracle_snapshot%' "
+                                   "ORDER BY database_name, schema_name, table_name");
     if (result.HasError()) {
         throw IOException("oracle_snapshots could not list tables: %s", result.error);
     }
     std::vector<SnapshotInfo> infos;
     for (idx_t row = 0; row < result.RowCount(); row++) {
         SnapshotInfo info;
-        if (!ParseComment(result.GetValue(2, row).ToString(), info)) {
+        if (!ParseComment(result.GetValue(3, row).ToString(), info)) {
             continue;
         }
-        info.schema = result.GetValue(0, row).ToString();
-        info.name = result.GetValue(1, row).ToString();
-        info.rows = result.GetValue(3, row).IsNull() ? 0 : result.GetValue(3, row).GetValue<int64_t>();
+        info.database = result.GetValue(0, row).ToString();
+        info.schema = result.GetValue(1, row).ToString();
+        info.name = result.GetValue(2, row).ToString();
+        info.rows = result.GetValue(4, row).IsNull() ? 0 : result.GetValue(4, row).GetValue<int64_t>();
         infos.push_back(std::move(info));
     }
     return infos;
@@ -194,17 +205,46 @@ unique_ptr<GlobalTableFunctionState> SnapshotInit(ClientContext &context, TableF
     const auto &bind = input.bind_data->Cast<SnapshotBindData>();
     auto state = make_uniq<SnapshotGlobalState>();
     if (!bind.refresh) {
-        state->rows.push_back(CreateSnapshot(context, bind.catalog, bind.name, QuotedName(bind.name), bind.source));
+        // The table goes where an unqualified CREATE TABLE in this session would
+        // put it. The snapshot runs on a connection of its own, whose default is
+        // the instance's first database rather than this session's USE.
+        const auto &target = ClientData::Get(context).catalog_search_path->GetDefault();
+        auto database = target.GetCatalog().GetIdentifierName();
+        if (database.empty()) {
+            database = DatabaseManager::GetDefaultDatabase(context).GetIdentifierName();
+        }
+        state->rows.push_back(CreateSnapshot(context, bind.catalog, bind.name,
+                                             QualifiedName(database, target.GetSchema().GetIdentifierName(), bind.name),
+                                             bind.source));
         return std::move(state);
     }
-    for (const auto &info : ListSnapshots(context)) {
-        if (info.name == bind.name) {
-            state->rows.push_back(CreateSnapshot(context, info.catalog, info.name,
-                                                 QuotedName(info.schema) + "." + QuotedName(info.name), info.source));
-            return std::move(state);
+    // Snapshots are listed from every attached database, so a bare name can
+    // match more than one table; a refresh must rebuild the one it found and
+    // no other, so the match keeps its database and an ambiguous name is refused.
+    std::vector<SnapshotInfo> matches;
+    for (auto &info : ListSnapshots(context)) {
+        if (StringUtil::CIEquals(bind.name, info.name) ||
+            StringUtil::CIEquals(bind.name, info.schema + "." + info.name) ||
+            StringUtil::CIEquals(bind.name, info.database + "." + info.schema + "." + info.name)) {
+            matches.push_back(std::move(info));
         }
     }
-    throw InvalidInputException("'%s' is not a table made by oracle_snapshot", bind.name);
+    if (matches.empty()) {
+        throw InvalidInputException("'%s' is not a table made by oracle_snapshot", bind.name);
+    }
+    if (matches.size() > 1) {
+        std::string candidates;
+        for (const auto &match : matches) {
+            candidates += (candidates.empty() ? "" : ", ") + match.database + "." + match.schema + "." + match.name;
+        }
+        throw InvalidInputException("'%s' names more than one oracle_snapshot table (%s); name it as "
+                                    "database.schema.table",
+                                    bind.name, candidates);
+    }
+    const auto &info = matches.front();
+    state->rows.push_back(CreateSnapshot(context, info.catalog, info.name,
+                                         QualifiedName(info.database, info.schema, info.name), info.source));
+    return std::move(state);
 }
 
 unique_ptr<GlobalTableFunctionState> SnapshotListInit(ClientContext &context, TableFunctionInitInput &) {
@@ -215,9 +255,9 @@ unique_ptr<GlobalTableFunctionState> SnapshotListInit(ClientContext &context, Ta
 
 unique_ptr<FunctionData> SnapshotListBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
                                           vector<Identifier> &names) {
-    names = {"schema_name", "table_name", "catalog", "scn", "taken_at", "row_count", "source"};
+    names = {"database_name", "schema_name", "table_name", "catalog", "scn", "taken_at", "row_count", "source"};
     return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-                    LogicalType::TIMESTAMP, LogicalType::BIGINT, LogicalType::VARCHAR};
+                    LogicalType::VARCHAR, LogicalType::TIMESTAMP, LogicalType::BIGINT, LogicalType::VARCHAR};
     return make_uniq<TableFunctionData>();
 }
 
@@ -234,13 +274,14 @@ void SnapshotFunction(ClientContext &, TableFunctionInput &input, DataChunk &out
             output.data[2].SetValue(count, Value(row.scn));
             output.data[3].SetValue(count, Value::TIMESTAMP(taken));
         } else {
-            output.data[0].SetValue(count, Value(row.schema));
-            output.data[1].SetValue(count, Value(row.name));
-            output.data[2].SetValue(count, Value(row.catalog));
-            output.data[3].SetValue(count, Value(row.scn));
-            output.data[4].SetValue(count, Value::TIMESTAMP(taken));
-            output.data[5].SetValue(count, Value::BIGINT(row.rows));
-            output.data[6].SetValue(count, Value(row.source));
+            output.data[0].SetValue(count, Value(row.database));
+            output.data[1].SetValue(count, Value(row.schema));
+            output.data[2].SetValue(count, Value(row.name));
+            output.data[3].SetValue(count, Value(row.catalog));
+            output.data[4].SetValue(count, Value(row.scn));
+            output.data[5].SetValue(count, Value::TIMESTAMP(taken));
+            output.data[6].SetValue(count, Value::BIGINT(row.rows));
+            output.data[7].SetValue(count, Value(row.source));
         }
         count++;
     }
@@ -271,7 +312,8 @@ vector<CreateTableFunctionInfo> OracleSnapshotFunctionInfos() {
     infos.push_back(DocumentedTableFunctionInfo(
         std::move(list),
         {{},
-         "Lists the local tables made by oracle_snapshot: the catalog, the SCN, when it was taken, the row count and the query.",
+         "Lists the local tables made by oracle_snapshot, in every attached database: where each is, the "
+         "catalog, the SCN, when it was taken, the row count and the query.",
          "SELECT * FROM oracle_snapshots();", {"oracle", "snapshot"}}));
     return infos;
 }

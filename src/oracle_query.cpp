@@ -2856,7 +2856,8 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
     // every run, since a prepared statement keeps its bind data.
     const auto query_scn = OracleQuerySnapshot(context, bind);
     bind.sample_clause = OracleSampleClause(input.sample_options.get(), bind.estimated_rows);
-    bind.flashback_scn = bind.sample_clause.empty() ? query_scn : std::string();
+    // A sample reads at that moment too: the SQL puts SAMPLE ahead of AS OF.
+    bind.flashback_scn = query_scn;
     // A Top-N the optimizer found over this scan is applied by Oracle only when
     // every filter went to Oracle too: a filter DuckDB applies afterwards would
     // see the first n rows instead of the first n that pass it.

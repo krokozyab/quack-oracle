@@ -38,6 +38,11 @@ namespace {
 constexpr idx_t MAX_PUSHED_TOP_N = 100000;
 
 bool OrderableInOracle(const OracleColumn &column) {
+	if (OracleColumnRoundsOnRead(column)) {
+		// Oracle would rank the stored values, and a later sort key can then
+		// order rows differently from the rounded values DuckDB sorts.
+		return false;
+	}
 	switch (MappedType(column).id()) {
 	case LogicalTypeId::BIGINT:
 	case LogicalTypeId::DECIMAL:
@@ -217,7 +222,7 @@ bool PlanPushedAggregate(ClientContext &context, LogicalAggregate &aggregate, Lo
 		}
 		const auto &source = bind.columns[column];
 		const auto type = MappedType(source);
-		if (!KeyType(type) || type != group->GetReturnType()) {
+		if (!KeyType(type) || type != group->GetReturnType() || OracleColumnRoundsOnRead(source)) {
 			return false;
 		}
 		add(Quoted(source), source, type, type);
@@ -501,7 +506,9 @@ void PushJoin(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &op, C
 			return;
 		}
 		const auto left_type = MappedType(sides[0].bind->columns[left]);
-		if (!KeyType(left_type) || left_type != MappedType(sides[1].bind->columns[right])) {
+		if (!KeyType(left_type) || left_type != MappedType(sides[1].bind->columns[right]) ||
+		    OracleColumnRoundsOnRead(sides[0].bind->columns[left]) ||
+		    OracleColumnRoundsOnRead(sides[1].bind->columns[right])) {
 			return;
 		}
 		conditions.push_back({Select(sides[0], left), Select(sides[1], right), comparison});

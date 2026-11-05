@@ -423,11 +423,13 @@ private:
         if (!vector.sparse) {
             return elements(",");
         }
+        // [dimensions,[indices],[values]]
         std::string indices = "[";
         for (size_t index = 0; index < vector.indices.size(); index++) {
             indices += (index == 0 ? "" : ",") + std::to_string(vector.indices[index]);
         }
-        return "[" + std::to_string(vector.dimensions) + "," + indices + "]," + elements(",") + "]";
+        indices += "]";
+        return "[" + std::to_string(vector.dimensions) + "," + indices + "," + elements(",") + "]";
     }
 
     static std::string Pad(int64_t value, int width) {
@@ -448,45 +450,10 @@ private:
                ":" + Pad(value.minute, 2) + ":" + Pad(value.second, 2) + (fraction ? FractionText(value.nanosecond) : "");
     }
 
-    static int64_t DaysFromCivil(int64_t year, int64_t month, int64_t day) {
-        year -= month <= 2 ? 1 : 0;
-        const int64_t era = (year >= 0 ? year : year - 399) / 400;
-        const int64_t year_of_era = year - era * 400;
-        const int64_t day_of_year = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
-        const int64_t day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-        return era * 146097 + day_of_era - 719468;
-    }
-
-    static void CivilFromDays(int64_t days, OracleDateTime &value) {
-        days += 719468;
-        const int64_t era = (days >= 0 ? days : days - 146096) / 146097;
-        const int64_t day_of_era = days - era * 146097;
-        const int64_t year_of_era =
-            (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
-        const int64_t day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-        const int64_t month_index = (5 * day_of_year + 2) / 153;
-        const int64_t month = month_index < 10 ? month_index + 3 : month_index - 9;
-        value.day = static_cast<uint8_t>(day_of_year - (153 * month_index + 2) / 5 + 1);
-        value.month = static_cast<uint8_t>(month);
-        value.year = static_cast<int32_t>(year_of_era + era * 400 + (month <= 2 ? 1 : 0));
-    }
-
     // A TIMESTAMP WITH TIME ZONE is stored as UTC plus the zone's offset, and
     // printed in the zone it was written in.
     static std::string ZonedText(OracleDateTime value) {
-        int64_t minutes = static_cast<int64_t>(value.hour) * 60 + value.minute + value.offset_minutes;
-        int64_t days = DaysFromCivil(value.year, value.month, value.day);
-        while (minutes < 0) {
-            minutes += 1440;
-            days--;
-        }
-        while (minutes >= 1440) {
-            minutes -= 1440;
-            days++;
-        }
-        value.hour = static_cast<uint8_t>(minutes / 60);
-        value.minute = static_cast<uint8_t>(minutes % 60);
-        CivilFromDays(days, value);
+        value = OracleZonedWallClock(value);
         const int offset = value.offset_minutes;
         const int magnitude = offset < 0 ? -offset : offset;
         return DateTimeText(value, true) + (offset < 0 ? "-" : "+") + Pad(magnitude / 60, 2) + ":" + Pad(magnitude % 60, 2);

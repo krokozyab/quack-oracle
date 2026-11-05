@@ -24,6 +24,13 @@ OracleDateTime DecodeOracleDate(const std::vector<uint8_t> &wire);
 std::vector<uint8_t> EncodeOracleTimestamp(const OracleDateTime &value, bool with_time_zone);
 OracleDateTime DecodeOracleTimestamp(const std::vector<uint8_t> &wire);
 
+// A TIMESTAMP WITH TIME ZONE carries its date and time as UTC with the offset
+// beside them (captured from 19c: 05:06:07 at +04:00 arrives as 01:06:07), so
+// the decoded fields are UTC. This is the same instant on the wall clock of
+// that offset, which is how Oracle prints it. A value with no offset is
+// returned unchanged.
+OracleDateTime OracleZonedWallClock(const OracleDateTime &utc);
+
 std::vector<uint8_t> EncodeOracleBinaryFloat(float value);
 std::vector<uint8_t> EncodeOracleBinaryDouble(double value);
 float DecodeOracleBinaryFloat(const std::vector<uint8_t> &wire);

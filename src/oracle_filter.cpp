@@ -228,6 +228,11 @@ std::string OracleLiteral(const Value &constant, const OracleColumn &column) {
         if (column.oracle_type != 2) {
             Refuse("a numeric constant compared against a column that is not NUMBER");
         }
+        if (OracleColumnRoundsOnRead(column)) {
+            // DuckDB compares the rounded value it read and Oracle the stored
+            // one: under decimal(10,1), 1.21 > 1.2 holds there and not here.
+            Refuse("a comparison on a NUMBER that oracle_unconstrained_number rounds when it is read");
+        }
         return constant.ToString();
     case LogicalTypeId::TIMESTAMP:
     case LogicalTypeId::TIMESTAMP_NS: {

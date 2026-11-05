@@ -15,7 +15,11 @@
 
 #if !defined(_WIN32)
 #include <arpa/inet.h>
+#include <csignal>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <pthread.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -2050,6 +2054,21 @@ static void TestValueCodecs() {
     CHECK(timestamp.nanosecond == value.nanosecond);
     CHECK(timestamp.offset_minutes == value.offset_minutes);
 
+    // The decoded fields are UTC; the wall clock adds the offset back, across
+    // a day, a month, a year and a leap day, in both directions.
+    const auto wall = [](OracleDateTime utc) {
+        const auto local = OracleZonedWallClock(utc);
+        return std::to_string(local.year) + "-" + std::to_string(local.month) + "-" + std::to_string(local.day) + " " +
+               std::to_string(local.hour) + ":" + std::to_string(local.minute) + ":" + std::to_string(local.second);
+    };
+    CHECK(wall(timestamp) == "2026-8-18 16:34:56");
+    CHECK(wall({2026, 12, 31, 23, 30, 0, 0, 90, true}) == "2027-1-1 1:0:0");
+    CHECK(wall({2024, 3, 1, 2, 15, 0, 0, -180, true}) == "2024-2-29 23:15:0");
+    CHECK(wall({2025, 1, 1, 0, 0, 0, 0, -1, true}) == "2024-12-31 23:59:0");
+    CHECK(wall({2026, 4, 30, 21, 45, 9, 0, 135, true}) == "2026-5-1 0:0:9");
+    // Without an offset there is nothing to add, and nothing is.
+    CHECK(wall({2026, 4, 30, 21, 45, 9, 0, 0, false}) == "2026-4-30 21:45:9");
+
     for (auto input : {0.0, -0.0, 1.25, -18.5, std::numeric_limits<double>::infinity()}) {
         auto decoded = DecodeOracleBinaryDouble(EncodeOracleBinaryDouble(input));
         CHECK(decoded == input);
@@ -3655,6 +3674,109 @@ static void TestWriteToClosedPeerDoesNotKillTheProcess() {
     CHECK(reported);
     (void)reported;
     stream->Close();
+}
+
+static void IgnoreSignal(int) {
+}
+
+// A read waits for the server, and two ordinary things must not end that wait
+// early. A signal that interrupts it (a profiler, a terminal resize, a language
+// runtime) is not a timeout: the wait used to report one, and the statement and
+// its session were lost. And a process holding many files hands out descriptors
+// past FD_SETSIZE, where select() cannot wait at all and FD_SET writes past the
+// end of its set. Here the socket's descriptor is pushed past 1100 and the
+// reading thread is signalled, without SA_RESTART, while the reply is late.
+static void TestReadWaitsThroughSignalsAndHighDescriptors() {
+    rlimit limit {};
+    CHECK(getrlimit(RLIMIT_NOFILE, &limit) == 0);
+    const rlim_t wanted = 1200;
+    if (limit.rlim_cur < wanted && (limit.rlim_max == RLIM_INFINITY || limit.rlim_max >= wanted)) {
+        limit.rlim_cur = wanted;
+        CHECK(setrlimit(RLIMIT_NOFILE, &limit) == 0);
+    }
+    std::vector<int> filler;
+    const int null_file = open("/dev/null", O_RDONLY);
+    CHECK(null_file >= 0);
+    while (true) {
+        const int duplicate = dup(null_file);
+        if (duplicate < 0 || duplicate >= 1100) {
+            if (duplicate >= 0) {
+                close(duplicate);
+            }
+            break;
+        }
+        filler.push_back(duplicate);
+    }
+
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(listener >= 0);
+    sockaddr_in address {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK(bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0);
+    CHECK(listen(listener, 1) == 0);
+    socklen_t address_size = sizeof(address);
+    CHECK(getsockname(listener, reinterpret_cast<sockaddr *>(&address), &address_size) == 0);
+    const auto port = ntohs(address.sin_port);
+
+    // Answers one byte, late.
+    std::atomic<bool> finished {false};
+    std::thread server([listener, &finished] {
+        const auto accepted = accept(listener, nullptr, nullptr);
+        if (accepted < 0) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        const uint8_t reply = 0x2a;
+        (void)send(accepted, &reply, 1, 0);
+        while (!finished.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        close(accepted);
+    });
+
+    auto stream = OpenSslByteStream::Connect("127.0.0.1", port, 5, 5, false);
+    CHECK(stream != nullptr);
+    const bool high_descriptor = !filler.empty() && filler.back() >= 1099;
+    if (!high_descriptor) {
+        std::fprintf(stderr, "note: descriptor limit too low to place the socket past FD_SETSIZE; signals only\n");
+    }
+
+    struct sigaction action {};
+    struct sigaction previous {};
+    action.sa_handler = IgnoreSignal;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+    CHECK(sigaction(SIGUSR1, &action, &previous) == 0);
+    const auto reader = pthread_self();
+    std::thread signaller([reader] {
+        for (int round = 0; round < 6; round++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            pthread_kill(reader, SIGUSR1);
+        }
+    });
+
+    uint8_t received = 0;
+    size_t count = 0;
+    std::string failure;
+    try {
+        count = stream->Read(&received, 1);
+    } catch (const ProtocolError &error) {
+        failure = error.what();
+    }
+    signaller.join();
+    CHECK(failure.empty());
+    CHECK(count == 1 && received == 0x2a);
+
+    finished = true;
+    stream->Close();
+    server.join();
+    close(listener);
+    sigaction(SIGUSR1, &previous, nullptr);
+    for (const auto descriptor : filler) {
+        close(descriptor);
+    }
+    close(null_file);
 }
 #endif // !_WIN32
 
@@ -8563,6 +8685,7 @@ int main() {
     TestUtf16BeConversion();
 #if !defined(_WIN32)
     TestWriteToClosedPeerDoesNotKillTheProcess();
+    TestReadWaitsThroughSignalsAndHighDescriptors();
 #endif
     TestConnectRunsThroughTheTransportSeam();
     TestRedirectDataSplitting();

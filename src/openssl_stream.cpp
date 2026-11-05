@@ -36,8 +36,8 @@
 #include <arpa/inet.h>
 #include <cerrno>
 #include <csignal>
+#include <poll.h>
 #include <pthread.h>
-#include <sys/select.h>
 #include <sys/socket.h>
 #endif
 
@@ -311,17 +311,56 @@ static bool IsIpAddress(const std::string &value) {
 // The wait for one blocking step: the transport's own timeout, cut down to
 // whatever is left before `deadline` when there is one. An expired deadline is
 // no time at all.
-static timeval StepTimeout(uint32_t timeout_seconds,
-                           const std::optional<std::chrono::steady_clock::time_point> &deadline) {
+static std::chrono::microseconds StepTimeout(uint32_t timeout_seconds,
+                                             const std::optional<std::chrono::steady_clock::time_point> &deadline) {
     auto wait = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::seconds(timeout_seconds));
     if (deadline) {
         const auto left =
             std::chrono::duration_cast<std::chrono::microseconds>(*deadline - std::chrono::steady_clock::now());
         wait = (std::max)(std::chrono::microseconds(0), (std::min)(wait, left));
     }
+    return wait;
+}
+
+// Waits up to `wait` for one socket to become readable and/or writable, and
+// answers as select() does: above zero ready, zero timed out, below zero failed.
+// POSIX waits with poll(), since select() cannot name a descriptor at or past
+// FD_SETSIZE and FD_SET writes past the end of its set when asked to — and a
+// process holding many files reaches such a descriptor. A signal that cuts the
+// wait short is not a timeout: the wait resumes for what is left of it.
+static int WaitForSocket(int socket_fd, bool for_read, bool for_write, std::chrono::microseconds wait) {
+#if defined(_WIN32)
+    // A Windows fd_set is a list of sockets, not a bitmap, so one socket of any
+    // value fits it.
+    fd_set readable, writable;
+    FD_ZERO(&readable);
+    FD_ZERO(&writable);
+    if (for_read) { FD_SET(socket_fd, &readable); }
+    if (for_write) { FD_SET(socket_fd, &writable); }
     const auto count = wait.count();
-    return {static_cast<decltype(timeval::tv_sec)>(count / 1000000),
-            static_cast<decltype(timeval::tv_usec)>(count % 1000000)};
+    timeval timeout {static_cast<decltype(timeval::tv_sec)>(count / 1000000),
+                     static_cast<decltype(timeval::tv_usec)>(count % 1000000)};
+    return select(socket_fd + 1, for_read ? &readable : nullptr, for_write ? &writable : nullptr, nullptr, &timeout);
+#else
+    const auto end = std::chrono::steady_clock::now() + wait;
+    while (true) {
+        // Rounded up, so a wait shorter than a millisecond still waits rather
+        // than spinning.
+        const auto left = std::chrono::duration_cast<std::chrono::microseconds>(end - std::chrono::steady_clock::now());
+        const auto milliseconds = (std::max)(int64_t {0}, (static_cast<int64_t>(left.count()) + 999) / 1000);
+        pollfd entry {};
+        entry.fd = socket_fd;
+        entry.events = static_cast<short>((for_read ? POLLIN : 0) | (for_write ? POLLOUT : 0));
+        const auto ready =
+            poll(&entry, 1, static_cast<int>((std::min)(milliseconds, int64_t {(std::numeric_limits<int>::max)()})));
+        if (ready >= 0 || errno != EINTR) {
+            return ready;
+        }
+        if (std::chrono::steady_clock::now() >= end) {
+            return 0;
+        }
+    }
+#endif
 }
 
 static bool WaitForBio(BIO *bio, uint32_t timeout_seconds,
@@ -345,15 +384,7 @@ static bool WaitForBio(BIO *bio, uint32_t timeout_seconds,
         if (now >= effective) { return false; }
         auto wait = std::chrono::duration_cast<std::chrono::microseconds>(effective - now);
         if (polled) { wait = (std::min)(wait, std::chrono::microseconds(50000)); }
-        fd_set readable, writable;
-        FD_ZERO(&readable); FD_ZERO(&writable);
-        if (want_read) { FD_SET(socket_fd, &readable); }
-        if (want_write) { FD_SET(socket_fd, &writable); }
-        const auto count = wait.count();
-        timeval timeout {static_cast<decltype(timeval::tv_sec)>(count / 1000000),
-                         static_cast<decltype(timeval::tv_usec)>(count % 1000000)};
-        const auto ready = select(socket_fd + 1, want_read ? &readable : nullptr,
-                                  want_write ? &writable : nullptr, nullptr, &timeout);
+        const auto ready = WaitForSocket(socket_fd, want_read != 0, want_write != 0, wait);
         if (ready > 0) { return true; }
         if (ready < 0 || !polled) { return false; }
     }
@@ -373,13 +404,8 @@ static bool WaitUntil(BIO *bio, bool for_read, std::chrono::steady_clock::time_p
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         return true;
     }
-    const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - now).count();
-    fd_set ready;
-    FD_ZERO(&ready);
-    FD_SET(socket_fd, &ready);
-    timeval timeout {static_cast<decltype(timeval::tv_sec)>(remaining / 1000000),
-                     static_cast<decltype(timeval::tv_usec)>(remaining % 1000000)};
-    return select(socket_fd + 1, for_read ? &ready : nullptr, for_read ? nullptr : &ready, nullptr, &timeout) > 0;
+    const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - now);
+    return WaitForSocket(socket_fd, for_read, !for_read, remaining) > 0;
 }
 
 std::vector<std::string> OpenSslResolveHost(const std::string &host, uint16_t port) {
@@ -777,11 +803,8 @@ void OpenSslByteStream::SendUrgent(uint8_t value) {
             return;
         }
         if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            fd_set writable;
-            FD_ZERO(&writable);
-            FD_SET(implementation->socket_fd, &writable);
-            timeval timeout = StepTimeout(implementation->read_timeout_seconds, deadline);
-            if (select(implementation->socket_fd + 1, nullptr, &writable, nullptr, &timeout) > 0) {
+            if (WaitForSocket(implementation->socket_fd, false, true,
+                              StepTimeout(implementation->read_timeout_seconds, deadline)) > 0) {
                 continue;
             }
         }

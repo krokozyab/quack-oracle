@@ -100,6 +100,49 @@ OracleDateTime DecodeOracleTimestamp(const std::vector<uint8_t> &wire) {
     return result;
 }
 
+static int64_t DaysFromCivil(int64_t year, int64_t month, int64_t day) {
+    year -= month <= 2 ? 1 : 0;
+    const int64_t era = (year >= 0 ? year : year - 399) / 400;
+    const int64_t year_of_era = year - era * 400;
+    const int64_t day_of_year = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+    const int64_t day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    return era * 146097 + day_of_era - 719468;
+}
+
+static void CivilFromDays(int64_t days, OracleDateTime &value) {
+    days += 719468;
+    const int64_t era = (days >= 0 ? days : days - 146096) / 146097;
+    const int64_t day_of_era = days - era * 146097;
+    const int64_t year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
+    const int64_t day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    const int64_t month_index = (5 * day_of_year + 2) / 153;
+    const int64_t month = month_index < 10 ? month_index + 3 : month_index - 9;
+    value.day = static_cast<uint8_t>(day_of_year - (153 * month_index + 2) / 5 + 1);
+    value.month = static_cast<uint8_t>(month);
+    value.year = static_cast<int32_t>(year_of_era + era * 400 + (month <= 2 ? 1 : 0));
+}
+
+OracleDateTime OracleZonedWallClock(const OracleDateTime &utc) {
+    if (!utc.has_offset) {
+        return utc;
+    }
+    auto result = utc;
+    int64_t minutes = static_cast<int64_t>(utc.hour) * 60 + utc.minute + utc.offset_minutes;
+    int64_t days = DaysFromCivil(utc.year, utc.month, utc.day);
+    while (minutes < 0) {
+        minutes += 1440;
+        days--;
+    }
+    while (minutes >= 1440) {
+        minutes -= 1440;
+        days++;
+    }
+    result.hour = static_cast<uint8_t>(minutes / 60);
+    result.minute = static_cast<uint8_t>(minutes % 60);
+    CivilFromDays(days, result);
+    return result;
+}
+
 template <class FLOAT, class INTEGER>
 static std::vector<uint8_t> EncodeBinary(FLOAT value) {
     INTEGER bits;
