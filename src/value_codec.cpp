@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #include <string>
 
@@ -451,7 +452,33 @@ static int ReadIntervalField(uint8_t byte, int limit, const char *what) {
     return value;
 }
 
+// Oracle carries an interval's sign on every component, so the non-zero ones agree:
+// -5-11 is year -5 and month -11. Components that disagree are not a value Oracle
+// writes, and summed they would read as a different interval, so they are refused.
+static void RequireOneSign(std::initializer_list<int64_t> components, const char *what) {
+    bool positive = false;
+    bool negative = false;
+    for (const auto component : components) {
+        positive = positive || component > 0;
+        negative = negative || component < 0;
+    }
+    if (positive && negative) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                            std::string("Oracle ") + what + " components have different signs");
+    }
+}
+
+// An encoder argument outside the field's range would be cut to a byte and
+// written as a different value.
+static void RequireIntervalField(int64_t value, int64_t limit, const char *what) {
+    if (value < -limit || value > limit) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, std::string("Oracle INTERVAL ") + what + " is out of range");
+    }
+}
+
 std::vector<uint8_t> EncodeOracleIntervalYearMonth(int32_t years, int32_t months) {
+    RequireIntervalField(months, 11, "month");
+    RequireOneSign({years, months}, "INTERVAL YEAR TO MONTH");
     std::vector<uint8_t> wire;
     PutBigEndian(wire, static_cast<uint32_t>(static_cast<int64_t>(years) + INTERVAL_SIGN_OFFSET));
     wire.push_back(static_cast<uint8_t>(months + INTERVAL_FIELD_OFFSET));
@@ -463,12 +490,20 @@ OracleIntervalYearMonth DecodeOracleIntervalYearMonth(const std::vector<uint8_t>
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle INTERVAL YEAR TO MONTH must be 5 bytes");
     }
     OracleIntervalYearMonth result;
-    result.months = static_cast<int64_t>(ReadOffsetInteger(wire.data())) * 12 + ReadIntervalField(wire[4], 11, "month");
+    const auto years = ReadOffsetInteger(wire.data());
+    const auto months = ReadIntervalField(wire[4], 11, "month");
+    RequireOneSign({years, months}, "INTERVAL YEAR TO MONTH");
+    result.months = static_cast<int64_t>(years) * 12 + months;
     return result;
 }
 
 std::vector<uint8_t> EncodeOracleIntervalDaySecond(int32_t days, int32_t hours, int32_t minutes, int32_t seconds,
                                                    int32_t nanoseconds) {
+    RequireIntervalField(hours, 23, "hour");
+    RequireIntervalField(minutes, 59, "minute");
+    RequireIntervalField(seconds, 59, "second");
+    RequireIntervalField(nanoseconds, 999999999, "fractional second");
+    RequireOneSign({days, hours, minutes, seconds, nanoseconds}, "INTERVAL DAY TO SECOND");
     std::vector<uint8_t> wire;
     PutBigEndian(wire, static_cast<uint32_t>(static_cast<int64_t>(days) + INTERVAL_SIGN_OFFSET));
     wire.push_back(static_cast<uint8_t>(hours + INTERVAL_FIELD_OFFSET));
@@ -491,6 +526,7 @@ OracleIntervalDaySecond DecodeOracleIntervalDaySecond(const std::vector<uint8_t>
     if (nanoseconds <= -1000000000 || nanoseconds >= 1000000000) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle INTERVAL fractional seconds are out of range");
     }
+    RequireOneSign({result.days, hours, minutes, seconds, nanoseconds}, "INTERVAL DAY TO SECOND");
     result.nanoseconds =
         ((static_cast<int64_t>(hours) * 60 + minutes) * 60 + seconds) * 1000000000LL + nanoseconds;
     return result;

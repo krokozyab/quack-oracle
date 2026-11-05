@@ -338,4 +338,31 @@ std::vector<uint8_t> EncodeTtcExecuteBindsRequest(const TtcExecuteBindsRequest &
     return writer.Take();
 }
 
+std::vector<uint8_t> EncodeTtcCursorFetchRequest(uint8_t sequence, uint32_t cursor_id, uint32_t rows,
+                                                 uint8_t field_version) {
+    if (sequence == 0 || cursor_id == 0 || rows == 0 || rows > MAX_PREFETCH_ROWS ||
+        field_version < TTC_FIELD_VERSION_12_2) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC cursor fetch request is invalid");
+    }
+    ByteWriter writer;
+    writer.WriteByte(TTC_MESSAGE_FUNCTION).WriteByte(TTC_FUNCTION_EXECUTE).WriteByte(sequence);
+    writer.WriteUB4(OALL8_FETCH | OALL8_NOT_PLSQL).WriteUB4(cursor_id);
+    writer.WriteByte(0).WriteUB4(0);  // no SQL text: the cursor is already open
+    writer.WriteByte(1).WriteUB4(13); // al8i4 vector
+    writer.WriteByte(0).WriteByte(0); // al8o4 and al8o4l pointers
+    writer.WriteUB4(0).WriteUB4(rows).WriteUB4(0x7fffffff);
+    writer.WriteByte(0).WriteUB4(0);                                          // no binds
+    writer.WriteByte(0).WriteByte(0).WriteByte(0).WriteByte(0).WriteByte(0); // transaction/vector auxiliaries
+    writer.WriteByte(0).WriteUB4(0);                                          // no defines
+    writer.WriteUB4(0);                                                       // registration id LSB
+    writer.WriteByte(0).WriteByte(1).WriteByte(0).WriteUB4(0).WriteByte(0).WriteUB4(0).WriteUB4(0);
+    writer.WriteByte(0).WriteUB4(0).WriteByte(0); // array-DML row counts
+    WriteThinOall8Extension(writer, field_version);
+    for (size_t index = 0; index < 13; index++) {
+        // al8i4[1] is the rows to fetch and al8i4[7] marks a query.
+        writer.WriteUB4(index == 1 ? rows : index == 7 ? 1 : 0);
+    }
+    return writer.Take();
+}
+
 } // namespace oracle_scanner

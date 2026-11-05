@@ -33,6 +33,16 @@ struct TtcExecuteNoBindsRequest {
 
 std::vector<uint8_t> EncodeTtcExecuteNoBindsRequest(const TtcExecuteNoBindsRequest &request);
 
+// The next rows of a cursor PL/SQL opened (an OUT SYS_REFCURSOR or an implicit
+// result), which has no statement text on this side: OALL8 with the cursor id
+// and FETCH alone, no PARSE, EXECUTE or defines. That is how python-oracledb
+// Thin fetches such a cursor every time (cursor.pyx fetch_rows, execute.pyx
+// _write_execute_message); it never sends OFETCH to one. Oracle 19c answers
+// OFETCH on such a cursor with ORA-01405 at the first NULL in a column that is
+// not a LOB, while Free 23ai accepts either.
+std::vector<uint8_t> EncodeTtcCursorFetchRequest(uint8_t sequence, uint32_t cursor_id, uint32_t rows,
+                                                 uint8_t field_version);
+
 // OALL8 execute with scalar and PL/SQL bind metadata. OracleBind::value must
 // already contain its Oracle wire representation (NUMBER, DATE, etc.); value
 // conversion remains in value_codec. OUT SYS_REFCURSOR binds are represented

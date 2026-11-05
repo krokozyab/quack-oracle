@@ -132,7 +132,11 @@ OracleServerError ParseTtcServerError(const std::vector<uint8_t> &message) {
 }
 
 TtcErrorInfo DecodeTtcErrorPrefix(const std::vector<uint8_t> &message, uint8_t ttc_field_version) {
-    ByteReader reader(message);
+    return DecodeTtcErrorPrefix(message.data(), message.size(), ttc_field_version);
+}
+
+TtcErrorInfo DecodeTtcErrorPrefix(const uint8_t *data, size_t size, uint8_t ttc_field_version) {
+    ByteReader reader(data, size);
     try {
     if (reader.ReadByte() != TTC_MESSAGE_ERROR) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "expected TTC ERROR message");

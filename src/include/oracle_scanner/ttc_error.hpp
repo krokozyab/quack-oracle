@@ -62,6 +62,8 @@ private:
 bool IsTtcErrorMessage(const std::vector<uint8_t> &message);
 OracleServerError ParseTtcServerError(const std::vector<uint8_t> &message);
 TtcErrorInfo DecodeTtcErrorPrefix(const std::vector<uint8_t> &message, uint8_t ttc_field_version = 12);
+// The same, read in place from `size` bytes at `data`.
+TtcErrorInfo DecodeTtcErrorPrefix(const uint8_t *data, size_t size, uint8_t ttc_field_version = 12);
 [[noreturn]] void ThrowTtcServerError(const std::vector<uint8_t> &message);
 
 } // namespace oracle_scanner

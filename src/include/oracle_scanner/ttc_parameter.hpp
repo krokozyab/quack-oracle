@@ -25,6 +25,8 @@ std::vector<TtcParameter> DecodeTtcParameters(const std::vector<uint8_t> &messag
 // Drains the execute-response RETURN_PARAMETER body (message type 8). It is
 // distinct from the authentication key/value PARAMETER grammar above.
 TtcReturnParameterPrefix DecodeTtcReturnParameterPrefix(const std::vector<uint8_t> &message);
+// The same, read in place from `size` bytes at `data`.
+TtcReturnParameterPrefix DecodeTtcReturnParameterPrefix(const uint8_t *data, size_t size);
 O5LogonChallenge O5LogonChallengeFromParameters(const std::vector<TtcParameter> &parameters);
 
 } // namespace oracle_scanner

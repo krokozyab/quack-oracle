@@ -56,6 +56,11 @@ bool IsDirectory(const std::string &path) {
     return std::filesystem::is_directory(std::filesystem::path(path), error) && !error;
 }
 
+// A file inside a folder, joined with the platform's own separator.
+std::string PathInFolder(const std::string &folder, const char *name) {
+    return (std::filesystem::path(folder) / name).string();
+}
+
 std::string ReadWalletFile(const std::string &path, size_t maximum_size, const char *description) {
     std::ifstream input(path, std::ios::binary | std::ios::ate);
     if (!input) {
@@ -215,8 +220,8 @@ std::string ReadWalletIdentityPem(const std::string &path, bool have_wallet_pass
         // A wallet folder, as python-oracledb's wallet_location names one. The
         // same preference as inside a ZIP: the auto-login store opens without a
         // password, and ewallet.pem is what a password belongs to.
-        const auto sso_path = path + "/cwallet.sso";
-        const auto pem_path = path + "/ewallet.pem";
+        const auto sso_path = PathInFolder(path, "cwallet.sso");
+        const auto pem_path = PathInFolder(path, "ewallet.pem");
         const bool has_sso = PathExists(sso_path);
         const bool has_pem = PathExists(pem_path);
         if (!has_sso && !has_pem) {
@@ -324,7 +329,7 @@ std::string ReadTnsNamesSource(const std::string &path) {
         return ReadWalletTnsNamesArchive(path);
     }
     // A folder holds tnsnames.ora; any other path is taken to be that file.
-    auto tnsnames = ReadWalletFile(is_directory ? path + "/tnsnames.ora" : path, MAX_WALLET_PEM_BYTES,
+    auto tnsnames = ReadWalletFile(is_directory ? PathInFolder(path, "tnsnames.ora") : path, MAX_WALLET_PEM_BYTES,
                                    "Oracle tnsnames.ora");
     if (tnsnames.find('\0') != std::string::npos) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle tnsnames.ora contains NUL bytes");

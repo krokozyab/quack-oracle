@@ -39,10 +39,10 @@ public:
     NativeOracleCursor(TtcStatementChannel &channel_p, uint8_t &next_sequence_p, std::shared_ptr<NativeSessionLifetime> lifetime_p,
                        OracleStatementHandle handle_p,
                        std::vector<OracleColumn> columns_p, std::vector<TtcRowData> prefetched_p, bool exhausted_p,
-                       uint8_t server_field_version_p,uint8_t field_version_p=0)
+                       uint8_t server_field_version_p, uint8_t field_version_p, bool opened_by_plsql_p)
         : channel(channel_p), next_sequence(next_sequence_p), lifetime(std::move(lifetime_p)), handle(handle_p),
           columns(std::move(columns_p)), pending(std::move(prefetched_p)), server_field_version(server_field_version_p),
-          exhausted(exhausted_p),field_version(field_version_p) {
+          exhausted(exhausted_p), field_version(field_version_p), opened_by_plsql(opened_by_plsql_p) {
         prefetch_eligible=SupportsLobPrefetchColumns(columns,field_version);
         if (prefetch_eligible) {
             try { (void)BoundedLobPrefetchRows(columns,1,prefetch_limits); }
@@ -200,7 +200,11 @@ public:
                 for (auto &column : columns) { column.inline_lob_cells = IsOracleLocatorType(column.oracle_type); }
                 // The rows before the define carry locators only.
                 previous_row.reset();inline_active=true;
-            } else { channel.Fetch(handle,sequence,count); }
+            } else if (opened_by_plsql) {
+                channel.FetchOpenedCursor(handle, sequence, count, field_version);
+            } else {
+                channel.Fetch(handle, sequence, count);
+            }
             auto response_limits=prefetch_limits;
             response_limits.maximum_rows=count;
             auto response=prefetch_active ?
@@ -260,6 +264,9 @@ private:
     bool exhausted = false;
     bool closed = false;
     uint8_t field_version=0;
+    // A REF CURSOR or implicit result: there is no statement text here, and its
+    // rows are fetched through OALL8 (see EncodeTtcCursorFetchRequest).
+    bool opened_by_plsql = false;
     bool prefetch_eligible=false;
     bool prefetch_active=false;
     bool inline_eligible=false;
@@ -442,7 +449,7 @@ std::unique_ptr<OracleCursor> NativeOracleSession::OpenQuery(const std::string &
     }
     channel->CompleteExecute(handle, true, response.completion->cursor_id);
     return std::make_unique<NativeOracleCursor>(*channel, next_sequence, lifetime, handle, response.columns, response.rows,
-                                                response.exhausted, connection->TtcServerFieldVersion(),connection->TtcFieldVersion());
+                                                response.exhausted, connection->TtcServerFieldVersion(),connection->TtcFieldVersion(), false);
 }
 
 uint64_t NativeOracleSession::Execute(const std::string &sql, const std::vector<OracleBind> &binds) {
@@ -737,7 +744,7 @@ OracleCallResult NativeOracleSession::Call(const OracleCallRequest &request) {
                     channel->CompleteExecute(cursor_handle, true, descriptor->cursor_id);
                     result.explicit_cursors.emplace_back(std::make_unique<NativeOracleCursor>(
                         *channel, next_sequence, lifetime, cursor_handle, descriptor->columns, std::vector<TtcRowData> {}, false,
-                        connection->TtcServerFieldVersion()));
+                        connection->TtcServerFieldVersion(), connection->TtcFieldVersion(), true));
                 } else {
                     output.value = decoded.out_binds->scalar_values[output_position];
                     result.outputs.push_back(std::move(output));
@@ -749,7 +756,7 @@ OracleCallResult NativeOracleSession::Call(const OracleCallRequest &request) {
             channel->CompleteExecute(cursor_handle, true, descriptor.cursor_id);
             result.implicit_cursors.emplace_back(std::make_unique<NativeOracleCursor>(
                 *channel, next_sequence, lifetime, cursor_handle, descriptor.columns, std::vector<TtcRowData> {}, false,
-                connection->TtcServerFieldVersion()));
+                connection->TtcServerFieldVersion(), connection->TtcFieldVersion(), true));
         }
         return result;
     });

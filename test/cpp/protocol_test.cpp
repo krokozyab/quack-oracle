@@ -927,6 +927,41 @@ static void TestTtcFetchCodec() {
     });
 }
 
+// A cursor PL/SQL opened is fetched with OALL8, field by field what
+// python-oracledb Thin's _write_execute_message writes for a REF cursor (no
+// SQL, cursor id set, not a define): options FETCH | NOT_PLSQL, no SQL
+// pointer, the row count in the prefetch slot and in al8i4[1], al8i4[7] = 1
+// for a query. 19c answers OFETCH on such a cursor with ORA-01405 at the
+// first NULL that is not in a LOB column.
+static void TestTtcCursorFetchRequest() {
+    const std::vector<uint8_t> expected = {
+        0x03, 0x5e, 0x05,                   // function message, OALL8, sequence
+        0x02, 0x80, 0x40,                   // options: FETCH | NOT_PLSQL
+        0x01, 0x2a,                         // cursor id 42
+        0x00, 0x00,                         // no SQL pointer, no SQL length
+        0x01, 0x01, 0x0d,                   // al8i4 pointer, 13 words
+        0x00, 0x00,                         // al8o4, al8o4l
+        0x00, 0x01, 0x32,                   // prefetch buffer 0, 50 rows
+        0x04, 0x7f, 0xff, 0xff, 0xff,       // maximum long size
+        0x00, 0x00,                         // no binds
+        0x00, 0x00, 0x00, 0x00, 0x00,       // al8app, al8txn, al8txl, al8kv, al8kvl
+        0x00, 0x00,                         // no defines
+        0x00,                               // registration id, low half
+        0x00, 0x01, 0x00, 0x00, 0x00, 0x00, // al8objlist, al8objlen, al8blv, al8blvl, al8dnam, al8dnaml
+        0x00,                               // registration id, high half
+        0x00, 0x00, 0x00,                   // array-DML row counts
+        0x00, 0x00, 0x00, 0x00, 0x00,       // SQL signature and SQL id (12.2)
+        0x00, 0x00,                         // chunk ids (12.2 extension)
+        0x00, 0x01, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00}; // al8i4
+    CHECK(EncodeTtcCursorFetchRequest(5, 42, 50, 12) == expected);
+    // Before the 12.2 extension the two chunk-id fields are not there.
+    CHECK(EncodeTtcCursorFetchRequest(5, 42, 50, 8).size() == expected.size() - 2);
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { EncodeTtcCursorFetchRequest(0, 42, 50, 12); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { EncodeTtcCursorFetchRequest(5, 0, 50, 12); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { EncodeTtcCursorFetchRequest(5, 42, 0, 12); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { EncodeTtcCursorFetchRequest(5, 42, 50, 7); });
+}
+
 static void TestTtcFetchResponse() {
     const std::vector<OracleColumn> columns = {{"A", 1, 16, 0, 0, true}, {"B", 2, 22, 0, 0, true}};
     ByteWriter response;
@@ -3135,7 +3170,8 @@ static void TestLiveTnsNegotiation() {
         const std::vector<OracleBind> binds = {{"c", ORACLE_WIRE_TYPE_CURSOR, BindDirection::BIND_OUT, std::nullopt, 4}};
         TtcExecuteBindsRequest request;
         request.sequence = 3;
-        request.sql = "BEGIN OPEN :c FOR SELECT 1 AS value FROM dual; END;";
+        // The NULL is what 19c refused through OFETCH (ORA-01405).
+        request.sql = "BEGIN OPEN :c FOR SELECT 1 AS value, CAST(NULL AS VARCHAR2(8)) AS empty FROM dual; END;";
         request.binds = binds;
         request.is_plsql = true;
         channel.ExecuteBinds(handle, request);
@@ -3146,9 +3182,10 @@ static void TestLiveTnsNegotiation() {
             const auto &cursor = *decoded.out_binds->cursor_values[0];
             const auto cursor_handle = statements.Open(OracleSqlKind::QUERY);
             channel.CompleteExecute(cursor_handle, true, cursor.cursor_id);
-            channel.Fetch(cursor_handle, 4, 2);
+            channel.FetchOpenedCursor(cursor_handle, 4, 2, connection->TtcFieldVersion());
             const auto fetched = channel.ReceiveDecodedFetchResponse(cursor_handle, cursor.columns, connection->TtcServerFieldVersion());
-            CHECK(!fetched.rows.empty() && fetched.exhausted && fetched.completion);
+            CHECK(fetched.rows.size() == 1 && fetched.rows[0].size() == 2 && fetched.rows[0][0] && !fetched.rows[0][1] &&
+                  fetched.exhausted && fetched.completion);
             channel.MarkFetchExhausted(cursor_handle);
         }
     }
@@ -3176,7 +3213,9 @@ static void TestLiveTnsNegotiation() {
         TtcExecuteNoBindsRequest request;
         request.sequence = 3;
         request.is_plsql = true;
-        request.sql = "DECLARE c SYS_REFCURSOR; BEGIN OPEN c FOR SELECT 1 AS value FROM dual; DBMS_SQL.RETURN_RESULT(c); END;";
+        // The NULL is what 19c refused through OFETCH (ORA-01405).
+        request.sql = "DECLARE c SYS_REFCURSOR; BEGIN OPEN c FOR SELECT 1 AS value, CAST(NULL AS VARCHAR2(8)) AS empty "
+                      "FROM dual; DBMS_SQL.RETURN_RESULT(c); END;";
         channel.ExecuteNoBinds(handle, request);
         const auto decoded = channel.ReceiveCallResponse(handle, {}, connection->TtcFieldVersion(), connection->TtcServerFieldVersion());
         CHECK(decoded.implicit_cursors.size() == 1 && decoded.implicit_cursors[0].cursor_id != 0);
@@ -3184,9 +3223,10 @@ static void TestLiveTnsNegotiation() {
             const auto &cursor = decoded.implicit_cursors[0];
             const auto cursor_handle = statements.Open(OracleSqlKind::QUERY);
             channel.CompleteExecute(cursor_handle, true, cursor.cursor_id);
-            channel.Fetch(cursor_handle, 4, 2);
+            channel.FetchOpenedCursor(cursor_handle, 4, 2, connection->TtcFieldVersion());
             const auto fetched = channel.ReceiveDecodedFetchResponse(cursor_handle, cursor.columns, connection->TtcServerFieldVersion());
-            CHECK(!fetched.rows.empty() && fetched.exhausted && fetched.completion);
+            CHECK(fetched.rows.size() == 1 && fetched.rows[0].size() == 2 && fetched.rows[0][0] && !fetched.rows[0][1] &&
+                  fetched.exhausted && fetched.completion);
             channel.MarkFetchExhausted(cursor_handle);
         }
     }
@@ -7290,6 +7330,23 @@ static void TestNewTypeValues() {
     auto bad_fraction = day_second(0);
     bad_fraction[7] = 0xc0;
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { DecodeOracleIntervalDaySecond(bad_fraction); });
+    // Every component carries the sign, so components that disagree are not an
+    // Oracle value: decoded, they would sum to a different interval.
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { DecodeOracleIntervalYearMonth({0x80, 0, 0, 2, 60 - 3}); });
+    auto mixed_signs = day_second(0);
+    mixed_signs[4] = 60 - 4;
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { DecodeOracleIntervalDaySecond(mixed_signs); });
+    // A zero component has no sign, so -0 02:00:00 is simply two hours back.
+    const auto hours_back = DecodeOracleIntervalDaySecond(EncodeOracleIntervalDaySecond(0, -2, 0, 0, 0));
+    CHECK(hours_back.days == 0 && hours_back.nanoseconds == -2 * 3600 * 1000000000LL);
+    // The encoder refuses what would be cut to a byte or change sign on the way.
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { EncodeOracleIntervalYearMonth(1, 12); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { EncodeOracleIntervalYearMonth(2, -3); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { EncodeOracleIntervalDaySecond(0, 24, 0, 0, 0); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { EncodeOracleIntervalDaySecond(0, 0, -60, 0, 0); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { EncodeOracleIntervalDaySecond(0, 0, 0, 60, 0); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { EncodeOracleIntervalDaySecond(0, 0, 0, 0, 1000000000); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { EncodeOracleIntervalDaySecond(1, -1, 0, 0, 0); });
     // Every value an Oracle interval can hold survives encode and decode.
     std::mt19937_64 random(20261022);
     for (int round = 0; round < 20000; round++) {
@@ -8622,6 +8679,7 @@ int main() {
     TestTtcParameters();
     TestTtcAuthEncoding();
     TestTtcFetchCodec();
+    TestTtcCursorFetchRequest();
     TestTtcFetchResponse();
     TestFetchResponseDecoderResumes();
     TestOracleIntegerMatchesDecimalText();

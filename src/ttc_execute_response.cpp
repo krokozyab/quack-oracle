@@ -43,16 +43,15 @@ TtcErrorInfo DecodeTtcExecuteCompletion(const std::vector<uint8_t> &message, uin
         // too. Drain those prefixes but intentionally do not use the PL/SQL
         // success fallback: DML must preserve the TTIOER row count.
         size_t offset = 0;
+        // Each prefix is read where it stands rather than from a copy of the rest.
         while (offset < message.size() && message[offset] == TTC_MESSAGE_PARAMETER) {
-            const std::vector<uint8_t> tail(message.begin() + static_cast<std::ptrdiff_t>(offset), message.end());
-            const auto parameter = DecodeTtcReturnParameterPrefix(tail);
+            const auto parameter = DecodeTtcReturnParameterPrefix(message.data() + offset, message.size() - offset);
             offset += parameter.bytes_consumed;
         }
         if (offset == message.size()) {
             throw ProtocolError(ProtocolErrorKind::TRUNCATED, "TTC non-query execute response has no completion");
         }
-        const std::vector<uint8_t> completion(message.begin() + static_cast<std::ptrdiff_t>(offset), message.end());
-        return DecodeTtcErrorPrefix(completion, ttc_field_version);
+        return DecodeTtcErrorPrefix(message.data() + offset, message.size() - offset, ttc_field_version);
     } catch (const ProtocolError &error) {
         const auto message_type = message.empty() ? std::string("none") : std::to_string(message.front());
         throw ProtocolError(error.Kind(), std::string("TTC non-query execute completion (message type ") + message_type +

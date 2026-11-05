@@ -276,6 +276,19 @@ void TtcStatementChannel::Fetch(OracleStatementHandle handle, uint8_t sequence, 
     }
 }
 
+void TtcStatementChannel::FetchOpenedCursor(OracleStatementHandle handle, uint8_t sequence, uint32_t requested_rows,
+                                            uint8_t field_version) {
+    const auto request = EncodeTtcCursorFetchRequest(sequence, statements.RemoteCursorId(handle), requested_rows,
+                                                     field_version);
+    statements.BeginFetch(handle);
+    try {
+        channel.Send(request);
+    } catch (...) {
+        statements.Poison(handle);
+        throw;
+    }
+}
+
 void TtcStatementChannel::DefineInlineLobs(OracleStatementHandle handle, uint8_t sequence,
                                            const std::vector<OracleColumn> &columns, uint32_t rows) {
     const auto cursor = statements.RemoteCursorId(handle);

@@ -73,7 +73,11 @@ uint32_t ParseIterations(const std::string &value) {
 } // namespace
 
 TtcReturnParameterPrefix DecodeTtcReturnParameterPrefix(const std::vector<uint8_t> &message) {
-    ByteReader reader(message);
+    return DecodeTtcReturnParameterPrefix(message.data(), message.size());
+}
+
+TtcReturnParameterPrefix DecodeTtcReturnParameterPrefix(const uint8_t *data, size_t size) {
+    ByteReader reader(data, size);
     if (reader.ReadByte() != TTC_MESSAGE_PARAMETER) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "expected TTC RETURN_PARAMETER message");
     }
