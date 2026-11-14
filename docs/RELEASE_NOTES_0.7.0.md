@@ -33,6 +33,10 @@
 
 ## Additions
 
+- Exact NUMBER-to-DECIMAL reads decode directly into portable scaled integers
+  through 38 digits. Values needing rounding or error reporting retain the
+  existing conversion semantics.
+
 - Scalar scans use batch-owned byte storage and cell descriptors, preserving
   NULLs and compressed-row continuation across packets and fetches. LOB/LONG/
   binary ROWID and deferred reads retain their existing path.

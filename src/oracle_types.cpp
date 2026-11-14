@@ -612,6 +612,30 @@ bool TryWriteDenseVector(Vector &vector, idx_t row, const OracleColumn &column, 
 // not flat, a type it does not cover, and every value that would be refused —
 // takes the SetValue(ValueFor(...)) path itself, so a refusal raises exactly
 // the error it always did.
+static bool WriteExactOracleDecimal(Vector &vector, idx_t row, const OracleColumn &column,
+                                    oracle_scanner::OracleByteView wire) {
+    const auto &type = vector.GetType();
+    const auto mapping = MapNumber(column);
+    if (type.id() != LogicalTypeId::DECIMAL || mapping.kind != NumberMapping::DECIMAL ||
+        DecimalType::GetWidth(type) != mapping.width || DecimalType::GetScale(type) != mapping.scale) { return false; }
+    const auto scaled = oracle_scanner::TryDecodeOracleScaledInteger(wire,mapping.width,mapping.scale);
+    if (!scaled) { return false; }
+    if (type.InternalType() == PhysicalType::INT128) {
+        hugeint_t value; value.upper = static_cast<int64_t>(scaled->upper); value.lower = scaled->lower;
+        FlatVector::GetDataMutable<hugeint_t>(vector)[row] = scaled->negative ? -value : value;
+    } else {
+        const auto value = scaled->negative ? -static_cast<int64_t>(scaled->lower) : static_cast<int64_t>(scaled->lower);
+        switch (type.InternalType()) {
+        case PhysicalType::INT16: FlatVector::GetDataMutable<int16_t>(vector)[row] = static_cast<int16_t>(value); break;
+        case PhysicalType::INT32: FlatVector::GetDataMutable<int32_t>(vector)[row] = static_cast<int32_t>(value); break;
+        case PhysicalType::INT64: FlatVector::GetDataMutable<int64_t>(vector)[row] = value; break;
+        default: return false;
+        }
+    }
+    FlatVector::SetNull(vector,row,false);
+    return true;
+}
+
 void WriteOracleValueView(Vector &vector, idx_t row, const OracleColumn &column,
                           const std::optional<oracle_scanner::OracleByteView> &wire) {
     const auto fallback = [&] {
@@ -622,6 +646,7 @@ void WriteOracleValueView(Vector &vector, idx_t row, const OracleColumn &column,
     if (vector.GetVectorType() != VectorType::FLAT_VECTOR) { fallback(); return; }
     if (!wire) { FlatVector::SetNull(vector, row, true); return; }
     const auto &type = vector.GetType();
+    if (column.oracle_type == 2 && WriteExactOracleDecimal(vector,row,column,*wire)) { return; }
     if (column.oracle_type == 2 && type.id() == LogicalTypeId::BIGINT && MapNumber(column).kind == NumberMapping::BIGINT) {
         if (const auto integer = oracle_scanner::TryDecodeOracleIntegerView(*wire)) {
             FlatVector::SetNull(vector, row, false);
@@ -673,6 +698,7 @@ void WriteOracleValue(Vector &vector, idx_t row, const OracleColumn &column,
     };
     switch (column.oracle_type) {
     case 2: {
+        if (WriteExactOracleDecimal(vector,row,column,oracle_scanner::OracleByteView(*wire))) { return; }
         const auto mapping = MapNumber(column);
         if (type.id() == LogicalTypeId::BIGINT && mapping.kind == NumberMapping::BIGINT) {
             // Most values are whole numbers that fit, and need no text at all.

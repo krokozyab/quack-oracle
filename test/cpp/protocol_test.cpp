@@ -1348,6 +1348,42 @@ static void TestPackedChunkedFetchAndPreviousRowOwnership() {
     ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED,[&] { limited.Decode(oversized.Data()); });
 }
 
+static void TestExactScaledNumberCodec() {
+    struct Example { const char *text; uint8_t width; uint8_t scale; uint64_t upper; uint64_t lower; bool negative; };
+    const Example examples[] = {
+        {"0",38,38,0,0,false}, {"-0",18,2,0,0,false}, {"123.45",5,2,0,12345,false},
+        {"-12.3",4,2,0,1230,true}, {"123.4",4,1,0,1234,false}, {"0.001",4,4,0,10,false},
+        {"0.00000000000000000000000000000000000001",38,38,0,1,false},
+        {"18446744073709551616",20,0,1,0,false},
+        {"999999999999999999.99",20,2,5,0x6bc75e2d630fffffULL,false},
+        {"99999999999999999999999999999999999999",38,0,0x4b3b4ca85a86c47aULL,0x098a223fffffffffULL,false},
+        {"-99999999999999999999999999999999999999",38,0,0x4b3b4ca85a86c47aULL,0x098a223fffffffffULL,true}
+    };
+    for (const auto &example : examples) {
+        const auto wire = EncodeOracleNumber(example.text);
+        const auto decoded = TryDecodeOracleScaledInteger(OracleByteView(wire),example.width,example.scale);
+        CHECK(decoded && decoded->upper==example.upper && decoded->lower==example.lower && decoded->negative==example.negative);
+    }
+    for (const auto *text : {"1.235","-1.235","0.0001","999.99","1e38","1e-130"}) {
+        const auto wire = EncodeOracleNumber(text);
+        CHECK(!TryDecodeOracleScaledInteger(OracleByteView(wire),4,2));
+    }
+    for (const auto &wire : {std::vector<uint8_t>{},std::vector<uint8_t>{193},std::vector<uint8_t>{193,0},
+                            std::vector<uint8_t>{193,101},std::vector<uint8_t>{62,102},std::vector<uint8_t>{0,100,102}}) {
+        CHECK(!TryDecodeOracleScaledInteger(OracleByteView(wire),38,0));
+    }
+    for (const auto *text : {"1.25","-1.25"}) {
+        const auto fractional = EncodeOracleNumber(text);
+        CHECK(!TryDecodeOracleScaledInteger(OracleByteView(fractional),4,1));
+    }
+    const auto excessive = EncodeOracleNumber("4e38");
+    CHECK(!TryDecodeOracleScaledInteger(OracleByteView(excessive),38,0));
+    const auto one = EncodeOracleNumber("1");
+    CHECK(!TryDecodeOracleScaledInteger(OracleByteView(one),0,0));
+    CHECK(!TryDecodeOracleScaledInteger(OracleByteView(one),39,0));
+    CHECK(!TryDecodeOracleScaledInteger(OracleByteView(one),4,5));
+}
+
 static void TestPackedBatchOwnsCellsAndBoundsMemory() {
     OraclePackedBatch batch(3);
     batch.AppendRow();
@@ -8832,6 +8868,7 @@ int main() {
     TestTtcErrorCarriesADmlRowId();
     TestTtcRowDataCodec();
     TestPackedBatchOwnsCellsAndBoundsMemory();
+    TestExactScaledNumberCodec();
     TestPackedChunkedFetchAndPreviousRowOwnership();
     TestTtcNegotiation();
     TestO5LogonFlow();

@@ -749,6 +749,40 @@ void TestQueryTypeMappingAndValues() {
 // A scan stores values with WriteOracleValue rather than SetValue(ValueFor(...)).
 // For every mapped type, and for the values each must refuse, the two have to
 // store the same thing or raise the same error.
+void TestExactDecimalsMatchDuckDbThroughBothFetchPaths() {
+    auto script = std::make_shared<FakeScript>();
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    for (const bool packed : {false,true}) {
+        script->packed_fetch = packed;
+        for (const int width : {1,4,9,18,19,38}) {
+            for (const int scale : {0,width/2,width}) {
+                if (!scale && width<=18) { continue; }
+                const auto type = "DECIMAL("+std::to_string(width)+","+std::to_string(scale)+")";
+                auto maximum = std::string(width,'9');
+                if (scale) {
+                    maximum.insert(maximum.size()-scale,".");
+                    if (scale==width) { maximum="0"+maximum; }
+                }
+                const auto smallest = scale ? "0."+std::string(scale-1,'0')+"1" : "1";
+                const auto rounding = scale ? smallest+"5" : "1.5";
+                const auto overflow = "1"+std::string(width-scale,'0');
+                script->columns = {Column("X",2,width,scale)};
+                for (const auto &text : {maximum,"-"+maximum,smallest,"-"+smallest,std::string("0"),rounding,"-"+rounding,overflow}) {
+                    script->rows = {{Number(text)},{WireValue()}};
+                    auto expected = database.Query("SELECT CAST('"+text+"' AS "+type+");");
+                    auto actual = database.Query("SELECT X FROM oracle_query('ora','SELECT X FROM RV_DECIMAL');");
+                    CHECK(expected->HasError()==actual->HasError());
+                    if (!actual->HasError()) {
+                        CHECK(actual->RowCount()==2 && actual->GetValue(0,1).IsNull());
+                        CHECK(duckdb::Value::NotDistinctFrom(expected->GetValue(0,0),actual->GetValue(0,0)));
+                    }
+                }
+            }
+        }
+    }
+}
+
 void TestPackedFetchThroughSql() {
     auto script = std::make_shared<FakeScript>();
     script->packed_fetch = true; script->two_batch_fetch = true;
@@ -5458,6 +5492,7 @@ int main() {
     TestQueryTypeMappingAndValues();
     TestWriteOracleValueMatchesValueFor();
     TestPackedFetchThroughSql();
+    TestExactDecimalsMatchDuckDbThroughBothFetchPaths();
     TestNewTypesReadThroughSql();
     TestBooleanAndLocalZoneReadThroughSql();
     TestProjectedColumns();

@@ -406,7 +406,9 @@ JOIN read_csv('sales.csv') AS s ON s.item_id = i.id;
 Scalar reads keep bytes in a batch-owned arena with cell offsets and a NULL
 bitmap, avoiding a heap allocation for every fetched cell. Compressed Oracle
 rows share unchanged bytes through descriptors; the last row is owned across
-fetch boundaries. Scalar batch storage is limited to 64 MiB including cell
+fetch boundaries. Exact NUMBER values decode directly into DECIMAL scaled integers
+(up to 38 digits); rounding and error cases retain the existing conversion path.
+Scalar batch storage is limited to 64 MiB including cell
 metadata. LOBs, LONG and binary ROWID frames retain their existing read path.
 
 ### Passing values safely (bind parameters)

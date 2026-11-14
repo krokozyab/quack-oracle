@@ -2,6 +2,7 @@
 #include "oracle_scanner/protocol_error.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstring>
 #include <initializer_list>
@@ -457,6 +458,57 @@ std::optional<int64_t> TryDecodeOracleIntegerView(OracleByteView wire) {
         return std::nullopt;
     }
     return static_cast<int64_t>(magnitude);
+}
+
+// Two portable 64-bit limbs: no compiler-specific 128-bit integer dependency.
+static constexpr bool ScaledMultiplyAdd(OracleScaledInteger &value, uint32_t factor, uint32_t digit) {
+    const auto low = (value.lower & 0xffffffffU) * factor + digit;
+    const auto high = (value.lower >> 32U) * factor + (low >> 32U);
+    const auto carry = high >> 32U;
+    if (value.upper > ((std::numeric_limits<uint64_t>::max)() - carry) / factor) { return false; }
+    value.lower = (high << 32U) | (low & 0xffffffffU);
+    value.upper = value.upper * factor + carry;
+    return true;
+}
+
+static constexpr std::array<OracleScaledInteger,39> DecimalLimits() {
+    std::array<OracleScaledInteger,39> result {};
+    result[0].lower = 1;
+    for (size_t i = 1; i < result.size(); i++) {
+        result[i] = result[i-1]; ScaledMultiplyAdd(result[i],10,0);
+    }
+    return result;
+}
+
+std::optional<OracleScaledInteger> TryDecodeOracleScaledInteger(OracleByteView wire, uint8_t precision, uint8_t scale) {
+    if (!precision || precision > 38 || scale > precision || wire.empty() || wire.size() > 21) { return std::nullopt; }
+    OracleScaledInteger result;
+    if (wire.size() == 1 && wire[0] == 0x80) { return result; }
+    result.negative = wire[0] < 0x80;
+    const int64_t exponent = result.negative ? 62 - wire[0] : static_cast<int64_t>(wire[0]) - 193;
+    if (exponent < -65 || exponent > 62 || wire.size() == 1) { return std::nullopt; }
+    size_t end = wire.size();
+    if (result.negative && wire.back() == 102) { end--; }
+    if (end == 1) { return std::nullopt; }
+    const auto digits = static_cast<int64_t>(end - 1);
+    const int64_t shift = 2 * (exponent - digits + 1) + scale;
+    const int tail = result.negative ? 101 - wire[end-1] : wire[end-1] - 1;
+    // A canonical final base-100 digit is nonzero, so it has at most one
+    // removable decimal zero. Anything requiring rounding takes the old path.
+    if (shift < -1 || shift > 38 || (shift == -1 && tail % 10 != 0)) { return std::nullopt; }
+    for (size_t i = 1; i < end; i++) {
+        const int digit = result.negative ? 101 - wire[i] : wire[i] - 1;
+        if (digit < 0 || digit > 99 || (i+1 == end && digit == 0)) { return std::nullopt; }
+        const bool divide_last = shift == -1 && i+1 == end;
+        if (!ScaledMultiplyAdd(result, divide_last ? 10 : 100, divide_last ? digit / 10 : digit)) { return std::nullopt; }
+    }
+    for (int64_t i = 0; i < shift; i++) {
+        if (!ScaledMultiplyAdd(result,10,0)) { return std::nullopt; }
+    }
+    static constexpr auto limits = DecimalLimits();
+    const auto &limit = limits[precision];
+    if (result.upper > limit.upper || (result.upper == limit.upper && result.lower >= limit.lower)) { return std::nullopt; }
+    return result;
 }
 
 constexpr uint32_t INTERVAL_SIGN_OFFSET = 0x80000000U;

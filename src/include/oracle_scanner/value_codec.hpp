@@ -65,6 +65,16 @@ std::string DecodeOracleNumberView(OracleByteView wire);
 std::optional<int64_t> TryDecodeOracleInteger(const std::vector<uint8_t> &wire);
 std::optional<int64_t> TryDecodeOracleIntegerView(OracleByteView wire);
 
+struct OracleScaledInteger {
+    uint64_t upper = 0;
+    uint64_t lower = 0;
+    bool negative = false;
+};
+// Exact scaled magnitude only. Rounding, overflow or malformed input returns
+// no value so the existing decimal conversion owns all error/rounding policy.
+std::optional<OracleScaledInteger> TryDecodeOracleScaledInteger(OracleByteView wire, uint8_t precision, uint8_t scale);
+
+
 // INTERVAL YEAR TO MONTH is 5 bytes: the year as a big-endian uint32 offset by
 // 0x80000000 and the month plus 60. INTERVAL DAY TO SECOND is 11: the day in the
 // same form, then hour, minute and second each plus 60, then the fractional
