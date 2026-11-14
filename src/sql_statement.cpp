@@ -137,7 +137,8 @@ void ValidateOracleQuery(const std::string &sql, const std::vector<OracleBind> &
 void ValidateOracleDml(const std::string &sql, const std::vector<OracleBind> &binds) {
     RejectStatementTerminators(sql);
     if (ClassifyOracleSql(sql) != OracleSqlKind::DML) {
-        throw ProtocolError(ProtocolErrorKind::MALFORMED, "oracle_execute accepts only INSERT, UPDATE, DELETE, or MERGE");
+        throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                            "oracle_execute accepts only INSERT, UPDATE, DELETE, or MERGE");
     }
     ValidateOracleStatementBinds(sql, binds, OracleBindUse::DML);
 }

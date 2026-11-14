@@ -111,7 +111,7 @@ Value ValueFor(const OracleColumn &column, const std::optional<std::vector<uint8
 void WriteOracleValue(Vector &vector, idx_t row, const OracleColumn &column,
                       const std::optional<std::vector<uint8_t>> &wire);
 void WriteOracleValueView(Vector &vector, idx_t row, const OracleColumn &column,
-    const std::optional<oracle_scanner::OracleByteView> &wire);
+                          const std::optional<oracle_scanner::OracleByteView> &wire);
 //! A unique DuckDB output name for a described column.
 std::string OutputName(const OracleColumn &column, idx_t index, std::unordered_set<std::string> &used);
 //! Renders one scalar OUT bind value as text for the callable surface.
@@ -578,11 +578,13 @@ void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const 
 std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const OracleQueryBindData &bind,
                                                   const std::vector<column_t> &selected, idx_t sessions);
 
-unique_ptr<LogicalOperator> MakeOracleMergePlan(TableCatalogEntry &table, TableIndex table_index, OracleWriteTarget target,
-    std::string sql, std::vector<OracleColumn> columns, idx_t key_count, std::vector<idx_t> key_groups, unique_ptr<LogicalOperator> source);
+unique_ptr<LogicalOperator> MakeOracleMergePlan(TableCatalogEntry &table, TableIndex table_index,
+                                                OracleWriteTarget target, std::string sql,
+                                                std::vector<OracleColumn> columns, idx_t key_count,
+                                                std::vector<idx_t> key_groups, unique_ptr<LogicalOperator> source);
 
-PhysicalOperator &PlanOracleCreateAs(ClientContext &context, PhysicalPlanGenerator &planner,
-    PhysicalOperator &source, vector<LogicalType> types, OracleWriteTarget target,
-    std::vector<OracleColumn> columns, std::function<bool(ClientContext &)> create);
+PhysicalOperator &PlanOracleCreateAs(ClientContext &context, PhysicalPlanGenerator &planner, PhysicalOperator &source,
+                                     vector<LogicalType> types, OracleWriteTarget target,
+                                     std::vector<OracleColumn> columns, std::function<bool(ClientContext &)> create);
 
 } // namespace duckdb

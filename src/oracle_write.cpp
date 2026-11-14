@@ -979,7 +979,9 @@ OracleTransactionStatus GetOracleTransactionStatus(ClientContext &context, const
 
 std::function<void()> OracleRollbackForCleanup(ClientContext &context, const std::string &catalog_name) {
     auto state = context.registered_state->GetOrCreate<OracleWriteState>("oracle_scanner.write_state");
-    return [state, catalog_name] { state->Discard(catalog_name); };
+    return [state, catalog_name] {
+        state->Discard(catalog_name);
+    };
 }
 
 void RollbackOracleTransaction(ClientContext &context, const std::string &catalog_name) noexcept {
@@ -1102,10 +1104,13 @@ class OracleInsertOperator final : public PhysicalOperator {
 public:
     OracleInsertOperator(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
                          OracleWriteTarget target_p, std::string sql_p, std::vector<idx_t> source_indexes_p,
-                         std::vector<OracleColumn> bound_columns_p, std::vector<OracleColumn> returned_columns_p, idx_t merge_keys_p = 0, std::function<bool(ClientContext &)> create_p = nullptr, std::vector<idx_t> key_groups_p = {})
+                         std::vector<OracleColumn> bound_columns_p, std::vector<OracleColumn> returned_columns_p,
+                         idx_t merge_keys_p = 0, std::function<bool(ClientContext &)> create_p = nullptr,
+                         std::vector<idx_t> key_groups_p = {})
         : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
           target(std::move(target_p)), sql(std::move(sql_p)), source_indexes(std::move(source_indexes_p)),
-          bound_columns(std::move(bound_columns_p)), returned_columns(std::move(returned_columns_p)), merge_keys(merge_keys_p), create(std::move(create_p)), key_groups(std::move(key_groups_p)) {
+          bound_columns(std::move(bound_columns_p)), returned_columns(std::move(returned_columns_p)),
+          merge_keys(merge_keys_p), create(std::move(create_p)), key_groups(std::move(key_groups_p)) {
     }
 
     string GetName() const override {
@@ -1156,7 +1161,9 @@ public:
                     for (idx_t i = 0; i < key_groups[group]; i++, offset++) {
                         const auto &value = row[offset].value;
                         if (!value) {
-                            throw NotImplementedException("Oracle attached MERGE/upsert requires non-NULL source conflict keys; use oracle_execute with Oracle MERGE SQL for NULL keys");
+                            throw NotImplementedException(
+                                "Oracle attached MERGE/upsert requires non-NULL source conflict keys; use "
+                                "oracle_execute with Oracle MERGE SQL for NULL keys");
                         }
                         // Length framing separates composite keys; bytes are
                         // encoded after the source was cast to the target type.
@@ -1165,7 +1172,8 @@ public:
                         key.append(value->begin(), value->end());
                     }
                     if (!global_state.merge_keys_seen[group].insert(std::move(key)).second) {
-                        throw ConstraintException("Oracle attached MERGE source has a duplicate key after conversion to the target type");
+                        throw ConstraintException(
+                            "Oracle attached MERGE source has a duplicate key after conversion to the target type");
                     }
                 }
             }
@@ -1178,8 +1186,9 @@ public:
         // both, and it discards exactly the uncommitted work a rollback would.
         try {
             auto &session = TransactionSession(context.client, target);
-            global_state.inserted_rows += TranslatingOracleErrors(
-                merge_keys ? "Oracle could not merge" : "Oracle could not insert", [&] { return session.ExecuteBatch(sql, rows); });
+            global_state.inserted_rows +=
+                TranslatingOracleErrors(merge_keys ? "Oracle could not merge" : "Oracle could not insert",
+                                        [&] { return session.ExecuteBatch(sql, rows); });
         } catch (...) {
             PoisonTransactionSession(context.client, target.catalog_name);
             throw;
@@ -1208,9 +1217,8 @@ public:
             AppendChunkBinds(chunk, source_indexes, bound_columns, rows);
             try {
                 auto &session = TransactionSession(context, target);
-                state.inserted_rows += TranslatingOracleErrors("Oracle could not merge", [&] {
-                    return session.ExecuteBatch(sql, rows);
-                });
+                state.inserted_rows +=
+                    TranslatingOracleErrors("Oracle could not merge", [&] { return session.ExecuteBatch(sql, rows); });
             } catch (...) {
                 PoisonTransactionSession(context, target.catalog_name);
                 throw;
@@ -1529,26 +1537,38 @@ namespace {
 class OracleMergePlan final : public LogicalExtensionOperator {
 public:
     OracleMergePlan(TableCatalogEntry &table_p, TableIndex index, OracleWriteTarget target_p, std::string sql_p,
-                    std::vector<OracleColumn> columns_p, idx_t key_count_p, std::vector<idx_t> key_groups_p, unique_ptr<LogicalOperator> source)
-        : table(table_p), index(index), target(std::move(target_p)), sql(std::move(sql_p)), columns(std::move(columns_p)), key_count(key_count_p), key_groups(std::move(key_groups_p)) {
+                    std::vector<OracleColumn> columns_p, idx_t key_count_p, std::vector<idx_t> key_groups_p,
+                    unique_ptr<LogicalOperator> source)
+        : table(table_p), index(index), target(std::move(target_p)), sql(std::move(sql_p)),
+          columns(std::move(columns_p)), key_count(key_count_p), key_groups(std::move(key_groups_p)) {
         children.push_back(std::move(source));
     }
     vector<ColumnBinding> GetColumnBindings() override {
         return {ColumnBinding(index, ProjectionIndex(0))};
     }
-    string GetExtensionName() const override { return "oracle_scanner"; }
-    string GetName() const override { return "ORACLE_MERGE"; }
-    void ResolveTypes() override { types = {LogicalType::BIGINT}; }
+    string GetExtensionName() const override {
+        return "oracle_scanner";
+    }
+    string GetName() const override {
+        return "ORACLE_MERGE";
+    }
+    void ResolveTypes() override {
+        types = {LogicalType::BIGINT};
+    }
     PhysicalOperator &CreatePlan(ClientContext &, PhysicalPlanGenerator &planner) override {
         planner.dependencies.AddDependency(table);
         auto &source = planner.CreatePlan(*children[0]);
         std::vector<idx_t> indexes;
-        for (idx_t i = 0; i < columns.size(); i++) { indexes.push_back(i); }
-        auto &sink = planner.Make<OracleInsertOperator>(types, estimated_cardinality, target, sql,
-            std::move(indexes), columns, std::vector<OracleColumn>(), key_count, nullptr, key_groups);
+        for (idx_t i = 0; i < columns.size(); i++) {
+            indexes.push_back(i);
+        }
+        auto &sink =
+            planner.Make<OracleInsertOperator>(types, estimated_cardinality, target, sql, std::move(indexes), columns,
+                                               std::vector<OracleColumn>(), key_count, nullptr, key_groups);
         sink.children.push_back(source);
         return sink;
     }
+
 private:
     TableCatalogEntry &table;
     TableIndex index;
@@ -1558,16 +1578,19 @@ private:
     idx_t key_count;
     std::vector<idx_t> key_groups;
 };
+} // namespace
+
+unique_ptr<LogicalOperator> MakeOracleMergePlan(TableCatalogEntry &table, TableIndex table_index,
+                                                OracleWriteTarget target, std::string sql,
+                                                std::vector<OracleColumn> columns, idx_t key_count,
+                                                std::vector<idx_t> key_groups, unique_ptr<LogicalOperator> source) {
+    return make_uniq<OracleMergePlan>(table, table_index, std::move(target), std::move(sql), std::move(columns),
+                                      key_count, std::move(key_groups), std::move(source));
 }
 
-unique_ptr<LogicalOperator> MakeOracleMergePlan(TableCatalogEntry &table, TableIndex table_index, OracleWriteTarget target,
-    std::string sql, std::vector<OracleColumn> columns, idx_t key_count, std::vector<idx_t> key_groups, unique_ptr<LogicalOperator> source) {
-    return make_uniq<OracleMergePlan>(table, table_index, std::move(target), std::move(sql), std::move(columns), key_count, std::move(key_groups), std::move(source));
-}
-
-PhysicalOperator &PlanOracleCreateAs(ClientContext &context, PhysicalPlanGenerator &planner,
-    PhysicalOperator &source, vector<LogicalType> types, OracleWriteTarget target,
-    std::vector<OracleColumn> columns, std::function<bool(ClientContext &)> create) {
+PhysicalOperator &PlanOracleCreateAs(ClientContext &context, PhysicalPlanGenerator &planner, PhysicalOperator &source,
+                                     vector<LogicalType> types, OracleWriteTarget target,
+                                     std::vector<OracleColumn> columns, std::function<bool(ClientContext &)> create) {
     vector<unique_ptr<Expression>> expressions;
     vector<LogicalType> input_types;
     std::vector<idx_t> indexes;
@@ -1582,15 +1605,20 @@ PhysicalOperator &PlanOracleCreateAs(ClientContext &context, PhysicalPlanGenerat
             type = LogicalType::TIMESTAMP;
             expression = BoundCastExpression::AddCastToType(context, std::move(expression), type);
         }
-        expressions.push_back(std::move(expression)); input_types.push_back(type); indexes.push_back(i);
+        expressions.push_back(std::move(expression));
+        input_types.push_back(type);
+        indexes.push_back(i);
         names += (names.empty() ? "" : ", ") + KeywordHelper::WriteQuotedAndEscaped(columns[i].name, '"');
-        values += (values.empty() ? "" : ", ") + OracleBindExpression(columns[i], i+1);
+        values += (values.empty() ? "" : ", ") + OracleBindExpression(columns[i], i + 1);
     }
-    auto &projection = planner.Make<PhysicalProjection>(std::move(input_types), std::move(expressions), source.estimated_cardinality);
+    auto &projection =
+        planner.Make<PhysicalProjection>(std::move(input_types), std::move(expressions), source.estimated_cardinality);
     projection.children.push_back(source);
-    auto sql = "INSERT INTO " + OracleObjectReference(target.schema_name, target.object_name) + " (" + names + ") VALUES (" + values + ")";
+    auto sql = "INSERT INTO " + OracleObjectReference(target.schema_name, target.object_name) + " (" + names +
+               ") VALUES (" + values + ")";
     auto &sink = planner.Make<OracleInsertOperator>(std::move(types), source.estimated_cardinality, std::move(target),
-        std::move(sql), std::move(indexes), std::move(columns), std::vector<OracleColumn>(), 0, std::move(create));
+                                                    std::move(sql), std::move(indexes), std::move(columns),
+                                                    std::vector<OracleColumn>(), 0, std::move(create));
     sink.children.push_back(projection);
     return sink;
 }

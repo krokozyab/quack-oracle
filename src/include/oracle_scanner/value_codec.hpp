@@ -74,7 +74,6 @@ struct OracleScaledInteger {
 // no value so the existing decimal conversion owns all error/rounding policy.
 std::optional<OracleScaledInteger> TryDecodeOracleScaledInteger(OracleByteView wire, uint8_t precision, uint8_t scale);
 
-
 // INTERVAL YEAR TO MONTH is 5 bytes: the year as a big-endian uint32 offset by
 // 0x80000000 and the month plus 60. INTERVAL DAY TO SECOND is 11: the day in the
 // same form, then hour, minute and second each plus 60, then the fractional

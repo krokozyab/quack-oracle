@@ -408,8 +408,12 @@ bitmap, avoiding a heap allocation for every fetched cell. Compressed Oracle
 rows share unchanged bytes through descriptors; the last row is owned across
 fetch boundaries. Exact NUMBER values decode directly into DECIMAL scaled integers
 (up to 38 digits); rounding and error cases retain the existing conversion path.
-Scalar batch storage is limited to 64 MiB including cell
-metadata. LOBs, LONG and binary ROWID frames retain their existing read path.
+Packed batch storage is limited to 64 MiB including cell metadata. LOBs, LONG
+and binary ROWID frames retain their existing read path.
+
+Packed scalar storage falls back to ordinary decoding when its 64 MiB budget
+is exceeded. The fallback reuses received bytes and does not repeat Oracle SQL.
+Full and continued rows accept scalar values through 16 MiB on both paths.
 
 ### Passing values safely (bind parameters)
 
@@ -847,6 +851,9 @@ Oracle session is pinned to the transaction. A query inside the transaction
 reads through that same session, so it sees your own uncommitted rows — which
 no other session can see.
 
+Oracle UPDATE sends only explicitly assigned columns, including when changing
+a key or using RETURNING. Oracle enforces constraints and maintains indexes.
+
 `INSERT ... RETURNING` works and asks Oracle for the row it actually stored, so
 identity values, `DEFAULT`s and trigger results come back:
 
@@ -886,6 +893,11 @@ the attached Oracle catalog retains its read-only access flag.
 
 #### Upserts and MERGE
 
+Attached MERGE validates the complete source before remote writes. Repeated
+conflict keys after conversion to target types are rejected, including across
+input batches. Source rows are buffered with DuckDB's buffer manager; the
+validation key sets also require memory proportional to distinct source keys.
+
 ```sql
 INSERT INTO o.ITEMS (ID, LABEL) VALUES (7, 'seven') ON CONFLICT (ID) DO NOTHING;
 INSERT INTO o.ITEMS (ID, LABEL) VALUES (7, 'VII')
@@ -920,7 +932,8 @@ UPDATE of source columns or constants. It sends the same native Oracle MERGE arr
 DML; DELETE, conditional actions and RETURNING are refused. For complete Oracle MERGE SQL,
 use `oracle_execute`, `oracle_execute_transaction`, or `oracle_execute_many`.
 
-For `DROP` and `ALTER`, use `oracle_execute_admin` and reattach the catalog.
+For DDL beyond the supported attached-table operations, use
+`oracle_execute_admin` and reattach the catalog.
 
 Explicit DEFAULT in a plain attached INSERT is currently refused before writing,
 including mixed VALUES rows. Omit the column to apply its Oracle default, or use
@@ -1667,15 +1680,3 @@ This is an independent community project and is not affiliated with Oracle or
 DuckDB Labs.
 
 ---
-
-Oracle UPDATE sends only explicitly assigned columns, including when changing
-a key or using RETURNING. Oracle enforces constraints and maintains indexes.
-
-Attached MERGE validates the complete source before remote writes. Repeated
-conflict keys after conversion to target types are rejected, including across
-input batches. Source rows are buffered with DuckDB's buffer manager; the
-validation key sets also require memory proportional to distinct source keys.
-
-Packed scalar storage falls back to ordinary decoding when its 64 MiB budget
-is exceeded. The fallback reuses received bytes and does not repeat Oracle SQL.
-Full and continued rows accept scalar values through 16 MiB on both paths.

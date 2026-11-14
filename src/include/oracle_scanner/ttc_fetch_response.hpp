@@ -45,7 +45,8 @@ TtcFetchResponse DecodeTtcFetchResponse(const std::vector<uint8_t> &message, con
 class TtcFetchResponseDecoder {
 public:
     TtcFetchResponseDecoder(const std::vector<OracleColumn> &columns, uint8_t ttc_field_version,
-                            const std::optional<TtcRowData> &preceding_row, bool packed_scalars = false, size_t reserve_rows = 0);
+                            const std::optional<TtcRowData> &preceding_row, bool packed_scalars = false,
+                            size_t reserve_rows = 0);
 
     // True once the response is complete. Throws TRUNCATED, as
     // DecodeTtcFetchResponse does, when the bytes end inside a message, and

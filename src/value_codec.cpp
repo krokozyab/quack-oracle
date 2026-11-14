@@ -43,7 +43,9 @@ std::vector<uint8_t> EncodeOracleDate(const OracleDateTime &value) {
             static_cast<uint8_t>(value.second + 1)};
 }
 
-OracleDateTime DecodeOracleDate(const std::vector<uint8_t> &wire) { return DecodeOracleDateView(OracleByteView(wire)); }
+OracleDateTime DecodeOracleDate(const std::vector<uint8_t> &wire) {
+    return DecodeOracleDateView(OracleByteView(wire));
+}
 
 OracleDateTime DecodeOracleDateView(OracleByteView wire) {
     if (wire.size() != 7) {
@@ -82,7 +84,9 @@ std::vector<uint8_t> EncodeOracleTimestamp(const OracleDateTime &value, bool wit
     return result;
 }
 
-OracleDateTime DecodeOracleTimestamp(const std::vector<uint8_t> &wire) { return DecodeOracleTimestampView(OracleByteView(wire)); }
+OracleDateTime DecodeOracleTimestamp(const std::vector<uint8_t> &wire) {
+    return DecodeOracleTimestampView(OracleByteView(wire));
+}
 
 OracleDateTime DecodeOracleTimestampView(OracleByteView wire) {
     if (wire.size() != 7 && wire.size() != 11 && wire.size() != 13) {
@@ -202,7 +206,8 @@ static FLOAT DecodeBinary(OracleByteView wire) {
     const bool positive = (wire[0] & 0x80U) != 0;
     INTEGER bits = 0;
     for (size_t i = 0; i < wire.size(); i++) {
-        const auto byte = positive ? (i ? wire[i] : static_cast<uint8_t>(wire[i] & 0x7fU)) : static_cast<uint8_t>(~wire[i]);
+        const auto byte =
+            positive ? (i ? wire[i] : static_cast<uint8_t>(wire[i] & 0x7fU)) : static_cast<uint8_t>(~wire[i]);
         bits = static_cast<INTEGER>((bits << 8U) | byte);
     }
     FLOAT result;
@@ -218,13 +223,17 @@ std::vector<uint8_t> EncodeOracleBinaryDouble(double value) {
     return EncodeBinary<double, uint64_t>(value);
 }
 
-float DecodeOracleBinaryFloat(const std::vector<uint8_t> &wire) { return DecodeOracleBinaryFloatView(OracleByteView(wire)); }
+float DecodeOracleBinaryFloat(const std::vector<uint8_t> &wire) {
+    return DecodeOracleBinaryFloatView(OracleByteView(wire));
+}
 
 float DecodeOracleBinaryFloatView(OracleByteView wire) {
     return DecodeBinary<float, uint32_t>(wire);
 }
 
-double DecodeOracleBinaryDouble(const std::vector<uint8_t> &wire) { return DecodeOracleBinaryDoubleView(OracleByteView(wire)); }
+double DecodeOracleBinaryDouble(const std::vector<uint8_t> &wire) {
+    return DecodeOracleBinaryDoubleView(OracleByteView(wire));
+}
 
 double DecodeOracleBinaryDoubleView(OracleByteView wire) {
     return DecodeBinary<double, uint64_t>(wire);
@@ -347,7 +356,9 @@ std::vector<uint8_t> EncodeOracleNumber(const std::string &decimal) {
     return result;
 }
 
-std::string DecodeOracleNumber(const std::vector<uint8_t> &wire) { return DecodeOracleNumberView(OracleByteView(wire)); }
+std::string DecodeOracleNumber(const std::vector<uint8_t> &wire) {
+    return DecodeOracleNumberView(OracleByteView(wire));
+}
 
 std::string DecodeOracleNumberView(OracleByteView wire) {
     if (wire.empty() || wire.size() > 21) {
@@ -403,7 +414,9 @@ std::string DecodeOracleNumberView(OracleByteView wire) {
     return negative ? "-" + result : result;
 }
 
-std::optional<int64_t> TryDecodeOracleInteger(const std::vector<uint8_t> &wire) { return TryDecodeOracleIntegerView(OracleByteView(wire)); }
+std::optional<int64_t> TryDecodeOracleInteger(const std::vector<uint8_t> &wire) {
+    return TryDecodeOracleIntegerView(OracleByteView(wire));
+}
 
 std::optional<int64_t> TryDecodeOracleIntegerView(OracleByteView wire) {
     // The checks are DecodeOracleNumber's, answered with "no" rather than
@@ -465,49 +478,72 @@ static constexpr bool ScaledMultiplyAdd(OracleScaledInteger &value, uint32_t fac
     const auto low = (value.lower & 0xffffffffU) * factor + digit;
     const auto high = (value.lower >> 32U) * factor + (low >> 32U);
     const auto carry = high >> 32U;
-    if (value.upper > ((std::numeric_limits<uint64_t>::max)() - carry) / factor) { return false; }
+    if (value.upper > ((std::numeric_limits<uint64_t>::max)() - carry) / factor) {
+        return false;
+    }
     value.lower = (high << 32U) | (low & 0xffffffffU);
     value.upper = value.upper * factor + carry;
     return true;
 }
 
-static constexpr std::array<OracleScaledInteger,39> DecimalLimits() {
-    std::array<OracleScaledInteger,39> result {};
+static constexpr std::array<OracleScaledInteger, 39> DecimalLimits() {
+    std::array<OracleScaledInteger, 39> result {};
     result[0].lower = 1;
     for (size_t i = 1; i < result.size(); i++) {
-        result[i] = result[i-1]; ScaledMultiplyAdd(result[i],10,0);
+        result[i] = result[i - 1];
+        ScaledMultiplyAdd(result[i], 10, 0);
     }
     return result;
 }
 
 std::optional<OracleScaledInteger> TryDecodeOracleScaledInteger(OracleByteView wire, uint8_t precision, uint8_t scale) {
-    if (!precision || precision > 38 || scale > precision || wire.empty() || wire.size() > 21) { return std::nullopt; }
+    if (!precision || precision > 38 || scale > precision || wire.empty() || wire.size() > 21) {
+        return std::nullopt;
+    }
     OracleScaledInteger result;
-    if (wire.size() == 1 && wire[0] == 0x80) { return result; }
+    if (wire.size() == 1 && wire[0] == 0x80) {
+        return result;
+    }
     result.negative = wire[0] < 0x80;
     const int64_t exponent = result.negative ? 62 - wire[0] : static_cast<int64_t>(wire[0]) - 193;
-    if (exponent < -65 || exponent > 62 || wire.size() == 1) { return std::nullopt; }
+    if (exponent < -65 || exponent > 62 || wire.size() == 1) {
+        return std::nullopt;
+    }
     size_t end = wire.size();
-    if (result.negative && wire.back() == 102) { end--; }
-    if (end == 1) { return std::nullopt; }
+    if (result.negative && wire.back() == 102) {
+        end--;
+    }
+    if (end == 1) {
+        return std::nullopt;
+    }
     const auto digits = static_cast<int64_t>(end - 1);
     const int64_t shift = 2 * (exponent - digits + 1) + scale;
-    const int tail = result.negative ? 101 - wire[end-1] : wire[end-1] - 1;
+    const int tail = result.negative ? 101 - wire[end - 1] : wire[end - 1] - 1;
     // A canonical final base-100 digit is nonzero, so it has at most one
     // removable decimal zero. Anything requiring rounding takes the old path.
-    if (shift < -1 || shift > 38 || (shift == -1 && tail % 10 != 0)) { return std::nullopt; }
+    if (shift < -1 || shift > 38 || (shift == -1 && tail % 10 != 0)) {
+        return std::nullopt;
+    }
     for (size_t i = 1; i < end; i++) {
         const int digit = result.negative ? 101 - wire[i] : wire[i] - 1;
-        if (digit < 0 || digit > 99 || (i+1 == end && digit == 0)) { return std::nullopt; }
-        const bool divide_last = shift == -1 && i+1 == end;
-        if (!ScaledMultiplyAdd(result, divide_last ? 10 : 100, divide_last ? digit / 10 : digit)) { return std::nullopt; }
+        if (digit < 0 || digit > 99 || (i + 1 == end && digit == 0)) {
+            return std::nullopt;
+        }
+        const bool divide_last = shift == -1 && i + 1 == end;
+        if (!ScaledMultiplyAdd(result, divide_last ? 10 : 100, divide_last ? digit / 10 : digit)) {
+            return std::nullopt;
+        }
     }
     for (int64_t i = 0; i < shift; i++) {
-        if (!ScaledMultiplyAdd(result,10,0)) { return std::nullopt; }
+        if (!ScaledMultiplyAdd(result, 10, 0)) {
+            return std::nullopt;
+        }
     }
     static constexpr auto limits = DecimalLimits();
     const auto &limit = limits[precision];
-    if (result.upper > limit.upper || (result.upper == limit.upper && result.lower >= limit.lower)) { return std::nullopt; }
+    if (result.upper > limit.upper || (result.upper == limit.upper && result.lower >= limit.lower)) {
+        return std::nullopt;
+    }
     return result;
 }
 

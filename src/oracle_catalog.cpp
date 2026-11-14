@@ -143,8 +143,12 @@ struct OracleAttachedState {
     bool discover_all_schemas = true;
     shared_ptr<OracleAttachedEpoch> epoch = make_shared_ptr<OracleAttachedEpoch>();
     mutable idx_t metadata_version = 0;
-    bool OwnDictionary() const { return owner.empty() || owner == current_schema; }
-    std::string EffectiveOwner() const { return owner.empty() ? current_schema : owner; }
+    bool OwnDictionary() const {
+        return owner.empty() || owner == current_schema;
+    }
+    std::string EffectiveOwner() const {
+        return owner.empty() ? current_schema : owner;
+    }
 
     static std::string Literal(const std::string &text) {
         std::string result = "'";
@@ -199,10 +203,18 @@ struct OracleAttachedState {
 
     void RefreshMetadataLocked() const {
         const auto version = epoch->version.load();
-        if (metadata_version == version) { return; }
-        objects_loaded = metadata_loaded = metadata_complete = primary_keys_loaded = tables_loaded = row_estimates_loaded = false;
-        object_names.clear(); column_cache.clear(); primary_key_cache.clear(); table_names.clear();
-        row_estimates.clear(); distinct_estimates.clear(); value_bounds.clear();
+        if (metadata_version == version) {
+            return;
+        }
+        objects_loaded = metadata_loaded = metadata_complete = primary_keys_loaded = tables_loaded =
+            row_estimates_loaded = false;
+        object_names.clear();
+        column_cache.clear();
+        primary_key_cache.clear();
+        table_names.clear();
+        row_estimates.clear();
+        distinct_estimates.clear();
+        value_bounds.clear();
         metadata_version = version;
     }
     void InvalidateMetadata() {
@@ -263,14 +275,18 @@ struct OracleAttachedState {
         if (found.empty()) {
             found = lookup("UPPER(username) = UPPER(" + Literal(owner) + ")");
         }
-        if (found.empty() && missing_ok) { return false; }
+        if (found.empty() && missing_ok) {
+            return false;
+        }
         if (found.size() != 1) {
             throw BinderException(found.empty() ? "Oracle ATTACH: there is no schema \"%s\" that this user can see"
                                                 : "Oracle ATTACH: schema \"%s\" matches several users by case; write it exactly",
                                   owner);
         }
         owner = found[0];
-        if (owner == current_schema && !named_schema) { owner.clear(); }
+        if (owner == current_schema && !named_schema) {
+            owner.clear();
+        }
         return true;
     }
 
@@ -722,12 +738,15 @@ struct OracleAttachedState {
             OracleMetadataLease session(transaction_pool, config, password);
             auto cursor = TranslatingOracleErrors("Oracle ATTACH could not read primary keys", [&] {
                 return session->Query("SELECT c.table_name, k.column_name FROM " + View("constraints") + " c JOIN " +
-                                      View("cons_columns") + " k ON k.constraint_name = c.constraint_name AND "
-                                      "k.table_name = c.table_name" +
-                                      (OwnDictionary() ? std::string() : " AND k.owner = c.owner") +
-                                      " WHERE c.constraint_type = 'P'" + OwnerCondition("c.owner", "AND") + " AND "
-                                      "c.status = 'ENABLED' AND c.validated = 'VALIDATED' AND c.deferrable = 'NOT DEFERRABLE' ORDER BY c.table_name, "
-                                      "k.position",
+                                          View("cons_columns") +
+                                          " k ON k.constraint_name = c.constraint_name AND "
+                                          "k.table_name = c.table_name" +
+                                          (OwnDictionary() ? std::string() : " AND k.owner = c.owner") +
+                                          " WHERE c.constraint_type = 'P'" + OwnerCondition("c.owner", "AND") +
+                                          " AND "
+                                          "c.status = 'ENABLED' AND c.validated = 'VALIDATED' AND c.deferrable = 'NOT "
+                                          "DEFERRABLE' ORDER BY c.table_name, "
+                                          "k.position",
                                       {});
             });
             for (;;) {
@@ -958,28 +977,39 @@ struct OracleAttachedState {
         std::vector<std::vector<std::string>> result;
         try {
             OracleMetadataLease session(transaction_pool, config, password);
-            auto cursor = session->Query("SELECT c.constraint_name, k.column_name, c.constraint_type FROM " + View("constraints") +
-                " c JOIN " + View("cons_columns") + " k ON k.constraint_name=c.constraint_name AND k.table_name=c.table_name" +
-                (OwnDictionary() ? std::string() : " AND k.owner=c.owner") +
-                " WHERE c.constraint_type='U' AND c.status='ENABLED' AND c.validated='VALIDATED'" +
-                " AND c.deferrable='NOT DEFERRABLE' AND c.table_name=" + KeywordHelper::WriteQuotedAndEscaped(object_name, '\'') +
-                OwnerCondition("c.owner", "AND") + " ORDER BY c.constraint_name,k.position", {});
+            auto cursor = session->Query(
+                "SELECT c.constraint_name, k.column_name, c.constraint_type FROM " + View("constraints") + " c JOIN " +
+                    View("cons_columns") + " k ON k.constraint_name=c.constraint_name AND k.table_name=c.table_name" +
+                    (OwnDictionary() ? std::string() : " AND k.owner=c.owner") +
+                    " WHERE c.constraint_type='U' AND c.status='ENABLED' AND c.validated='VALIDATED'" +
+                    " AND c.deferrable='NOT DEFERRABLE' AND c.table_name=" +
+                    KeywordHelper::WriteQuotedAndEscaped(object_name, '\'') + OwnerCondition("c.owner", "AND") +
+                    " ORDER BY c.constraint_name,k.position",
+                {});
             std::string previous;
             for (;;) {
                 const auto batch = cursor->Fetch(STANDARD_VECTOR_SIZE);
                 for (const auto &row : batch.rows) {
-                    if (row.size() != 3 || !row[0] || !row[1] || !row[2] || std::string(row[2]->begin(), row[2]->end()) != "U") {
+                    if (row.size() != 3 || !row[0] || !row[1] || !row[2] ||
+                        std::string(row[2]->begin(), row[2]->end()) != "U") {
                         throw IOException("Oracle UNIQUE metadata is incomplete");
                     }
                     std::string name(row[0]->begin(), row[0]->end());
-                    if (name != previous || result.empty()) { result.emplace_back(); previous = name; }
+                    if (name != previous || result.empty()) {
+                        result.emplace_back();
+                        previous = name;
+                    }
                     result.back().emplace_back(row[1]->begin(), row[1]->end());
                 }
-                if (batch.exhausted) { break; }
+                if (batch.exhausted) {
+                    break;
+                }
             }
             cursor->Close();
             session.Finish();
-        } catch (const std::exception &) { result.clear(); }
+        } catch (const std::exception &) {
+            result.clear();
+        }
         return result;
     }
 
@@ -1166,7 +1196,8 @@ public:
             auto output_name = OutputName(oracle_columns[index], index, used_names);
             output_names.emplace(oracle_columns[index].name, output_name);
             ColumnDefinition definition(Identifier(output_name), MappedType(oracle_columns[index]));
-            definition.SetDefaultValue(make_uniq<FunctionExpression>(Identifier("__oracle_scanner_default"), vector<unique_ptr<ParsedExpression>>()));
+            definition.SetDefaultValue(make_uniq<FunctionExpression>(Identifier("__oracle_scanner_default"),
+                                                                     vector<unique_ptr<ParsedExpression>>()));
             info->columns.AddColumn(std::move(definition));
             if (!oracle_columns[index].nullable) {
                 // USER_TAB_COLUMNS already carries this, so it costs no query.
@@ -1192,10 +1223,15 @@ public:
             duckdb::vector<Identifier> names;
             for (const auto &column : key) {
                 const auto found = output_names.find(column);
-                if (found == output_names.end()) { names.clear(); break; }
+                if (found == output_names.end()) {
+                    names.clear();
+                    break;
+                }
                 names.emplace_back(found->second);
             }
-            if (!names.empty()) { info->constraints.push_back(make_uniq<UniqueConstraint>(std::move(names), false)); }
+            if (!names.empty()) {
+                info->constraints.push_back(make_uniq<UniqueConstraint>(std::move(names), false));
+            }
         }
         info->on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
         return make_uniq<OracleAttachedTableEntry>(catalog, schema, std::move(info), std::move(state), object_name,
@@ -1237,7 +1273,9 @@ public:
     TableStorageInfo GetStorageInfo(ClientContext &) override {
         TableStorageInfo result;
         for (const auto &constraint : GetConstraints()) {
-            if (constraint->type != ConstraintType::UNIQUE) { continue; }
+            if (constraint->type != ConstraintType::UNIQUE) {
+                continue;
+            }
             const auto &unique = constraint->Cast<UniqueConstraint>();
             IndexInfo index;
             index.is_unique = true;
@@ -1352,43 +1390,104 @@ private:
 
 // DDL is immediate in Oracle. Keep it off the caller's DML session, and keep
 // acknowledged CREATEs for compensating cleanup on transaction rollback.
-std::string DdlQuote(const std::string &name) { return KeywordHelper::WriteQuotedAndEscaped(name, '"'); }
+std::string DdlQuote(const std::string &name) {
+    return KeywordHelper::WriteQuotedAndEscaped(name, '"');
+}
 
 std::pair<std::string, OracleColumn> DdlType(const LogicalType &type) {
     OracleColumn column;
     std::string sql;
     int precision = 0;
     switch (type.id()) {
-    case LogicalTypeId::BOOLEAN: precision = 1; break;
-    case LogicalTypeId::TINYINT: precision = 3; break;
-    case LogicalTypeId::SMALLINT: precision = 5; break;
-    case LogicalTypeId::INTEGER: precision = 10; break;
-    case LogicalTypeId::BIGINT: precision = 19; break;
-    case LogicalTypeId::UTINYINT: precision = 3; break;
-    case LogicalTypeId::USMALLINT: precision = 5; break;
-    case LogicalTypeId::UINTEGER: precision = 10; break;
-    case LogicalTypeId::UBIGINT: precision = 20; break;
-    case LogicalTypeId::HUGEINT: precision = 38; break;
+    case LogicalTypeId::BOOLEAN:
+        precision = 1;
+        break;
+    case LogicalTypeId::TINYINT:
+        precision = 3;
+        break;
+    case LogicalTypeId::SMALLINT:
+        precision = 5;
+        break;
+    case LogicalTypeId::INTEGER:
+        precision = 10;
+        break;
+    case LogicalTypeId::BIGINT:
+        precision = 19;
+        break;
+    case LogicalTypeId::UTINYINT:
+        precision = 3;
+        break;
+    case LogicalTypeId::USMALLINT:
+        precision = 5;
+        break;
+    case LogicalTypeId::UINTEGER:
+        precision = 10;
+        break;
+    case LogicalTypeId::UBIGINT:
+        precision = 20;
+        break;
+    case LogicalTypeId::HUGEINT:
+        precision = 38;
+        break;
     case LogicalTypeId::DECIMAL:
         column.oracle_type = 2;
         column.precision = DecimalType::GetWidth(type);
         column.scale = DecimalType::GetScale(type);
         sql = "NUMBER(" + std::to_string(column.precision) + "," + std::to_string(column.scale) + ")";
         break;
-    case LogicalTypeId::VARCHAR: column.oracle_type = 1; column.byte_width = 4000; sql = "VARCHAR2(4000 BYTE)"; break;
-    case LogicalTypeId::BLOB: column.oracle_type = 113; sql = "BLOB"; break;
-    case LogicalTypeId::FLOAT: column.oracle_type = 100; sql = "BINARY_FLOAT"; break;
-    case LogicalTypeId::DOUBLE: column.oracle_type = 101; sql = "BINARY_DOUBLE"; break;
-    case LogicalTypeId::DATE: column.oracle_type = 12; sql = "DATE"; break;
-    case LogicalTypeId::TIMESTAMP_SEC: column.oracle_type = 180; column.scale = 0; sql = "TIMESTAMP(0)"; break;
-    case LogicalTypeId::TIMESTAMP_MS: column.oracle_type = 180; column.scale = 3; sql = "TIMESTAMP(3)"; break;
-    case LogicalTypeId::TIMESTAMP: column.oracle_type = 180; column.scale = 6; sql = "TIMESTAMP(6)"; break;
-    case LogicalTypeId::TIMESTAMP_NS: column.oracle_type = 180; column.scale = 9; sql = "TIMESTAMP(9)"; break;
-    case LogicalTypeId::TIMESTAMP_TZ: column.oracle_type = 231; column.scale = 6; sql = "TIMESTAMP(6) WITH LOCAL TIME ZONE"; break;
-    default: throw NotImplementedException("Oracle CREATE/ADD COLUMN does not support DuckDB type %s", type.ToString());
+    case LogicalTypeId::VARCHAR:
+        column.oracle_type = 1;
+        column.byte_width = 4000;
+        sql = "VARCHAR2(4000 BYTE)";
+        break;
+    case LogicalTypeId::BLOB:
+        column.oracle_type = 113;
+        sql = "BLOB";
+        break;
+    case LogicalTypeId::FLOAT:
+        column.oracle_type = 100;
+        sql = "BINARY_FLOAT";
+        break;
+    case LogicalTypeId::DOUBLE:
+        column.oracle_type = 101;
+        sql = "BINARY_DOUBLE";
+        break;
+    case LogicalTypeId::DATE:
+        column.oracle_type = 12;
+        sql = "DATE";
+        break;
+    case LogicalTypeId::TIMESTAMP_SEC:
+        column.oracle_type = 180;
+        column.scale = 0;
+        sql = "TIMESTAMP(0)";
+        break;
+    case LogicalTypeId::TIMESTAMP_MS:
+        column.oracle_type = 180;
+        column.scale = 3;
+        sql = "TIMESTAMP(3)";
+        break;
+    case LogicalTypeId::TIMESTAMP:
+        column.oracle_type = 180;
+        column.scale = 6;
+        sql = "TIMESTAMP(6)";
+        break;
+    case LogicalTypeId::TIMESTAMP_NS:
+        column.oracle_type = 180;
+        column.scale = 9;
+        sql = "TIMESTAMP(9)";
+        break;
+    case LogicalTypeId::TIMESTAMP_TZ:
+        column.oracle_type = 231;
+        column.scale = 6;
+        sql = "TIMESTAMP(6) WITH LOCAL TIME ZONE";
+        break;
+    default:
+        throw NotImplementedException("Oracle CREATE/ADD COLUMN does not support DuckDB type %s", type.ToString());
     }
     if (precision) {
-        column.oracle_type = 2; column.precision = precision; column.scale = 0;
+        column.oracle_type = 2;
+        column.precision = precision;
+        column.scale = 0;
         sql = "NUMBER(" + std::to_string(precision) + ",0)";
     }
     return {sql, column};
@@ -1396,25 +1495,36 @@ std::pair<std::string, OracleColumn> DdlType(const LogicalType &type) {
 
 std::string DdlDefault(const ParsedExpression &expression) {
     if (expression.GetExpressionClass() != ExpressionClass::CONSTANT) {
-        throw NotImplementedException("Oracle DDL supports literal defaults only; use oracle_execute_admin for expressions");
+        throw NotImplementedException(
+            "Oracle DDL supports literal defaults only; use oracle_execute_admin for expressions");
     }
     const auto value = expression.Cast<ConstantExpression>().GetLiteral().ToValue();
-    if (value.IsNull()) { return "NULL"; }
+    if (value.IsNull()) {
+        return "NULL";
+    }
     if (value.type().id() == LogicalTypeId::VARCHAR) {
-        if (value.ToString().find('\0') != std::string::npos) { throw InvalidInputException("Oracle DDL default contains NUL"); }
+        if (value.ToString().find('\0') != std::string::npos) {
+            throw InvalidInputException("Oracle DDL default contains NUL");
+        }
         return KeywordHelper::WriteQuotedAndEscaped(value.ToString(), '\'');
     }
-    if (value.type().id() == LogicalTypeId::BOOLEAN) { return value.GetValue<bool>() ? "1" : "0"; }
+    if (value.type().id() == LogicalTypeId::BOOLEAN) {
+        return value.GetValue<bool>() ? "1" : "0";
+    }
     if (value.type().IsNumeric()) {
         if ((value.type().id() == LogicalTypeId::DOUBLE || value.type().id() == LogicalTypeId::FLOAT) &&
-            !std::isfinite(value.GetValue<double>())) { throw InvalidInputException("Oracle default must be finite"); }
+            !std::isfinite(value.GetValue<double>())) {
+            throw InvalidInputException("Oracle default must be finite");
+        }
         return value.ToString();
     }
     throw NotImplementedException("Oracle DDL default type %s is not supported", value.type().ToString());
 }
 
 std::string DdlColumn(const ColumnDefinition &column) {
-    if (column.Generated()) { throw NotImplementedException("Oracle CREATE does not support generated columns"); }
+    if (column.Generated()) {
+        throw NotImplementedException("Oracle CREATE does not support generated columns");
+    }
     auto sql = DdlQuote(column.Name().GetIdentifierName()) + " " + DdlType(column.Type()).first;
     if (column.HasDefaultValue()) {
         const auto &expression = column.DefaultValue();
@@ -1422,9 +1532,11 @@ std::string DdlColumn(const ColumnDefinition &column) {
             const auto value = expression.Cast<ConstantExpression>().GetLiteral().ToValue();
             const auto type = DdlType(column.Type()).second.oracle_type;
             if (!value.IsNull() && ((type == 1 && value.type().id() != LogicalTypeId::VARCHAR) ||
-                ((type == 2 || type == 100 || type == 101) && !value.type().IsNumeric() && value.type().id() != LogicalTypeId::BOOLEAN) ||
-                (type != 1 && type != 2 && type != 100 && type != 101))) {
-                throw NotImplementedException("Oracle DDL default must match the column type without an implicit conversion");
+                                    ((type == 2 || type == 100 || type == 101) && !value.type().IsNumeric() &&
+                                     value.type().id() != LogicalTypeId::BOOLEAN) ||
+                                    (type != 1 && type != 2 && type != 100 && type != 101))) {
+                throw NotImplementedException(
+                    "Oracle DDL default must match the column type without an implicit conversion");
             }
         }
         sql += " DEFAULT " + DdlDefault(expression);
@@ -1433,32 +1545,44 @@ std::string DdlColumn(const ColumnDefinition &column) {
 }
 
 std::string CreateDdl(const CreateTableInfo &info, const std::string &owner) {
-    if (info.temporary || info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT ||
-        !info.options.empty() || !info.partition_keys.empty() || !info.sort_keys.empty()) {
-        throw NotImplementedException("Oracle CREATE does not support TEMPORARY, OR REPLACE, partitioning or table options");
+    if (info.temporary || info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT || !info.options.empty() ||
+        !info.partition_keys.empty() || !info.sort_keys.empty()) {
+        throw NotImplementedException(
+            "Oracle CREATE does not support TEMPORARY, OR REPLACE, partitioning or table options");
     }
     std::string list;
     for (const auto &column : info.columns.Physical()) {
         list += (list.empty() ? "" : ", ") + DdlColumn(column);
-        if (info.FindNotNullConstraint(column.Logical()).IsValid()) { list += " NOT NULL"; }
+        if (info.FindNotNullConstraint(column.Logical()).IsValid()) {
+            list += " NOT NULL";
+        }
     }
     for (const auto &constraint : info.constraints) {
-        if (constraint->type == ConstraintType::NOT_NULL) { continue; }
-        if (constraint->type != ConstraintType::UNIQUE) { throw NotImplementedException("Oracle CREATE supports NOT NULL, PRIMARY KEY and UNIQUE constraints only"); }
+        if (constraint->type == ConstraintType::NOT_NULL) {
+            continue;
+        }
+        if (constraint->type != ConstraintType::UNIQUE) {
+            throw NotImplementedException("Oracle CREATE supports NOT NULL, PRIMARY KEY and UNIQUE constraints only");
+        }
         const auto &key = constraint->Cast<UniqueConstraint>();
         list += key.IsPrimaryKey() ? ", PRIMARY KEY (" : ", UNIQUE (";
         bool first = true;
         for (const auto index : key.GetLogicalIndexes(info.columns)) {
-            list += (first ? "" : ", ") + DdlQuote(info.columns.GetColumn(index).Name().GetIdentifierName()); first = false;
+            list += (first ? "" : ", ") + DdlQuote(info.columns.GetColumn(index).Name().GetIdentifierName());
+            first = false;
         }
         list += ")";
     }
-    if (list.empty()) { throw InvalidInputException("Oracle CREATE needs columns"); }
+    if (list.empty()) {
+        throw InvalidInputException("Oracle CREATE needs columns");
+    }
     return "CREATE TABLE " + OracleObjectReference(owner, info.GetTableName().GetIdentifierName()) + " (" + list + ")";
 }
 
 std::shared_ptr<oracle_scanner::OracleIoDeadline> DdlDeadline(optional_ptr<ClientContext> context, bool cleanup) {
-    if (!cleanup) { return OracleIoDeadlineFor(*context); }
+    if (!cleanup) {
+        return OracleIoDeadlineFor(*context);
+    }
     // Executor cancellation is already set during error rollback. Compensation
     // uses a separate bounded budget and must not inherit that failed query.
     auto deadline = std::make_shared<oracle_scanner::OracleIoDeadline>();
@@ -1466,11 +1590,14 @@ std::shared_ptr<oracle_scanner::OracleIoDeadline> DdlDeadline(optional_ptr<Clien
     return deadline;
 }
 
-void RunAttachedDdl(optional_ptr<ClientContext> context, const shared_ptr<OracleAttachedState> &state, const std::string &sql, bool cleanup = false, const std::string &lock_table = std::string()) {
+void RunAttachedDdl(optional_ptr<ClientContext> context, const shared_ptr<OracleAttachedState> &state,
+                    const std::string &sql, bool cleanup = false, const std::string &lock_table = std::string()) {
     std::lock_guard<std::mutex> guard(state->epoch->ddl_lock);
     auto config = state->config;
     config.io_deadline = DdlDeadline(context, cleanup);
-    if (cleanup) { config.connect_cancelled = nullptr; }
+    if (cleanup) {
+        config.connect_cancelled = nullptr;
+    }
     try {
         TranslatingOracleErrors("Oracle DDL failed", [&] {
             auto session = oracle_scanner::OpenOracleSession(config, state->password);
@@ -1480,8 +1607,9 @@ void RunAttachedDdl(optional_ptr<ClientContext> context, const shared_ptr<Oracle
             if (!lock_table.empty()) {
                 oracle_scanner::OracleCallRequest request;
                 request.kind = oracle_scanner::OracleCallableKind::ANONYMOUS_BLOCK;
-                request.block = "BEGIN EXECUTE IMMEDIATE " + OracleAttachedState::Literal(
-                    "LOCK TABLE " + lock_table + " IN EXCLUSIVE MODE NOWAIT") + "; END;";
+                request.block = "BEGIN EXECUTE IMMEDIATE " +
+                                OracleAttachedState::Literal("LOCK TABLE " + lock_table + " IN EXCLUSIVE MODE NOWAIT") +
+                                "; END;";
                 session->Call(request);
             }
             session->ExecuteAdmin(sql);
@@ -1492,7 +1620,7 @@ void RunAttachedDdl(optional_ptr<ClientContext> context, const shared_ptr<Oracle
         const auto code = info.find("oracle_error_code");
         if (code != info.end() && code->second == "54") {
             throw IOException(info, "Oracle DDL is blocked by an active transaction, possibly this connection; "
-                                   "COMMIT or ROLLBACK that transaction before retrying");
+                                    "COMMIT or ROLLBACK that transaction before retrying");
         }
         throw;
     }
@@ -1500,24 +1628,36 @@ void RunAttachedDdl(optional_ptr<ClientContext> context, const shared_ptr<Oracle
 }
 
 struct OracleDdlUndo final : ClientContextState {
-    struct Created { shared_ptr<OracleAttachedState> state; std::string name; std::string object_id; };
+    struct Created {
+        shared_ptr<OracleAttachedState> state;
+        std::string name;
+        std::string object_id;
+    };
     std::unordered_map<std::string, std::vector<Created>> created;
     std::unordered_map<std::string, std::function<void()>> rollback_writes;
     ~OracleDdlUndo() override;
 };
 
-std::string DdlObjectId(optional_ptr<ClientContext> context, const shared_ptr<OracleAttachedState> &state, const std::string &name, bool cleanup = false) {
-    auto config = state->config; config.io_deadline = DdlDeadline(context, cleanup);
-    if (cleanup) { config.connect_cancelled = nullptr; }
+std::string DdlObjectId(optional_ptr<ClientContext> context, const shared_ptr<OracleAttachedState> &state,
+                        const std::string &name, bool cleanup = false) {
+    auto config = state->config;
+    config.io_deadline = DdlDeadline(context, cleanup);
+    if (cleanup) {
+        config.connect_cancelled = nullptr;
+    }
     auto session = oracle_scanner::OpenOracleSession(config, state->password);
-    auto cursor = session->Query("SELECT TO_CHAR(object_id) FROM " + state->View("objects") +
-        " WHERE object_type='TABLE' AND object_name=" + OracleAttachedState::Literal(name) + state->OwnerCondition("owner", "AND"), {});
+    auto cursor =
+        session->Query("SELECT TO_CHAR(object_id) FROM " + state->View("objects") +
+                           " WHERE object_type='TABLE' AND object_name=" + OracleAttachedState::Literal(name) +
+                           state->OwnerCondition("owner", "AND"),
+                       {});
     auto batch = cursor->Fetch(2);
     std::string id;
     if (batch.rows.size() == 1 && batch.rows[0].size() == 1 && batch.rows[0][0]) {
         id.assign(batch.rows[0][0]->begin(), batch.rows[0][0]->end());
     }
-    cursor->Close(); session->Close();
+    cursor->Close();
+    session->Close();
     return id;
 }
 
@@ -1532,17 +1672,20 @@ void CompensateOracleCreate(optional_ptr<ClientContext> context, const OracleDdl
     const auto reference = OracleObjectReference(entry.state->owner, entry.name);
     oracle_scanner::OracleCallRequest request;
     request.kind = oracle_scanner::OracleCallableKind::ANONYMOUS_BLOCK;
-    request.block = "DECLARE rv_expected_id CONSTANT VARCHAR2(128) := " + OracleAttachedState::Literal(entry.object_id) +
+    request.block =
+        "DECLARE rv_expected_id CONSTANT VARCHAR2(128) := " + OracleAttachedState::Literal(entry.object_id) +
         "; rv_actual_id VARCHAR2(128); BEGIN "
-        "BEGIN EXECUTE IMMEDIATE " + OracleAttachedState::Literal("LOCK TABLE " + reference + " IN EXCLUSIVE MODE NOWAIT") +
+        "BEGIN EXECUTE IMMEDIATE " +
+        OracleAttachedState::Literal("LOCK TABLE " + reference + " IN EXCLUSIVE MODE NOWAIT") +
         "; EXCEPTION WHEN OTHERS THEN IF SQLCODE=-942 THEN RETURN; ELSE RAISE; END IF; END; "
-        "SELECT TO_CHAR(object_id) INTO rv_actual_id FROM " + entry.state->View("objects") +
+        "SELECT TO_CHAR(object_id) INTO rv_actual_id FROM " +
+        entry.state->View("objects") +
         " WHERE object_type='TABLE' AND object_name=" + OracleAttachedState::Literal(entry.name) +
         entry.state->OwnerCondition("owner", "AND") +
         "; IF rv_actual_id <> rv_expected_id THEN "
         "RAISE_APPLICATION_ERROR(-20907, 'Oracle CREATE rollback refused: table identity changed'); END IF; "
-        "EXECUTE IMMEDIATE " + OracleAttachedState::Literal("DROP TABLE " + reference) +
-        "; EXCEPTION WHEN NO_DATA_FOUND THEN NULL; END;";
+        "EXECUTE IMMEDIATE " +
+        OracleAttachedState::Literal("DROP TABLE " + reference) + "; EXCEPTION WHEN NO_DATA_FOUND THEN NULL; END;";
     TranslatingOracleErrors("Oracle CREATE rollback cleanup failed", [&] {
         auto session = oracle_scanner::OpenOracleSession(config, entry.state->password);
         session->ExecuteAdmin("ALTER SESSION SET DDL_LOCK_TIMEOUT=0");
@@ -1562,7 +1705,9 @@ void CompensateOracleCreates(optional_ptr<ClientContext> context, std::vector<Or
             errors += std::string(errors.empty() ? "" : "; ") + error.what();
         }
     }
-    if (!errors.empty()) { throw IOException("Oracle CREATE rollback cleanup failed: %s", errors); }
+    if (!errors.empty()) {
+        throw IOException("Oracle CREATE rollback cleanup failed: %s", errors);
+    }
 }
 
 OracleDdlUndo::~OracleDdlUndo() {
@@ -1571,7 +1716,9 @@ OracleDdlUndo::~OracleDdlUndo() {
     for (auto &entry : created) {
         try {
             const auto rollback = rollback_writes.find(entry.first);
-            if (rollback != rollback_writes.end()) { rollback->second(); }
+            if (rollback != rollback_writes.end()) {
+                rollback->second();
+            }
             CompensateOracleCreates(nullptr, std::move(entry.second));
         } catch (...) {
             // Destructors cannot report failures; explicit ROLLBACK reports them.
@@ -1581,12 +1728,19 @@ OracleDdlUndo::~OracleDdlUndo() {
 
 void FinishOracleDdl(ClientContext &context, const std::string &catalog, bool commit) {
     auto undo = context.registered_state->Get<OracleDdlUndo>("oracle_scanner.ddl_undo");
-    if (!undo) { return; }
+    if (!undo) {
+        return;
+    }
     auto found = undo->created.find(catalog);
-    if (found == undo->created.end()) { return; }
-    auto entries = std::move(found->second); undo->created.erase(found);
+    if (found == undo->created.end()) {
+        return;
+    }
+    auto entries = std::move(found->second);
+    undo->created.erase(found);
     undo->rollback_writes.erase(catalog);
-    if (!commit) { CompensateOracleCreates(context, std::move(entries)); }
+    if (!commit) {
+        CompensateOracleCreates(context, std::move(entries));
+    }
 }
 
 class OracleSchemaEntry final : public DuckSchemaEntry {
@@ -1597,62 +1751,94 @@ public:
         defaults = generator.get();
         GetCatalogSet(CatalogType::TABLE_ENTRY).SetDefaultGenerator(std::move(generator));
     }
-    shared_ptr<OracleAttachedState> State() const { return state; }
-    static bool IsRelation(CatalogType type) { return type==CatalogType::TABLE_ENTRY || type==CatalogType::VIEW_ENTRY; }
+    shared_ptr<OracleAttachedState> State() const {
+        return state;
+    }
+    static bool IsRelation(CatalogType type) {
+        return type == CatalogType::TABLE_ENTRY || type == CatalogType::VIEW_ENTRY;
+    }
     void Sync(ClientContext &context) {
         std::lock_guard<std::mutex> guard(cache_lock);
         const auto version = state->epoch->version.load();
-        if (version == cached_version) { return; }
+        if (version == cached_version) {
+            return;
+        }
         auto &set = GetCatalogSet(CatalogType::TABLE_ENTRY);
         vector<Identifier> names;
-        set.Scan([&](CatalogEntry &entry) { if (entry.type == CatalogType::TABLE_ENTRY) { names.push_back(entry.name); } });
+        set.Scan([&](CatalogEntry &entry) {
+            if (entry.type == CatalogType::TABLE_ENTRY) {
+                names.push_back(entry.name);
+            }
+        });
         const auto system = CatalogTransaction::GetSystemTransaction(catalog.GetDatabase());
         has_materialized_entries |= !names.empty();
-        for (const auto &name : names) { set.DropEntry(system, name, true); }
+        for (const auto &name : names) {
+            set.DropEntry(system, name, true);
+        }
         if (has_materialized_entries) {
             // A tombstone prevents DuckDB's default generator from running.
             // Restore previously materialized names that Oracle has revived,
             // without eagerly constructing every table in the remote schema.
             std::unordered_set<std::string> scheduled;
-            for (const auto &name : names) { scheduled.insert(name.GetIdentifierName()); }
+            for (const auto &name : names) {
+                scheduled.insert(name.GetIdentifierName());
+            }
             for (const auto &remote : state->ListObjects()) {
                 const auto head = set.GetHeadEntry(Identifier(remote));
-                if (head && head->deleted && scheduled.insert(remote).second) { names.emplace_back(remote); }
+                if (head && head->deleted && scheduled.insert(remote).second) {
+                    names.emplace_back(remote);
+                }
             }
         }
         for (const auto &name : names) {
             auto entry = OracleAttachedTableEntry::Create(context, catalog, *this, state, name.GetIdentifierName());
-            if (entry) { set.CreateEntry(system, entry->name, std::move(entry), LogicalDependencyList()); }
+            if (entry) {
+                set.CreateEntry(system, entry->name, std::move(entry), LogicalDependencyList());
+            }
         }
         defaults->created_all_entries = false;
         cached_version = version;
     }
     optional_ptr<CatalogEntry> LookupEntry(CatalogTransaction transaction, const EntryLookupInfo &lookup) override {
-        if (transaction.context && IsRelation(lookup.GetCatalogType())) { Sync(*transaction.context); }
+        if (transaction.context && IsRelation(lookup.GetCatalogType())) {
+            Sync(*transaction.context);
+        }
         return DuckSchemaEntry::LookupEntry(transaction, lookup);
     }
-    CatalogSet::EntryLookup LookupEntryDetailed(CatalogTransaction transaction, const EntryLookupInfo &lookup) override {
-        if (transaction.context && IsRelation(lookup.GetCatalogType())) { Sync(*transaction.context); }
+    CatalogSet::EntryLookup LookupEntryDetailed(CatalogTransaction transaction,
+                                                const EntryLookupInfo &lookup) override {
+        if (transaction.context && IsRelation(lookup.GetCatalogType())) {
+            Sync(*transaction.context);
+        }
         return DuckSchemaEntry::LookupEntryDetailed(transaction, lookup);
     }
     void Scan(ClientContext &context, CatalogType type, const std::function<void(CatalogEntry &)> &callback) override {
-        if (IsRelation(type)) { Sync(context); }
+        if (IsRelation(type)) {
+            Sync(context);
+        }
         DuckSchemaEntry::Scan(context, type, callback);
     }
-    void Scan(CatalogTransaction transaction, CatalogType type, const std::function<void(CatalogEntry &)> &callback) override {
-        if (transaction.context && IsRelation(type)) { Sync(*transaction.context); }
+    void Scan(CatalogTransaction transaction, CatalogType type,
+              const std::function<void(CatalogEntry &)> &callback) override {
+        if (transaction.context && IsRelation(type)) {
+            Sync(*transaction.context);
+        }
         DuckSchemaEntry::Scan(transaction, type, callback);
     }
     optional_ptr<CatalogEntry> CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) override {
         auto &context = transaction.GetContext();
-        if (catalog.GetAttached().IsReadOnly()) { throw BinderException("Oracle DDL is not allowed on a read-only catalog"); }
+        if (catalog.GetAttached().IsReadOnly()) {
+            throw BinderException("Oracle DDL is not allowed on a read-only catalog");
+        }
         Sync(context);
         const auto &base = info.Base();
         const auto sql = CreateDdl(base, state->owner); // validate everything before side effects
         const auto name = base.GetTableName().GetIdentifierName();
         auto &set = GetCatalogSet(CatalogType::TABLE_ENTRY);
         if (!state->ResolveObjectName(name).empty()) {
-            if (base.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) { return nullptr; }
+            if (base.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
+                return nullptr;
+            }
             throw CatalogException("Oracle table already exists: %s", name);
         }
         RunAttachedDdl(context, state, sql);
@@ -1662,13 +1848,20 @@ public:
         auto &created = undo->created[catalog_name];
         created.push_back({state, name, std::string()});
         created.back().object_id = DdlObjectId(context, state, name);
-        if (created.back().object_id.empty()) { throw IOException("Oracle CREATE succeeded but its object identity could not be read; reconcile the table manually"); }
+        if (created.back().object_id.empty()) {
+            throw IOException(
+                "Oracle CREATE succeeded but its object identity could not be read; reconcile the table manually");
+        }
         Sync(context);
         // Sync may already have restored a previously materialized name.
         auto head = set.GetHeadEntry(Identifier(name));
-        if (head && !head->deleted) { return head; }
+        if (head && !head->deleted) {
+            return head;
+        }
         auto entry = OracleAttachedTableEntry::Create(context, catalog, *this, state, name);
-        if (!entry) { throw IOException("Oracle CREATE succeeded but its table could not be described"); }
+        if (!entry) {
+            throw IOException("Oracle CREATE succeeded but its table could not be described");
+        }
         auto result = entry.get();
         const auto system = CatalogTransaction::GetSystemTransaction(catalog.GetDatabase());
         if (!set.CreateEntry(system, entry->name, std::move(entry), LogicalDependencyList())) {
@@ -1677,83 +1870,135 @@ public:
         return result;
     }
     void DropEntry(ClientContext &context, DropInfo &info) override {
-        if (catalog.GetAttached().IsReadOnly()) { throw BinderException("Oracle DDL is not allowed on a read-only catalog"); }
-        if (info.type != CatalogType::TABLE_ENTRY || info.cascade) { throw NotImplementedException("Oracle DROP supports TABLE without CASCADE only"); }
+        if (catalog.GetAttached().IsReadOnly()) {
+            throw BinderException("Oracle DDL is not allowed on a read-only catalog");
+        }
+        if (info.type != CatalogType::TABLE_ENTRY || info.cascade) {
+            throw NotImplementedException("Oracle DROP supports TABLE without CASCADE only");
+        }
         Sync(context);
         const auto requested = info.GetQualifiedName().Name().GetIdentifierName();
         const auto name = state->ResolveObjectName(requested);
         if (name.empty()) {
-            if (info.if_not_found == OnEntryNotFound::RETURN_NULL) { return; }
+            if (info.if_not_found == OnEntryNotFound::RETURN_NULL) {
+                return;
+            }
             throw CatalogException("Oracle table not found: %s", requested);
         }
-        RunAttachedDdl(context, state, "DROP TABLE " + OracleObjectReference(state->owner, name), false, OracleObjectReference(state->owner, name));
+        RunAttachedDdl(context, state, "DROP TABLE " + OracleObjectReference(state->owner, name), false,
+                       OracleObjectReference(state->owner, name));
         auto undo = context.registered_state->Get<OracleDdlUndo>("oracle_scanner.ddl_undo");
         if (undo) {
             auto &created = undo->created[catalog.GetName().GetIdentifierName()];
-            created.erase(std::remove_if(created.begin(), created.end(), [&](const OracleDdlUndo::Created &item) { return item.name == name && item.state->EffectiveOwner() == state->EffectiveOwner(); }), created.end());
+            created.erase(std::remove_if(created.begin(), created.end(),
+                                         [&](const OracleDdlUndo::Created &item) {
+                                             return item.name == name &&
+                                                    item.state->EffectiveOwner() == state->EffectiveOwner();
+                                         }),
+                          created.end());
         }
         Sync(context);
     }
     void Alter(CatalogTransaction transaction, AlterInfo &info) override {
-        auto &context = transaction.GetContext(); Sync(context);
-        if (catalog.GetAttached().IsReadOnly()) { throw BinderException("Oracle DDL is not allowed on a read-only catalog"); }
-        if (info.type != AlterType::ALTER_TABLE) { throw NotImplementedException("Oracle ALTER supports table changes only"); }
+        auto &context = transaction.GetContext();
+        Sync(context);
+        if (catalog.GetAttached().IsReadOnly()) {
+            throw BinderException("Oracle DDL is not allowed on a read-only catalog");
+        }
+        if (info.type != AlterType::ALTER_TABLE) {
+            throw NotImplementedException("Oracle ALTER supports table changes only");
+        }
         const auto name = state->ResolveObjectName(info.GetQualifiedName().Name().GetIdentifierName());
-        if (name.empty()) { throw CatalogException("Oracle table not found"); }
+        if (name.empty()) {
+            throw CatalogException("Oracle table not found");
+        }
         auto &alter = info.Cast<AlterTableInfo>();
         auto reference = OracleObjectReference(state->owner, name);
         std::string sql = "ALTER TABLE " + reference;
         std::string renamed;
         const auto columns = state->TryDescribe(name);
         const auto column_name = [&](const Identifier &requested) {
-            for (const auto &column : columns) { if (column.name == requested.GetIdentifierName()) { return column.name; } }
+            for (const auto &column : columns) {
+                if (column.name == requested.GetIdentifierName()) {
+                    return column.name;
+                }
+            }
             std::string found;
             for (const auto &column : columns) {
                 if (StringUtil::CIEquals(column.name, requested.GetIdentifierName())) {
-                    if (!found.empty()) { throw BinderException("Oracle column name is ambiguous"); }
+                    if (!found.empty()) {
+                        throw BinderException("Oracle column name is ambiguous");
+                    }
                     found = column.name;
                 }
             }
-            if (found.empty()) { throw BinderException("Oracle column not found: %s", requested); }
+            if (found.empty()) {
+                throw BinderException("Oracle column not found: %s", requested);
+            }
             return found;
         };
         switch (alter.alter_table_type) {
         case AlterTableType::ADD_COLUMN: {
             const auto &add = alter.Cast<AddColumnInfo>();
-            if (add.add_column_constraints.add_unique) { throw NotImplementedException("Oracle ADD COLUMN UNIQUE is not supported"); }
+            if (add.add_column_constraints.add_unique) {
+                throw NotImplementedException("Oracle ADD COLUMN UNIQUE is not supported");
+            }
             bool exists = false;
-            for (const auto &column : columns) { exists |= StringUtil::CIEquals(column.name, add.new_column.Name().GetIdentifierName()); }
-            if (exists && add.if_column_not_exists) { return; }
+            for (const auto &column : columns) {
+                exists |= StringUtil::CIEquals(column.name, add.new_column.Name().GetIdentifierName());
+            }
+            if (exists && add.if_column_not_exists) {
+                return;
+            }
             sql += " ADD (" + DdlColumn(add.new_column);
-            if (add.add_column_constraints.add_not_null) { sql += " NOT NULL"; }
-            sql += ")"; break;
+            if (add.add_column_constraints.add_not_null) {
+                sql += " NOT NULL";
+            }
+            sql += ")";
+            break;
         }
         case AlterTableType::REMOVE_COLUMN: {
             const auto &remove = alter.Cast<RemoveColumnInfo>();
-            if (remove.cascade) { throw NotImplementedException("Oracle DROP COLUMN CASCADE is not supported"); }
+            if (remove.cascade) {
+                throw NotImplementedException("Oracle DROP COLUMN CASCADE is not supported");
+            }
             bool exists = false;
-            for (const auto &column : columns) { exists |= StringUtil::CIEquals(column.name, remove.removed_column.GetIdentifierName()); }
-            if (!exists && remove.if_column_exists) { return; }
-            sql += " DROP COLUMN " + DdlQuote(column_name(remove.removed_column)); break;
+            for (const auto &column : columns) {
+                exists |= StringUtil::CIEquals(column.name, remove.removed_column.GetIdentifierName());
+            }
+            if (!exists && remove.if_column_exists) {
+                return;
+            }
+            sql += " DROP COLUMN " + DdlQuote(column_name(remove.removed_column));
+            break;
         }
         case AlterTableType::RENAME_COLUMN: {
             const auto &rename = alter.Cast<RenameColumnInfo>();
-            sql += " RENAME COLUMN " + DdlQuote(column_name(rename.old_name)) + " TO " + DdlQuote(rename.new_name.GetIdentifierName()); break;
+            sql += " RENAME COLUMN " + DdlQuote(column_name(rename.old_name)) + " TO " +
+                   DdlQuote(rename.new_name.GetIdentifierName());
+            break;
         }
         case AlterTableType::RENAME_TABLE:
             renamed = alter.Cast<RenameTableInfo>().new_table_name.GetIdentifierName();
-            sql += " RENAME TO " + DdlQuote(renamed); break;
-        default: throw NotImplementedException("Oracle ALTER supports ADD/DROP/RENAME COLUMN and RENAME TO only");
+            sql += " RENAME TO " + DdlQuote(renamed);
+            break;
+        default:
+            throw NotImplementedException("Oracle ALTER supports ADD/DROP/RENAME COLUMN and RENAME TO only");
         }
         RunAttachedDdl(context, state, sql, false, reference);
         if (!renamed.empty()) {
             auto undo = context.registered_state->Get<OracleDdlUndo>("oracle_scanner.ddl_undo");
             if (undo) {
-                for (auto &item : undo->created[catalog.GetName().GetIdentifierName()]) { if (item.name == name && item.state->EffectiveOwner() == state->EffectiveOwner()) { item.name = renamed; } }
+                for (auto &item : undo->created[catalog.GetName().GetIdentifierName()]) {
+                    if (item.name == name && item.state->EffectiveOwner() == state->EffectiveOwner()) {
+                        item.name = renamed;
+                    }
+                }
             }
         }
         Sync(context);
     }
+
 private:
     shared_ptr<OracleAttachedState> state;
     std::mutex cache_lock;
@@ -1788,8 +2033,10 @@ public:
                                 table.WriteTarget(static_cast<const std::string &>(GetAttached().GetName())));
     }
 
-    PhysicalOperator &PlanMergeInto(ClientContext &, PhysicalPlanGenerator &, LogicalMergeInto &, PhysicalOperator &) override {
-        throw NotImplementedException("Oracle MERGE/upsert requires the Oracle optimizer rewrite; use oracle_execute with Oracle MERGE SQL");
+    PhysicalOperator &PlanMergeInto(ClientContext &, PhysicalPlanGenerator &, LogicalMergeInto &,
+                                    PhysicalOperator &) override {
+        throw NotImplementedException(
+            "Oracle MERGE/upsert requires the Oracle optimizer rewrite; use oracle_execute with Oracle MERGE SQL");
     }
 
     PhysicalOperator &PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
@@ -1805,8 +2052,8 @@ public:
                                 table.WriteTarget(static_cast<const std::string &>(GetAttached().GetName())));
     }
 
-    PhysicalOperator &PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
-                                        LogicalCreateTable &op, PhysicalOperator &source) override {
+    PhysicalOperator &PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner, LogicalCreateTable &op,
+                                        PhysicalOperator &source) override {
         auto &schema = op.schema;
         planner.dependencies.AddDependency(schema);
         const auto table_state = schema.Cast<OracleSchemaEntry>().State();
@@ -1825,16 +2072,21 @@ public:
             BoundCreateTableInfo bound(schema, base->Copy());
             return static_cast<bool>(schema.CreateTable(CatalogTransaction(schema.catalog, caller), bound));
         };
-        return PlanOracleCreateAs(context, planner, source, op.types, std::move(target), std::move(columns), std::move(create));
+        return PlanOracleCreateAs(context, planner, source, op.types, std::move(target), std::move(columns),
+                                  std::move(create));
     }
 
     ErrorData SupportsCreateTable(BoundCreateTableInfo &info) override {
-        try { (void)CreateDdl(info.Base(), info.schema.Cast<OracleSchemaEntry>().State()->owner); }
-        catch (const std::exception &error) { return ErrorData(error); }
+        try {
+            (void)CreateDdl(info.Base(), info.schema.Cast<OracleSchemaEntry>().State()->owner);
+        } catch (const std::exception &error) {
+            return ErrorData(error);
+        }
         return ErrorData();
     }
-    optional_idx GetCatalogVersion(ClientContext &) override { return state->epoch->version.load(); }
-
+    optional_idx GetCatalogVersion(ClientContext &) override {
+        return state->epoch->version.load();
+    }
 
     optional_ptr<CatalogEntry> CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) override {
         if (info.internal && info.SchemaName() == Identifier(DEFAULT_SCHEMA)) {
@@ -1842,10 +2094,14 @@ public:
             // Other Oracle owners are registered by lookup/discovery below.
             auto entry = make_uniq<OracleSchemaEntry>(*this, info, state);
             auto result = entry.get();
-            if (!GetSchemaCatalogSet().CreateEntry(transaction, info.SchemaName(), std::move(entry), LogicalDependencyList())) { return nullptr; }
+            if (!GetSchemaCatalogSet().CreateEntry(transaction, info.SchemaName(), std::move(entry),
+                                                   LogicalDependencyList())) {
+                return nullptr;
+            }
             return result;
         }
-        throw NotImplementedException("Oracle ATTACH cannot create Oracle users/schemas; use an existing Oracle schema");
+        throw NotImplementedException(
+            "Oracle ATTACH cannot create Oracle users/schemas; use an existing Oracle schema");
     }
 
     void AlterSchema(CatalogTransaction, SchemaCatalogEntry &, AlterSchemaInfo &) override {
@@ -1856,16 +2112,19 @@ public:
         throw NotImplementedException("Oracle ATTACH cannot drop a schema. %s", ORACLE_DDL_ROUTE);
     }
 
-    bool SupportsNestedSchemas() const override { return false; }
+    bool SupportsNestedSchemas() const override {
+        return false;
+    }
 
     optional_ptr<SchemaCatalogEntry> LookupSchema(CatalogTransaction transaction, const EntryLookupInfo &lookup,
                                                   OnEntryNotFound if_not_found) override {
-        return LookupSchemaPath(transaction, lookup, if_not_found, [&](const EntryLookupInfo &root) -> optional_ptr<CatalogEntry> {
-            if (root.GetEntryIdentifier() == Identifier(DEFAULT_SCHEMA)) {
-                return GetSchemaCatalogSet().GetEntry(transaction, root.GetEntryIdentifier());
-            }
-            return NamedSchema(root.GetEntryName()).get();
-        });
+        return LookupSchemaPath(transaction, lookup, if_not_found,
+                                [&](const EntryLookupInfo &root) -> optional_ptr<CatalogEntry> {
+                                    if (root.GetEntryIdentifier() == Identifier(DEFAULT_SCHEMA)) {
+                                        return GetSchemaCatalogSet().GetEntry(transaction, root.GetEntryIdentifier());
+                                    }
+                                    return NamedSchema(root.GetEntryName()).get();
+                                });
     }
 
     void ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) override {
@@ -1876,15 +2135,27 @@ public:
     optional_ptr<SchemaCatalogEntry> NamedSchema(const std::string &requested, bool known_owner = false) {
         std::lock_guard<std::mutex> guard(schema_lock);
         const auto cached = schema_aliases.find(requested);
-        if (cached != schema_aliases.end()) { return cached->second; }
-        if (missing_schemas.count(requested)) { return nullptr; }
-        if (schema_aliases.size() + missing_schemas.size() >= 4096) { throw BinderException("Oracle ATTACH exceeds the 4096 named-schema limit"); }
+        if (cached != schema_aliases.end()) {
+            return cached->second;
+        }
+        if (missing_schemas.count(requested)) {
+            return nullptr;
+        }
+        if (schema_aliases.size() + missing_schemas.size() >= 4096) {
+            throw BinderException("Oracle ATTACH exceeds the 4096 named-schema limit");
+        }
         auto scoped = make_shared_ptr<OracleAttachedState>();
-        scoped->config = state->config; scoped->password = state->password;
-        scoped->secret_name = state->secret_name; scoped->transaction_pool = state->transaction_pool;
-        scoped->current_schema = state->current_schema; scoped->nls_comp_binary = state->nls_comp_binary;
-        scoped->epoch = state->epoch; scoped->named_schema = true; scoped->owner = requested;
-        if (!known_owner && requested != state->current_schema && requested != state->owner && !scoped->ResolveOwner(true)) {
+        scoped->config = state->config;
+        scoped->password = state->password;
+        scoped->secret_name = state->secret_name;
+        scoped->transaction_pool = state->transaction_pool;
+        scoped->current_schema = state->current_schema;
+        scoped->nls_comp_binary = state->nls_comp_binary;
+        scoped->epoch = state->epoch;
+        scoped->named_schema = true;
+        scoped->owner = requested;
+        if (!known_owner && requested != state->current_schema && requested != state->owner &&
+            !scoped->ResolveOwner(true)) {
             missing_schemas.insert(requested);
             return nullptr;
         }
@@ -1893,18 +2164,20 @@ public:
         if (existing) {
             auto &schema = existing->Cast<OracleSchemaEntry>();
             if (schema.State()->EffectiveOwner() != scoped->owner) {
-                throw BinderException("Oracle schemas with case-colliding names cannot coexist in one ATTACH; use separate attachments with SCHEMA");
+                throw BinderException("Oracle schemas with case-colliding names cannot coexist in one ATTACH; use "
+                                      "separate attachments with SCHEMA");
             }
-            schema_aliases.emplace(requested,&schema); return &schema;
+            schema_aliases.emplace(requested, &schema);
+            return &schema;
         }
         CreateSchemaInfo info;
-        info.SetQualifiedName(QualifiedName({Identifier(scoped->owner)},Identifier()));
-        auto entry = make_uniq<OracleSchemaEntry>(*this,info,scoped);
+        info.SetQualifiedName(QualifiedName({Identifier(scoped->owner)}, Identifier()));
+        auto entry = make_uniq<OracleSchemaEntry>(*this, info, scoped);
         auto result = entry.get();
-        if (!GetSchemaCatalogSet().CreateEntry(system,info.SchemaName(),std::move(entry),LogicalDependencyList())) {
+        if (!GetSchemaCatalogSet().CreateEntry(system, info.SchemaName(), std::move(entry), LogicalDependencyList())) {
             throw CatalogException("Oracle schema could not be registered");
         }
-        schema_aliases.emplace(requested,result);
+        schema_aliases.emplace(requested, result);
         return result;
     }
 
@@ -1912,32 +2185,47 @@ public:
         std::vector<std::string> owners;
         {
             std::lock_guard<std::mutex> guard(discovery_lock);
-            if (schemas_discovered) { return; }
-            OracleMetadataLease session(state->transaction_pool,state->config,state->password);
-            auto cursor = TranslatingOracleErrors("Oracle ATTACH could not list accessible schemas",[&] {
-                return session->Query("SELECT DISTINCT o.owner FROM all_objects o JOIN all_users u ON u.username=o.owner "
-                    "WHERE u.oracle_maintained='N' AND o.object_type IN ('TABLE','VIEW') ORDER BY o.owner",{});
+            if (schemas_discovered) {
+                return;
+            }
+            OracleMetadataLease session(state->transaction_pool, state->config, state->password);
+            auto cursor = TranslatingOracleErrors("Oracle ATTACH could not list accessible schemas", [&] {
+                return session->Query(
+                    "SELECT DISTINCT o.owner FROM all_objects o JOIN all_users u ON u.username=o.owner "
+                    "WHERE u.oracle_maintained='N' AND o.object_type IN ('TABLE','VIEW') ORDER BY o.owner",
+                    {});
             });
             // Validate the dictionary shape before interpreting names.
-            if (cursor->Columns().size()==1 && StringUtil::CIEquals(cursor->Columns()[0].name,"OWNER")) {
+            if (cursor->Columns().size() == 1 && StringUtil::CIEquals(cursor->Columns()[0].name, "OWNER")) {
                 for (;;) {
                     const auto batch = cursor->Fetch(128);
                     for (const auto &row : batch.rows) {
-                        if (row.size()!=1 || !row[0]) { throw IOException("Oracle schema listing returned an invalid owner"); }
-                        if (owners.size() >= 4096) { break; }
-                        owners.emplace_back(row[0]->begin(),row[0]->end());
+                        if (row.size() != 1 || !row[0]) {
+                            throw IOException("Oracle schema listing returned an invalid owner");
+                        }
+                        if (owners.size() >= 4096) {
+                            break;
+                        }
+                        owners.emplace_back(row[0]->begin(), row[0]->end());
                     }
-                    if (batch.exhausted || owners.size() >= 4096) { break; }
+                    if (batch.exhausted || owners.size() >= 4096) {
+                        break;
+                    }
                 }
             }
-            cursor->Close(); session.Finish();
+            cursor->Close();
+            session.Finish();
             // Materialization is outside CatalogSet scanning and its locks.
-            std::unordered_map<std::string,size_t> counts;
-            for (const auto &owner : owners) { ++counts[StringUtil::Lower(owner)]; }
+            std::unordered_map<std::string, size_t> counts;
             for (const auto &owner : owners) {
-                if (owner == state->EffectiveOwner() || StringUtil::CIEquals(owner,DEFAULT_SCHEMA) ||
-                    counts[StringUtil::Lower(owner)] != 1) { continue; }
-                NamedSchema(owner,true);
+                ++counts[StringUtil::Lower(owner)];
+            }
+            for (const auto &owner : owners) {
+                if (owner == state->EffectiveOwner() || StringUtil::CIEquals(owner, DEFAULT_SCHEMA) ||
+                    counts[StringUtil::Lower(owner)] != 1) {
+                    continue;
+                }
+                NamedSchema(owner, true);
             }
             schemas_discovered = true;
         }
@@ -1958,7 +2246,7 @@ private:
     std::mutex schema_lock;
     std::mutex discovery_lock;
     bool schemas_discovered = false;
-    std::unordered_map<std::string,OracleSchemaEntry *> schema_aliases;
+    std::unordered_map<std::string, OracleSchemaEntry *> schema_aliases;
     std::unordered_set<std::string> missing_schemas;
 };
 
@@ -2085,7 +2373,9 @@ public:
             RollbackOracleTransaction(*context, catalog_name);
         }
         DuckTransactionManager::RollbackTransaction(transaction);
-        if (context) { FinishOracleDdl(*context, catalog_name, false); }
+        if (context) {
+            FinishOracleDdl(*context, catalog_name, false);
+        }
     }
 
 private:
@@ -2520,11 +2810,13 @@ void ApplyUnconstrainedNumberSetting(ClientContext &context, std::vector<OracleC
 }
 
 void RegisterOracleAttachedCatalog(ExtensionLoader &loader) {
-    ScalarFunction default_marker(Identifier("__oracle_scanner_default"), vector<LogicalType>(), LogicalType::SQLNULL,
+    ScalarFunction default_marker(
+        Identifier("__oracle_scanner_default"), vector<LogicalType>(), LogicalType::SQLNULL,
         [](DataChunk &, ExpressionState &, Vector &result) {
             result.SetVectorType(VectorType::CONSTANT_VECTOR);
             ConstantVector::SetNull(result, true);
-        }, nullptr, nullptr, nullptr, LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
+        },
+        nullptr, nullptr, nullptr, LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
     loader.RegisterFunction(default_marker);
     RegisterOracleOptimizer(loader.GetDatabaseInstance());
     // On by default. Once a filter is handed to a scan DuckDB removes it from

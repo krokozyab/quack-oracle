@@ -3285,7 +3285,8 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
                 }
             }
             try {
-                return state.deferred ? state.cursor->Fetch(STANDARD_VECTOR_SIZE) : state.cursor->FetchPacked(STANDARD_VECTOR_SIZE);
+                return state.deferred ? state.cursor->Fetch(STANDARD_VECTOR_SIZE)
+                                      : state.cursor->FetchPacked(STANDARD_VECTOR_SIZE);
             } catch (...) {
                 if (interrupt) {
                     interrupt->Stop();
@@ -3332,10 +3333,10 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
                 TranslatingOracleErrors("oracle_query could not convert an Oracle value", [&] {
                     if (batch.packed) {
                         WriteOracleValueView(output.data[vector_index], row_index, state.columns[column_index],
-                            batch.packed->Get(row_index, column_index));
+                                             batch.packed->Get(row_index, column_index));
                     } else {
                         WriteOracleValue(output.data[vector_index], row_index, state.columns[column_index],
-                            batch.rows[row_index][column_index]);
+                                         batch.rows[row_index][column_index]);
                     }
                     return true;
                 });

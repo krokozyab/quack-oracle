@@ -87,7 +87,9 @@ struct OracleBatch {
     std::vector<std::vector<std::optional<std::vector<uint8_t>>>> rows;
     bool exhausted = false;
     std::optional<OraclePackedBatch> packed;
-    size_t RowCount() const { return packed ? packed->RowCount() : rows.size(); }
+    size_t RowCount() const {
+        return packed ? packed->RowCount() : rows.size();
+    }
 };
 
 // The enumerators carry a BIND_ prefix because Windows defines IN and OUT as
@@ -123,7 +125,9 @@ public:
     virtual const std::vector<OracleColumn> &Columns() const = 0;
     virtual OracleBatch Fetch(size_t requested_rows) = 0;
     // Optional zero-per-cell-allocation scalar path; legacy consumers keep Fetch.
-    virtual OracleBatch FetchPacked(size_t requested_rows) { return Fetch(requested_rows); }
+    virtual OracleBatch FetchPacked(size_t requested_rows) {
+        return Fetch(requested_rows);
+    }
     virtual void Cancel() = 0;
     virtual void Close() = 0;
 };

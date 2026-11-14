@@ -223,8 +223,8 @@ TtcRowData ExpandWireRow(size_t column_count, const std::vector<size_t> &wire_co
 }
 
 // Same scalar framing as DecodeTtcRowDataPrefix, writing into a bounded arena.
-size_t DecodePackedRow(const uint8_t *data, size_t size, const std::vector<size_t> &selected,
-                       OraclePackedBatch &batch, bool continued) {
+size_t DecodePackedRow(const uint8_t *data, size_t size, const std::vector<size_t> &selected, OraclePackedBatch &batch,
+                       bool continued) {
     ByteReader reader(data, size);
     if (reader.ReadByte() != TTC_MESSAGE_ROW_DATA) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "expected TTC ROW_DATA after row continuation");
@@ -234,21 +234,28 @@ size_t DecodePackedRow(const uint8_t *data, size_t size, const std::vector<size_
     for (const auto column : selected) {
         batch.ClearCell(column);
         const auto first = reader.ReadByte();
-        if (first == 0 || first == TNS_NULL_LENGTH_INDICATOR) { continue; }
+        if (first == 0 || first == TNS_NULL_LENGTH_INDICATOR) {
+            continue;
+        }
         if (first != TNS_LONG_LENGTH_INDICATOR) {
-            const auto at = reader.Position(); reader.Skip(first);
+            const auto at = reader.Position();
+            reader.Skip(first);
             batch.AppendCellBytes(column, data + at, first);
             continue;
         }
         size_t total = 0;
         for (;;) {
             const auto count = reader.ReadUB4();
-            if (!count) { break; }
+            if (!count) {
+                break;
+            }
             if (count > maximum_value_bytes - total) {
                 throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "chunked TTC value exceeds configured limit");
             }
-            const auto at = reader.Position(); reader.Skip(count);
-            batch.AppendCellBytes(column, data + at, count); total += count;
+            const auto at = reader.Position();
+            reader.Skip(count);
+            batch.AppendCellBytes(column, data + at, count);
+            total += count;
         }
     }
     return reader.Position();
@@ -256,8 +263,10 @@ size_t DecodePackedRow(const uint8_t *data, size_t size, const std::vector<size_
 
 } // namespace
 
-TtcFetchResponseDecoder::TtcFetchResponseDecoder(const std::vector<OracleColumn> &columns_p, uint8_t ttc_field_version_p,
-                                                 const std::optional<TtcRowData> &preceding_row_p, bool packed_scalars, size_t reserve_rows)
+TtcFetchResponseDecoder::TtcFetchResponseDecoder(const std::vector<OracleColumn> &columns_p,
+                                                 uint8_t ttc_field_version_p,
+                                                 const std::optional<TtcRowData> &preceding_row_p, bool packed_scalars,
+                                                 size_t reserve_rows)
     : columns(columns_p), ttc_field_version(ttc_field_version_p), preceding_row(preceding_row_p) {
     if (columns.empty() || columns.size() > 4096) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC fetch response has an invalid cursor column count");
@@ -266,7 +275,9 @@ TtcFetchResponseDecoder::TtcFetchResponseDecoder(const std::vector<OracleColumn>
     row_framing = ColumnFraming(columns, row_columns);
     if (packed_scalars) {
         for (const auto framing : row_framing) {
-            if (framing != TtcColumnFraming::SCALAR) { throw ProtocolError(ProtocolErrorKind::UNSUPPORTED, "packed fetch requires scalar framing"); }
+            if (framing != TtcColumnFraming::SCALAR) {
+                throw ProtocolError(ProtocolErrorKind::UNSUPPORTED, "packed fetch requires scalar framing");
+            }
         }
         try {
             result.packed.emplace(columns.size());
@@ -334,8 +345,11 @@ bool TtcFetchResponseDecoder::DecodeInternal(const std::vector<uint8_t> &message
     // was still waiting over, the end-of-call and whether it ends the response
     // — is decided again from the bytes as they now stand, exactly as one pass
     // over the joined response would decide it.
-    if (result.packed) { result.packed->Truncate(kept_rows, kept_bytes); }
-    else { result.rows.erase(result.rows.begin() + static_cast<std::ptrdiff_t>(kept_rows), result.rows.end()); }
+    if (result.packed) {
+        result.packed->Truncate(kept_rows, kept_bytes);
+    } else {
+        result.rows.erase(result.rows.begin() + static_cast<std::ptrdiff_t>(kept_rows), result.rows.end());
+    }
     result.used_row_header_selection = kept_row_header_selection;
     result.used_row_continuation = kept_row_continuation;
     result.completion.reset();
@@ -356,7 +370,9 @@ bool TtcFetchResponseDecoder::DecodeInternal(const std::vector<uint8_t> &message
     };
     const auto keep_packed = [&] {
         if (!row_header_present_columns) {
-            resume_offset = offset; kept_rows = result.packed->RowCount(); kept_bytes = result.packed->ByteCount();
+            resume_offset = offset;
+            kept_rows = result.packed->RowCount();
+            kept_bytes = result.packed->ByteCount();
             kept_row_header_selection = result.used_row_header_selection;
             kept_row_continuation = result.used_row_continuation;
         }
@@ -385,8 +401,12 @@ bool TtcFetchResponseDecoder::DecodeInternal(const std::vector<uint8_t> &message
             if (result.packed) {
                 const bool continued = row_header_present_columns.has_value();
                 offset += DecodePackedRow(at, remaining, wire_columns, *result.packed, continued);
-                if (continued) { result.used_row_header_selection = true; row_header_present_columns.reset(); }
-                keep_packed(); break;
+                if (continued) {
+                    result.used_row_header_selection = true;
+                    row_header_present_columns.reset();
+                }
+                keep_packed();
+                break;
             }
             TtcRowData values;
             if (wire_columns.empty()) {
@@ -419,10 +439,13 @@ bool TtcFetchResponseDecoder::DecodeInternal(const std::vector<uint8_t> &message
             if (result.packed) {
                 const auto continuation = DecodeRowContinuationPrefix(at, remaining, columns.size());
                 const auto selected = WireCarryingColumns(columns, continuation.present_columns);
-                const auto consumed = DecodePackedRow(at + continuation.bytes_consumed,
-                    remaining - continuation.bytes_consumed, selected, *result.packed, true);
+                const auto consumed =
+                    DecodePackedRow(at + continuation.bytes_consumed, remaining - continuation.bytes_consumed, selected,
+                                    *result.packed, true);
                 offset += continuation.bytes_consumed + consumed;
-                result.used_row_continuation = true; keep_packed(); break;
+                result.used_row_continuation = true;
+                keep_packed();
+                break;
             }
             const auto *previous_row = PreviousRow();
             if (previous_row == nullptr) {
@@ -497,8 +520,12 @@ bool TtcFetchResponseDecoder::DecodeInternal(const std::vector<uint8_t> &message
 
 TtcFetchResponse TtcFetchResponseDecoder::Take() {
     if (result.packed) {
-        if (result.packed->RowCount()) { result.last_row = result.packed->MaterializeRow(result.packed->RowCount() - 1); }
-        if (packed_seed) { result.packed->RemoveFirstRow(); }
+        if (result.packed->RowCount()) {
+            result.last_row = result.packed->MaterializeRow(result.packed->RowCount() - 1);
+        }
+        if (packed_seed) {
+            result.packed->RemoveFirstRow();
+        }
         return std::move(result);
     }
     if (const auto *last = PreviousRow()) {

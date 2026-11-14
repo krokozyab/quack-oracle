@@ -68,7 +68,8 @@ public:
     std::vector<uint8_t> ReceiveFetchResponse(OracleStatementHandle handle);
     TtcFetchResponse ReceiveDecodedFetchResponse(OracleStatementHandle handle, const std::vector<OracleColumn> &columns,
                                                  uint8_t server_field_version = 12,
-                                                 const std::optional<TtcRowData> &preceding_row = std::nullopt, bool packed_scalars = false, size_t reserve_rows = 0);
+                                                 const std::optional<TtcRowData> &preceding_row = std::nullopt,
+                                                 bool packed_scalars = false, size_t reserve_rows = 0);
     void MarkFetchExhausted(OracleStatementHandle handle);
     // Discards the local handle immediately and schedules its server cursor
     // for Oracle's next-call CLOSE_CURSORS piggyback when it has one.

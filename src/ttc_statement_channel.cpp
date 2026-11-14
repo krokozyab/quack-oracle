@@ -348,9 +348,10 @@ std::vector<uint8_t> TtcStatementChannel::ReceiveFetchResponse(OracleStatementHa
 }
 
 TtcFetchResponse TtcStatementChannel::ReceiveDecodedFetchResponse(OracleStatementHandle handle,
-                                                                   const std::vector<OracleColumn> &columns,
-                                                                   uint8_t server_field_version,
-                                                                   const std::optional<TtcRowData> &preceding_row, bool packed_scalars, size_t reserve_rows) {
+                                                                  const std::vector<OracleColumn> &columns,
+                                                                  uint8_t server_field_version,
+                                                                  const std::optional<TtcRowData> &preceding_row,
+                                                                  bool packed_scalars, size_t reserve_rows) {
     try {
         // Oracle does not delimit a data response for this client: on a legacy
         // 19c session it never sets END_OF_RESPONSE, and a response too large
