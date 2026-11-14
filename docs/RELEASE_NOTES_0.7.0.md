@@ -2,6 +2,9 @@
 
 ## Fixes
 
+- Schema discovery truncates at 4,096 owners instead of failing ATTACH. Explicit
+  SCHEMA skips discovery; missing named owners are cached until reattachment.
+
 - A commit rejected before the remote COMMIT starts compensates acknowledged
   CREATEs. Only an attempted remote COMMIT retains tables for reconciliation.
 

@@ -506,8 +506,10 @@ name also materializes that alias, so catalog inspection can show its tables
 under both names. `main` is reserved for the default alias; to use an Oracle
 owner named MAIN as the default, select it with SCHEMA.
 
-At ATTACH, discovery lists non-Oracle-maintained owners with visible tables or
-views. Explicit owner names are resolved lazily against ALL_USERS, including
+Without SCHEMA, ATTACH discovers up to 4,096 non-Oracle-maintained owners with
+visible tables or views; larger lists are truncated. With SCHEMA, owner discovery
+is skipped, avoiding an ALL_OBJECTS scan. Other owners remain explicitly
+addressable. Missing owner lookups are cached until reattachment. Explicit owner names are resolved lazily against ALL_USERS, including
 empty schemas: exact spelling first, then a unique match ignoring case. Table
 metadata, keys and statistics have separate caches per owner. Eligible joins
 across owners can execute as one Oracle statement. Discovery and named-schema

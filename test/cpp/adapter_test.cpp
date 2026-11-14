@@ -2857,6 +2857,28 @@ void TestMultipleOracleSchemasShareTransactionsAndIsolateMetadata() {
     CHECK(label("cases.HR.RV_T")=="HR");
     auto collision=database.Query("SELECT * FROM cases.\"hr\".RV_T;");
     CHECK(collision->HasError() && collision->GetError().find("case-colliding")!=std::string::npos);
+    const auto before_miss = script->queries.size();
+    CHECK(database.Query("SELECT * FROM o.RV_NO_SUCH_OWNER.RV_T;")->HasError());
+    const auto after_miss = script->queries.size();
+    CHECK(after_miss > before_miss);
+    CHECK(database.Query("SELECT * FROM o.RV_NO_SUCH_OWNER.RV_T;")->HasError());
+    CHECK(script->queries.size() == after_miss);
+    FakeResponse many_owners {{Column("OWNER", 1)}, {}};
+    for (size_t i = 0; i < 5000; i++) {
+        many_owners.rows.push_back({Text("RV_OWNER_" + std::to_string(i))});
+    }
+    script->routes.insert(script->routes.begin(), {"SELECT DISTINCT o.owner", std::move(many_owners)});
+    const auto before_explicit = script->queries.size();
+    database.Run("ATTACH 'ora' AS explicit_owner (TYPE oracle_scanner, SCHEMA 'HR');");
+    for (size_t i = before_explicit; i < script->queries.size(); i++) {
+        CHECK(script->queries[i].find("SELECT DISTINCT o.owner") == std::string::npos);
+    }
+    database.Run("ATTACH 'ora' AS capped_owners (TYPE oracle_scanner);");
+    auto schemas = database.Query("SELECT count(*) FROM duckdb_schemas() WHERE database_name='capped_owners';");
+    CHECK(!schemas->HasError() && schemas->GetValue(0, 0).ToString() == "4097");
+    database.Run("DETACH capped_owners;");
+    database.Run("DETACH explicit_owner;");
+
     const auto before_type_queries=script->queries.size();
     CHECK(database.Query("SELECT * FROM oracle_query_transaction_typed('o','SELECT ID FROM RV_T',['ID'],['NOT_A_TYPE']);")->HasError());
     CHECK(script->queries.size()==before_type_queries);

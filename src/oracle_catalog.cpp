@@ -140,6 +140,7 @@ struct OracleAttachedState {
     // their explicit owner, using USER_ metadata only for the connected user.
     std::string owner;
     bool named_schema = false;
+    bool discover_all_schemas = true;
     shared_ptr<OracleAttachedEpoch> epoch = make_shared_ptr<OracleAttachedEpoch>();
     mutable idx_t metadata_version = 0;
     bool OwnDictionary() const { return owner.empty() || owner == current_schema; }
@@ -1837,13 +1838,17 @@ public:
         std::lock_guard<std::mutex> guard(schema_lock);
         const auto cached = schema_aliases.find(requested);
         if (cached != schema_aliases.end()) { return cached->second; }
-        if (schema_aliases.size() >= 4096) { throw BinderException("Oracle ATTACH exceeds the 4096 named-schema limit"); }
+        if (missing_schemas.count(requested)) { return nullptr; }
+        if (schema_aliases.size() + missing_schemas.size() >= 4096) { throw BinderException("Oracle ATTACH exceeds the 4096 named-schema limit"); }
         auto scoped = make_shared_ptr<OracleAttachedState>();
         scoped->config = state->config; scoped->password = state->password;
         scoped->secret_name = state->secret_name; scoped->transaction_pool = state->transaction_pool;
         scoped->current_schema = state->current_schema; scoped->nls_comp_binary = state->nls_comp_binary;
         scoped->epoch = state->epoch; scoped->named_schema = true; scoped->owner = requested;
-        if (!known_owner && requested != state->current_schema && requested != state->owner && !scoped->ResolveOwner(true)) { return nullptr; }
+        if (!known_owner && requested != state->current_schema && requested != state->owner && !scoped->ResolveOwner(true)) {
+            missing_schemas.insert(requested);
+            return nullptr;
+        }
         const auto system = CatalogTransaction::GetSystemTransaction(GetDatabase());
         auto existing = GetSchemaCatalogSet().GetEntry(system, Identifier(scoped->owner));
         if (existing) {
@@ -1880,10 +1885,10 @@ public:
                     const auto batch = cursor->Fetch(128);
                     for (const auto &row : batch.rows) {
                         if (row.size()!=1 || !row[0]) { throw IOException("Oracle schema listing returned an invalid owner"); }
-                        if (owners.size()>=4096) { throw BinderException("Oracle ATTACH exceeds the 4096 named-schema limit"); }
+                        if (owners.size() >= 4096) { break; }
                         owners.emplace_back(row[0]->begin(),row[0]->end());
                     }
-                    if (batch.exhausted) { break; }
+                    if (batch.exhausted || owners.size() >= 4096) { break; }
                 }
             }
             cursor->Close(); session.Finish();
@@ -1902,7 +1907,11 @@ public:
     void Initialize(bool) override {
         state->ConnectAndDiscoverSchema();
         DuckCatalog::Initialize(false);
-        DiscoverSchemas();
+        if (state->discover_all_schemas) {
+            DiscoverSchemas();
+        } else {
+            schemas_discovered = true;
+        }
     }
 
 private:
@@ -1911,6 +1920,7 @@ private:
     std::mutex discovery_lock;
     bool schemas_discovered = false;
     std::unordered_map<std::string,OracleSchemaEntry *> schema_aliases;
+    std::unordered_set<std::string> missing_schemas;
 };
 
 constexpr int64_t ORACLE_TRANSACTION_POOL_DEFAULT_SIZE = 2;
@@ -1974,6 +1984,7 @@ unique_ptr<Catalog> OracleAttachedCatalogAttach(optional_ptr<StorageExtensionInf
                 throw BinderException("Oracle ATTACH option SCHEMA takes a schema name as a string");
             }
             state->owner = option.second.GetValue<std::string>();
+            state->discover_all_schemas = false;
         }
     }
     // The local storage DuckDB gives every attached database refuses options it
