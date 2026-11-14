@@ -3538,6 +3538,7 @@ void TestAttachedDdlRefreshesAndCompensates() {
     script->affected_rows = 1;
     std::map<std::string, std::string> identities;
     int next_id = 1;
+    bool incomplete_dictionary = false;
     auto refresh = [&] {
         script->routes.clear();
         script->routes.push_back({"SELECT USER FROM DUAL", {{Column("USER",1)}, {{Text("APP")}}}});
@@ -3555,6 +3556,20 @@ void TestAttachedDdlRefreshesAndCompensates() {
         }
         script->routes.push_back({"FROM user_tables", std::move(tables)});
         script->routes.push_back({"FROM user_views", {{Column("VIEW_NAME",1)}, {}}});
+        if (incomplete_dictionary) {
+            const std::vector<OracleColumn> pointed_columns(dictionary.columns.begin() + 1, dictionary.columns.end());
+            for (const auto &table : script->tables) {
+                FakeResponse pointed {pointed_columns, {}};
+                for (const auto &row : dictionary.rows) {
+                    if (row[0] == Text(table.first)) {
+                        pointed.rows.emplace_back(row.begin() + 1, row.end());
+                    }
+                }
+                script->routes.push_back({"FROM user_tab_columns WHERE table_name = '" + table.first + "'", std::move(pointed)});
+            }
+            script->routes.push_back({"FROM user_tab_columns WHERE table_name =", {pointed_columns, {}}});
+            dictionary.rows.insert(dictionary.rows.begin(), {WireValue()});
+        }
         script->routes.push_back({"FROM user_tab_columns", std::move(dictionary)});
         script->routes.push_back({"FROM user_constraints", {{Column("TABLE_NAME",1),Column("COLUMN_NAME",1)}, {}}});
     };
@@ -3673,6 +3688,23 @@ void TestAttachedDdlRefreshesAndCompensates() {
     script->commit_should_fail = false;
     CHECK(script->tables.count("RV_UNKNOWN")==1);
     database.Run("DROP TABLE o.RV_UNKNOWN;");
+    incomplete_dictionary = true;
+    refresh();
+    database.Run("DETACH o;");
+    database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner);");
+    database.Run("DROP TABLE IF EXISTS o.RV_MISSING;");
+    CHECK(script->tables.count("RV_MISSING") == 0);
+    database.Run("CREATE TABLE IF NOT EXISTS o.RV_MISSING(ID INTEGER);");
+    CHECK(script->tables.count("RV_MISSING") == 1);
+    database.Run("DROP TABLE o.RV_MISSING;");
+    database.Run("CREATE TABLE o.RV_MISSING(ID INTEGER);");
+    CHECK(script->tables.count("RV_MISSING") == 1);
+    database.Run("DROP TABLE o.RV_MISSING;");
+    database.Run("DROP TABLE IF EXISTS o.RV_MISSING;");
+    incomplete_dictionary = false;
+    refresh();
+    database.Run("DETACH o;");
+    database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner);");
     for (const auto *unit : {"TIMESTAMP_S", "TIMESTAMP_MS"}) {
         script->batch_rows.clear();
         database.Run(std::string("CREATE TABLE o.RV_TS AS SELECT CAST(TIMESTAMP '2026-01-02 03:04:05.123' AS ")+unit+") ID;");

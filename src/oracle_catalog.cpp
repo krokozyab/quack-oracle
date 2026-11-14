@@ -1027,12 +1027,12 @@ struct OracleAttachedState {
                 LoadSchemaColumnsLocked();
             }
             if (column_cache.find(requested) != column_cache.end()) {
-                return requested;
+                return column_cache.at(requested).empty() ? std::string() : requested;
             }
             std::string found;
             size_t matches = 0;
             for (const auto &entry : column_cache) {
-                if (StringUtil::CIEquals(entry.first, requested)) {
+                if (!entry.second.empty() && StringUtil::CIEquals(entry.first, requested)) {
                     found = entry.first;
                     matches++;
                 }
@@ -1044,13 +1044,16 @@ struct OracleAttachedState {
                 return std::string();
             }
         }
-        // The bulk load was truncated and does not carry the name: ask for the
-        // spelling Oracle would have stored an unquoted one in.
+        // An incomplete dictionary cannot prove existence. Describe the exact
+        // spelling first, then the spelling of an unquoted Oracle identifier.
+        if (!TryDescribe(requested).empty()) {
+            return requested;
+        }
         auto upper = StringUtil::Upper(requested);
         if (upper != requested && !TryDescribe(upper).empty()) {
             return upper;
         }
-        return requested;
+        return std::string();
     }
 
     // Describes the table from the dictionary and leaves the Oracle statement

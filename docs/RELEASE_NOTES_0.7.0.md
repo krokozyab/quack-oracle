@@ -2,6 +2,9 @@
 
 ## Fixes
 
+- Incomplete dictionary loads verify missing names with a per-table describe;
+  CREATE/DROP IF EXISTS decisions no longer assume the requested object exists.
+
 - Skipping protocol bytes checks bounds and advances without allocating or copying.
 
 - Attached MERGE rejects duplicate source keys after target-type conversion,
