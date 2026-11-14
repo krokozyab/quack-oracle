@@ -1179,7 +1179,7 @@ public:
     // database; an Oracle table simply has no DuckDB-local storage, and saying
     // so leaves the connection usable.
     DataTable &GetStorage() override {
-        throw NotImplementedException("Oracle table \"%s\" is not stored by DuckDB, which cannot drop or change it. %s",
+        throw NotImplementedException("Oracle table \"%s\" has no DuckDB-local storage. MERGE INTO and ON CONFLICT through ATTACH are not supported yet. For DROP or ALTER: %s",
                                       object_name, ORACLE_DDL_ROUTE);
     }
 

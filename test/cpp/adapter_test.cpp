@@ -3184,9 +3184,14 @@ void TestAttachedWritesAgainstAFakeSession() {
     // error invalidated the whole database.
     for (const auto *ddl : {"ALTER TABLE ora.main.ITEMS ADD COLUMN EXTRA INTEGER;",
                             "ALTER TABLE ora.main.ITEMS RENAME TO OTHER;", "DROP TABLE ora.main.ITEMS;",
-                            "CREATE TABLE ora.main.MORE (ID INTEGER);"}) {
+                            "CREATE TABLE ora.main.MORE (ID INTEGER);",
+                            "MERGE INTO ora.main.ITEMS t USING (SELECT 1 AS ID) s ON t.ID=s.ID "
+                            "WHEN MATCHED THEN UPDATE SET LABEL='RV';"}) {
         auto refused = database.Query(ddl);
         CHECK(refused->HasError() && refused->GetError().find("oracle_execute_admin") != std::string::npos);
+        if (std::string(ddl).find("MERGE INTO") == 0) {
+            CHECK(refused->GetError().find("MERGE INTO and ON CONFLICT through ATTACH are not supported yet") != std::string::npos);
+        }
         CHECK(!database.Query("SELECT count(*) FROM ora.main.ITEMS;")->HasError());
     }
 

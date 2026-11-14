@@ -772,6 +772,10 @@ DuckDB enforces visibility. The scanner's in-memory storage wrapper stays
 writable internally because DuckDB cannot open an in-memory database read-only;
 the attached Oracle catalog retains its read-only access flag.
 
+
+`MERGE INTO` and `ON CONFLICT` through an attached Oracle table are not supported yet.
+For `DROP` and `ALTER`, use `oracle_execute_admin` and reattach the catalog.
+
 ### Raw SQL in the attached transaction
 
 The explicit catalog functions pin a session even when a SELECT comes before
