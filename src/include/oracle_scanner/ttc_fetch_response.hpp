@@ -58,6 +58,7 @@ private:
     // that preceded this response, or null when there is neither. It points
     // into the decoded rows, so it is valid only until the next row is added.
     const TtcRowData *PreviousRow() const;
+    bool DecodeInternal(const std::vector<uint8_t> &message);
 
     const std::vector<OracleColumn> &columns;
     uint8_t ttc_field_version;

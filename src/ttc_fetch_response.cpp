@@ -292,6 +292,24 @@ const TtcRowData *TtcFetchResponseDecoder::PreviousRow() const {
 }
 
 bool TtcFetchResponseDecoder::Decode(const std::vector<uint8_t> &message) {
+    try {
+        return DecodeInternal(message);
+    } catch (const ProtocolError &error) {
+        if (!result.packed || error.Kind() != ProtocolErrorKind::LIMIT_EXCEEDED ||
+            std::string(error.what()) != "Oracle packed batch exceeds its memory limit") {
+            throw;
+        }
+        // The caller retains all received bytes. Release the arena and restart
+        // this response through the legacy path; never retry a remote fetch.
+        result = TtcFetchResponse {};
+        resume_offset = kept_rows = kept_bytes = 0;
+        packed_seed = false;
+        kept_row_header_selection = kept_row_continuation = false;
+        return DecodeInternal(message);
+    }
+}
+
+bool TtcFetchResponseDecoder::DecodeInternal(const std::vector<uint8_t> &message) {
     if (message.size() < resume_offset) {
         throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "TTC fetch response is shorter than what was decoded");
     }
@@ -360,7 +378,7 @@ bool TtcFetchResponseDecoder::Decode(const std::vector<uint8_t> &message) {
                 // is its message byte and nothing else.
                 offset += 1;
             } else {
-                auto row = DecodeTtcRowDataPrefix(at, remaining, framing);
+                auto row = DecodeTtcRowDataPrefix(at, remaining, framing, 16U << 20U);
                 values = std::move(row.values);
                 offset += row.bytes_consumed;
             }

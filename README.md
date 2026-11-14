@@ -1664,3 +1664,7 @@ Attached MERGE validates the complete source before remote writes. Repeated
 conflict keys after conversion to target types are rejected, including across
 input batches. Source rows are buffered with DuckDB's buffer manager; the
 validation key sets also require memory proportional to distinct source keys.
+
+Packed scalar storage falls back to ordinary decoding when its 64 MiB budget
+is exceeded. The fallback reuses received bytes and does not repeat Oracle SQL.
+Full and continued rows accept scalar values through 16 MiB on both paths.

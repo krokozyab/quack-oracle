@@ -1399,6 +1399,37 @@ static void TestExactScaledNumberCodec() {
     CHECK(!TryDecodeOracleScaledInteger(OracleByteView(one),4,5));
 }
 
+static void TestPackedFetchFallsBackWhenDescriptorsExceedBudget() {
+    constexpr size_t column_count = 1000;
+    constexpr size_t row_count = 8300;
+    std::vector<OracleColumn> columns(column_count, OracleColumn {"N", 1});
+    std::vector<uint8_t> response;
+    response.reserve(row_count * (column_count + 1) + 1);
+    for (size_t row = 0; row < row_count; row++) {
+        response.push_back(TTC_MESSAGE_ROW_DATA);
+        response.insert(response.end(), column_count, 0);
+    }
+    response.push_back(29);
+    TtcFetchResponseDecoder decoder(columns, 6, std::nullopt, true, row_count);
+    const auto cut = response.size() / 2;
+    try { decoder.Decode(std::vector<uint8_t>(response.begin(), response.begin() + cut)); }
+    catch (const ProtocolError &error) { CHECK(error.Kind() == ProtocolErrorKind::TRUNCATED); }
+    CHECK(decoder.Decode(response));
+    auto result = decoder.Take();
+    CHECK(!result.packed && result.rows.size() == row_count);
+    CHECK(result.rows.front().size() == column_count && !result.rows.back().back());
+    CHECK(result.last_row == result.rows.back());
+
+    const std::vector<OracleColumn> scalar {OracleColumn {"V", 23}};
+    const std::vector<uint8_t> value((1U << 20U) + 1, 'x');
+    ByteWriter large;
+    large.WriteByte(TTC_MESSAGE_ROW_DATA).WriteLengthPrefixed(value).WriteByte(29);
+    const auto ordinary = DecodeTtcFetchResponse(large.Data(), scalar, 6);
+    TtcFetchResponseDecoder packed(scalar, 6, std::nullopt, true);
+    CHECK(packed.Decode(large.Data()));
+    CHECK(packed.Take().packed->MaterializeRow(0) == ordinary.rows[0]);
+}
+
 static void TestPackedBatchOwnsCellsAndBoundsMemory() {
     OraclePackedBatch batch(3);
     batch.AppendRow();
@@ -8883,6 +8914,7 @@ int main() {
     TestTtcErrorNamesTheFailingIteration();
     TestTtcErrorCarriesADmlRowId();
     TestTtcRowDataCodec();
+    TestPackedFetchFallsBackWhenDescriptorsExceedBudget();
     TestPackedBatchOwnsCellsAndBoundsMemory();
     TestExactScaledNumberCodec();
     TestPackedChunkedFetchAndPreviousRowOwnership();

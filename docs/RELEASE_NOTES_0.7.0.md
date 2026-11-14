@@ -27,8 +27,10 @@
   are refused, and discovery/named lookup are bounded to 4,096 names. Reattach
   after external schema/grant changes. READ_ONLY applies to every owner.
 
-- Scalar fetch batches are bounded to 64 MiB including cell descriptors and
-  validity metadata; exceeding the bound reports an explicit limit error.
+- Packed scalar storage is bounded to 64 MiB including cell descriptors and
+  validity metadata. A response exceeding that budget is decoded through the
+  ordinary path without another remote fetch. Both paths allow scalar values
+  through 16 MiB; response reassembly bounds remain enforced.
 
 - Attached CREATE/CTAS, DROP and ALTER (ADD/DROP/RENAME COLUMN, RENAME TO)
   now execute Oracle DDL on separate sessions and refresh the local catalog.
