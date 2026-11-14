@@ -554,7 +554,9 @@ a new lock acquired concurrently after that check.
 CREATE/CTAS is visible in Oracle immediately. On DuckDB ROLLBACK, CTAS failure
 or connection close, the extension attempts a compensating DROP of tables it
 created in that transaction, after rolling back its DML. It checks Oracle's
-object identity first and refuses to drop a replacement table. Explicit
+object identity in the same server block as LOCK NOWAIT and DROP, refusing a
+replacement identity. This removes the client-session gap; Oracle's implicit
+DDL commit still prevents a guarantee against concurrent external DDL. Explicit
 ROLLBACK reports cleanup errors; connection destruction cannot report them.
 Cleanup uses a separate bounded I/O budget. Lost CREATE acknowledgements,
 cleanup failures, and concurrent external DDL can require manual reconciliation;

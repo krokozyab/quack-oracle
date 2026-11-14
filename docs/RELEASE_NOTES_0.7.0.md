@@ -2,6 +2,10 @@
 
 ## Fixes
 
+- CREATE compensation locks, verifies OBJECT_ID and drops in one server block,
+  removing the gap between client sessions. Concurrent external DDL remains
+  outside the compensation guarantee because Oracle DDL implicitly commits.
+
 - oracle_top_n_pushdown=false also disables unordered LIMIT pushdown.
 
 - Schema discovery truncates at 4,096 owners instead of failing ATTACH. Explicit

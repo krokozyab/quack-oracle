@@ -1510,18 +1510,46 @@ std::string DdlObjectId(optional_ptr<ClientContext> context, const shared_ptr<Or
     return id;
 }
 
+void CompensateOracleCreate(optional_ptr<ClientContext> context, const OracleDdlUndo::Created &entry) {
+    if (entry.object_id.empty()) {
+        throw IOException("Oracle CREATE rollback refused a table without a recorded identity");
+    }
+    std::lock_guard<std::mutex> guard(entry.state->epoch->ddl_lock);
+    auto config = entry.state->config;
+    config.io_deadline = DdlDeadline(context, true);
+    config.connect_cancelled = nullptr;
+    const auto reference = OracleObjectReference(entry.state->owner, entry.name);
+    oracle_scanner::OracleCallRequest request;
+    request.kind = oracle_scanner::OracleCallableKind::ANONYMOUS_BLOCK;
+    request.block = "DECLARE rv_expected_id CONSTANT VARCHAR2(128) := " + OracleAttachedState::Literal(entry.object_id) +
+        "; rv_actual_id VARCHAR2(128); BEGIN "
+        "BEGIN EXECUTE IMMEDIATE " + OracleAttachedState::Literal("LOCK TABLE " + reference + " IN EXCLUSIVE MODE NOWAIT") +
+        "; EXCEPTION WHEN OTHERS THEN IF SQLCODE=-942 THEN RETURN; ELSE RAISE; END IF; END; "
+        "SELECT TO_CHAR(object_id) INTO rv_actual_id FROM " + entry.state->View("objects") +
+        " WHERE object_type='TABLE' AND object_name=" + OracleAttachedState::Literal(entry.name) +
+        entry.state->OwnerCondition("owner", "AND") +
+        "; IF rv_actual_id <> rv_expected_id THEN "
+        "RAISE_APPLICATION_ERROR(-20907, 'Oracle CREATE rollback refused: table identity changed'); END IF; "
+        "EXECUTE IMMEDIATE " + OracleAttachedState::Literal("DROP TABLE " + reference) +
+        "; EXCEPTION WHEN NO_DATA_FOUND THEN NULL; END;";
+    TranslatingOracleErrors("Oracle CREATE rollback cleanup failed", [&] {
+        auto session = oracle_scanner::OpenOracleSession(config, entry.state->password);
+        session->ExecuteAdmin("ALTER SESSION SET DDL_LOCK_TIMEOUT=0");
+        session->Call(request);
+        session->Close();
+    });
+    entry.state->InvalidateMetadata();
+}
+
 void CompensateOracleCreates(optional_ptr<ClientContext> context, std::vector<OracleDdlUndo::Created> entries) {
     std::string errors;
     for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
         try {
-            const auto actual = DdlObjectId(context, it->state, it->name, true);
-            if (actual.empty()) { it->state->InvalidateMetadata(); continue; }
-            if (it->object_id.empty() || actual != it->object_id) {
-                it->state->InvalidateMetadata();
-                throw IOException("Oracle CREATE rollback refused to drop a table whose identity changed");
-            }
-            RunAttachedDdl(context, it->state, "DROP TABLE " + OracleObjectReference(it->state->owner, it->name), true);
-        } catch (const std::exception &error) { errors += std::string(errors.empty() ? "" : "; ") + error.what(); }
+            CompensateOracleCreate(context, *it);
+        } catch (const std::exception &error) {
+            it->state->InvalidateMetadata();
+            errors += std::string(errors.empty() ? "" : "; ") + error.what();
+        }
     }
     if (!errors.empty()) { throw IOException("Oracle CREATE rollback cleanup failed: %s", errors); }
 }

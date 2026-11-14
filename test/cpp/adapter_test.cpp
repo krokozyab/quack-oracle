@@ -178,6 +178,7 @@ struct FakeScript {
     // A call that fails the way a composite's row-count check does: Oracle's
     // ORA-20906 after the statements before the failing one have run.
     bool call_should_fail = false;
+    std::function<void(const OracleCallRequest &)> call_action;
 
     // Set to make the scripted cursor fail mid-stream, which is how a protocol
     // failure reaches the adapter after the bind has already succeeded.
@@ -463,6 +464,7 @@ public:
         }
         std::lock_guard<std::mutex> guard(script->record_lock);
         script->calls.push_back(request);
+        if (script->call_action) { script->call_action(request); }
         if (script->call_should_fail) {
             failed = true;
             throw oracle_scanner::ProtocolError(oracle_scanner::ProtocolErrorKind::INVALID_STATE,
@@ -2679,6 +2681,37 @@ void TestHeavyColumnsAreReadAfterTheFilter() {
 // ATTACH ... (SCHEMA 'x') lists another user's tables through the ALL_ views,
 // qualifies every statement with the owner, and settles the name against
 // ALL_USERS. The connected user's own schema, named or not, stays on USER_.
+void SimulateDdlCompensation(const std::shared_ptr<FakeScript> &script,
+                             const std::map<std::string, std::string> &identities,
+                             const OracleCallRequest &request) {
+    if (request.block.find("DECLARE rv_expected_id") != 0) {
+        return;
+    }
+    CHECK(request.block.find("IN EXCLUSIVE MODE NOWAIT") != std::string::npos);
+    const auto first = request.block.find('"');
+    const auto last = request.block.find('"', first + 1);
+    auto name = request.block.substr(first + 1, last - first - 1);
+    auto reference = request.block.substr(first, last - first + 1);
+    if (request.block.compare(last, 3, "\".\"") == 0) {
+        const auto end = request.block.find('"', last + 3);
+        name += "." + request.block.substr(last + 3, end - last - 3);
+        reference = request.block.substr(first, end - first + 1);
+    }
+    auto found = identities.find(name);
+    if (found == identities.end()) { found = identities.find("APP." + name); }
+    if (found == identities.end()) {
+        return;
+    }
+    const auto expected_begin = request.block.find(":= '") + 4;
+    const auto expected_end = request.block.find("'", expected_begin);
+    const auto expected = request.block.substr(expected_begin, expected_end - expected_begin);
+    if (request.block.find("rv_actual_id <> rv_expected_id") != std::string::npos && found->second != expected) {
+        throw duckdb::IOException("Oracle CREATE rollback refused: table identity changed");
+    }
+    CHECK(request.block.find("DROP TABLE " + reference) != std::string::npos);
+    script->admin_action("DROP TABLE " + reference);
+}
+
 void TestMultipleOracleSchemasShareTransactionsAndIsolateMetadata() {
     auto script = std::make_shared<FakeScript>();
     script->affected_rows=1;
@@ -2767,6 +2800,9 @@ void TestMultipleOracleSchemasShareTransactionsAndIsolateMetadata() {
             identities[owner+"."+renamed]=identities.at(qualified);identities.erase(qualified);
         } else { CHECK(false && "unexpected DDL in multi-schema fixture"); }
         refresh();
+    };
+    script->call_action = [&](const OracleCallRequest &request) {
+        SimulateDdlCompensation(script, identities, request);
     };
     auto factory=InstallFake(script);
     TestDatabase database;
@@ -3627,6 +3663,9 @@ void TestAttachedDdlRefreshesAndCompensates() {
         } else { CHECK(false && "unexpected DDL"); }
         refresh();
     };
+    script->call_action = [&](const OracleCallRequest &request) {
+        SimulateDdlCompensation(script, identities, request);
+    };
     auto factory = InstallFake(script);
     TestDatabase database;
     database.Run("ATTACH 'ora' AS o(TYPE oracle_scanner);");
@@ -3675,7 +3714,10 @@ void TestAttachedDdlRefreshesAndCompensates() {
     database.Run("BEGIN;");
     database.Run("CREATE TABLE o.RV_DDL(ID INTEGER);");
     database.Run("ALTER TABLE o.RV_DDL RENAME TO RV_RENAMED;");
+    const auto before_compensation_queries = script->queries.size();
     database.Run("ROLLBACK;");
+    CHECK(script->queries.size() == before_compensation_queries);
+    CHECK(script->calls.back().block.find("rv_actual_id <> rv_expected_id") != std::string::npos);
     CHECK(script->tables.empty());
     database.Run("BEGIN;");
     database.Run("CREATE TABLE o.RV_CTAS AS SELECT 1::INTEGER ID;");
