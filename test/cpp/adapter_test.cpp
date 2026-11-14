@@ -3961,6 +3961,64 @@ void TestAttachedUpsertsUseOracleMerge() {
     CHECK(script->counted_executes.back().find("MERGE INTO") == 0);
 }
 
+void TestAttachedMergesRefuseUnsafeKeyEquality() {
+    struct KeyCase {
+        const char *type;
+        uint16_t oracle_type;
+        const char *nls_comp;
+        const char *collation;
+        const char *value;
+        bool supported;
+    };
+    for (const auto &key : {
+            KeyCase {"CHAR", 96, "BINARY", "BINARY", "'a'", false},
+            KeyCase {"NCHAR", 96, "BINARY", "BINARY", "'a'", false},
+            KeyCase {"VARCHAR2", 1, "BINARY", "BINARY_CI", "'a'", false},
+            KeyCase {"VARCHAR2", 1, "LINGUISTIC", "", "'a'", false},
+            KeyCase {"BINARY_FLOAT", 100, "BINARY", "", "0.0", false},
+            KeyCase {"BINARY_DOUBLE", 101, "BINARY", "", "0.0", false},
+            KeyCase {"VARCHAR2", 1, "BINARY", "BINARY", "'a'", true},
+            KeyCase {"VARCHAR2", 1, "LINGUISTIC", "BINARY", "'a'", true}}) {
+        auto script = std::make_shared<FakeScript>();
+        script->routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+        script->routes.push_back({"nls_session_parameters", {{Column("VALUE", 1)}, {{Text(key.nls_comp)}}}});
+        FakeResponse collations {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("COLLATION", 1)}, {}};
+        if (*key.collation) {
+            collations.rows.push_back({Text("ITEMS"), Text("K"), Text(key.collation)});
+        }
+        script->routes.push_back({"collation IS NOT NULL", std::move(collations)});
+        script->routes.push_back({"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("ITEMS")}}}});
+        script->routes.push_back({"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}});
+        script->routes.push_back({"FROM user_tab_columns",
+            {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+              Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+             {{Text("ITEMS"), Text("K"), Text(key.type), Number("40"), WireValue(), WireValue(), Text("N")},
+              {Text("ITEMS"), Text("V"), Text("VARCHAR2"), Number("40"), WireValue(), WireValue(), Text("Y")}}}});
+        script->routes.push_back({"FROM user_constraints",
+            {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {{Text("ITEMS"), Text("K")}}}});
+        script->tables["ITEMS"] = {{Column("K", key.oracle_type), Column("V", 1)}, {}};
+        script->affected_rows = 1;
+        auto factory = InstallFake(script);
+        TestDatabase database;
+        database.Run("ATTACH 'ora' AS o(TYPE oracle_scanner);");
+        for (const auto &sql : {
+                std::string("MERGE INTO o.ITEMS t USING (VALUES(") + key.value + ",'v')) s(K,V) ON t.K=s.K "
+                    "WHEN NOT MATCHED THEN INSERT(K,V) VALUES(s.K,s.V);",
+                std::string("INSERT INTO o.ITEMS VALUES(") + key.value + ",'v') ON CONFLICT DO NOTHING;"}) {
+            const auto writes = script->counted_executes.size();
+            auto result = database.Query(sql);
+            if (key.supported) {
+                CHECK(!result->HasError());
+                CHECK(script->counted_executes.size() > writes);
+            } else {
+                CHECK(result->HasError() && result->GetError().find("key equality") != std::string::npos);
+                CHECK(script->counted_executes.size() == writes);
+            }
+        }
+        CHECK(!database.Query("SELECT 42;")->HasError());
+    }
+}
+
 void TestAttachedWritesAgainstAFakeSession() {
     const auto text_columns = [](std::initializer_list<const char *> names) {
         std::vector<OracleColumn> result;
@@ -5877,6 +5935,7 @@ int main() {
     TestAttachedCatalogAgainstAFakeSession();
     TestAttachedDdlRefreshesAndCompensates();
     TestAttachedUpsertsUseOracleMerge();
+    TestAttachedMergesRefuseUnsafeKeyEquality();
     TestAttachedWritesAgainstAFakeSession();
     TestAttachedCatalogNamesTheNewTypes();
     TestInsertBindsMatchTheValuePath();

@@ -42,6 +42,9 @@
 
 ## Behaviour changes
 
+- Attached MERGE/upsert refuses CHAR/NCHAR, national or nonbinary text, and
+  BINARY_FLOAT/DOUBLE conflict keys before writing; raw Oracle MERGE remains available.
+
 - Plain attached INSERT refuses explicit DEFAULT before writing instead of
   silently inserting NULL. Omitted columns retain Oracle defaults; use the raw
   Oracle INSERT API when explicit DEFAULT values are required.

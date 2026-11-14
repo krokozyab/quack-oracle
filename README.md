@@ -897,6 +897,10 @@ Attached MERGE validates the complete source before remote writes. Repeated
 conflict keys after conversion to target types are rejected, including across
 input batches. Source rows are buffered with DuckDB's buffer manager; the
 validation key sets also require memory proportional to distinct source keys.
+CHAR/NCHAR, national text, text without proven byte equality and BINARY_FLOAT/
+DOUBLE conflict keys are refused before writing. Their Oracle equality is not
+validated by the bind-byte duplicate check. Use Oracle MERGE SQL through the raw
+execution APIs for those keys.
 
 ```sql
 INSERT INTO o.ITEMS (ID, LABEL) VALUES (7, 'seven') ON CONFLICT (ID) DO NOTHING;

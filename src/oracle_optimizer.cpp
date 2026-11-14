@@ -876,6 +876,18 @@ void RewriteOracleMerges(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
     for (const auto &branch : branches) {
         unordered_set<column_t> columns;
         for (const auto &key : branch) {
+            const auto &column = bind->columns[key.column];
+            // The duplicate check compares target-cast bind bytes. Refuse
+            // keys whose Oracle equality can identify different encodings.
+            if (column.oracle_type == 96 || column.oracle_type == 100 || column.oracle_type == 101 ||
+                (column.oracle_type == 1 &&
+                 (!column.compared_as_bytes || column.character_set_form == 2 || column.xml))) {
+                throw NotImplementedException(
+                    "Oracle MERGE/upsert cannot validate key equality for column \"%s\": "
+                    "CHAR, national or nonbinary text, and BINARY_FLOAT/DOUBLE keys are not supported; "
+                    "use oracle_execute with Oracle MERGE SQL",
+                    column.name);
+            }
             columns.insert(key.column);
         }
         bool enforced = false;
