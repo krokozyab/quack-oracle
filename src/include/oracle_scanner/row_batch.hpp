@@ -14,7 +14,9 @@ namespace oracle_scanner {
 class OracleByteView {
 public:
     OracleByteView(const uint8_t *bytes, size_t count) : bytes(bytes), count(count) {}
-    OracleByteView(const std::vector<uint8_t> &value) : OracleByteView(value.data(), value.size()) {}
+    explicit OracleByteView(const std::vector<uint8_t> &value) : OracleByteView(value.data(), value.size()) {}
+    OracleByteView(std::vector<uint8_t> &&) = delete;
+    OracleByteView(const std::vector<uint8_t> &&) = delete;
     const uint8_t *data() const { return bytes; }
     size_t size() const { return count; }
     bool empty() const { return count == 0; }

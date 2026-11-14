@@ -27,6 +27,7 @@
 
 #include <functional>
 #include <thread>
+#include <type_traits>
 
 #include "oracle_scanner/byte_buffer.hpp"
 #include "oracle_scanner/byte_stream.hpp"
@@ -1431,6 +1432,10 @@ static void TestPackedFetchFallsBackWhenDescriptorsExceedBudget() {
 }
 
 static void TestPackedBatchOwnsCellsAndBoundsMemory() {
+    CHECK((!std::is_convertible<const std::vector<uint8_t> &, OracleByteView>::value));
+    CHECK((std::is_constructible<OracleByteView, const std::vector<uint8_t> &>::value));
+    CHECK((!std::is_constructible<OracleByteView, std::vector<uint8_t> &&>::value));
+    CHECK((!std::is_constructible<OracleByteView, const std::vector<uint8_t> &&>::value));
     OraclePackedBatch batch(3);
     batch.AppendRow();
     std::vector<uint8_t> value {'a','b'};
