@@ -350,7 +350,7 @@ std::vector<uint8_t> TtcStatementChannel::ReceiveFetchResponse(OracleStatementHa
 TtcFetchResponse TtcStatementChannel::ReceiveDecodedFetchResponse(OracleStatementHandle handle,
                                                                    const std::vector<OracleColumn> &columns,
                                                                    uint8_t server_field_version,
-                                                                   const std::optional<TtcRowData> &preceding_row) {
+                                                                   const std::optional<TtcRowData> &preceding_row, bool packed_scalars, size_t reserve_rows) {
     try {
         // Oracle does not delimit a data response for this client: on a legacy
         // 19c session it never sets END_OF_RESPONSE, and a response too large
@@ -364,7 +364,7 @@ TtcFetchResponse TtcStatementChannel::ReceiveDecodedFetchResponse(OracleStatemen
         // decoder resumes after the last row it finished instead of decoding
         // the whole response again for each one. A fragment can split any
         // field, but never a row that has already decoded completely.
-        TtcFetchResponseDecoder decoder(columns, server_field_version, preceding_row);
+        TtcFetchResponseDecoder decoder(columns, server_field_version, preceding_row, packed_scalars, reserve_rows);
         for (size_t fragments = 1;; fragments++) {
             bool complete = false;
             try {

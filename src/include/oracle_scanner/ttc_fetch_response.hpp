@@ -13,6 +13,7 @@ namespace oracle_scanner {
 
 struct TtcFetchResponse {
     std::vector<TtcRowData> rows;
+    std::optional<OraclePackedBatch> packed;
     std::optional<TtcRowData> last_row;
     std::optional<TtcErrorInfo> completion;
     bool exhausted = false;
@@ -44,7 +45,7 @@ TtcFetchResponse DecodeTtcFetchResponse(const std::vector<uint8_t> &message, con
 class TtcFetchResponseDecoder {
 public:
     TtcFetchResponseDecoder(const std::vector<OracleColumn> &columns, uint8_t ttc_field_version,
-                            const std::optional<TtcRowData> &preceding_row);
+                            const std::optional<TtcRowData> &preceding_row, bool packed_scalars = false, size_t reserve_rows = 0);
 
     // True once the response is complete. Throws TRUNCATED, as
     // DecodeTtcFetchResponse does, when the bytes end inside a message, and
@@ -70,6 +71,8 @@ private:
     // were decoded with a row header still waiting, and are decoded again.
     size_t resume_offset = 0;
     size_t kept_rows = 0;
+    size_t kept_bytes = 0;
+    bool packed_seed = false;
     bool kept_row_header_selection = false;
     bool kept_row_continuation = false;
 };

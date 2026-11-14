@@ -110,6 +110,8 @@ Value ValueFor(const OracleColumn &column, const std::optional<std::vector<uint8
 //! building the Value in between.
 void WriteOracleValue(Vector &vector, idx_t row, const OracleColumn &column,
                       const std::optional<std::vector<uint8_t>> &wire);
+void WriteOracleValueView(Vector &vector, idx_t row, const OracleColumn &column,
+    const std::optional<oracle_scanner::OracleByteView> &wire);
 //! A unique DuckDB output name for a described column.
 std::string OutputName(const OracleColumn &column, idx_t index, std::unordered_set<std::string> &used);
 //! Renders one scalar OUT bind value as text for the callable surface.

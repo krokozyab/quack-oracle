@@ -42,7 +42,9 @@ std::vector<uint8_t> EncodeOracleDate(const OracleDateTime &value) {
             static_cast<uint8_t>(value.second + 1)};
 }
 
-OracleDateTime DecodeOracleDate(const std::vector<uint8_t> &wire) {
+OracleDateTime DecodeOracleDate(const std::vector<uint8_t> &wire) { return DecodeOracleDateView(OracleByteView(wire)); }
+
+OracleDateTime DecodeOracleDateView(OracleByteView wire) {
     if (wire.size() != 7) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle DATE must contain exactly 7 bytes");
     }
@@ -79,11 +81,13 @@ std::vector<uint8_t> EncodeOracleTimestamp(const OracleDateTime &value, bool wit
     return result;
 }
 
-OracleDateTime DecodeOracleTimestamp(const std::vector<uint8_t> &wire) {
+OracleDateTime DecodeOracleTimestamp(const std::vector<uint8_t> &wire) { return DecodeOracleTimestampView(OracleByteView(wire)); }
+
+OracleDateTime DecodeOracleTimestampView(OracleByteView wire) {
     if (wire.size() != 7 && wire.size() != 11 && wire.size() != 13) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle TIMESTAMP must contain 7, 11, or 13 bytes");
     }
-    auto result = DecodeOracleDate(std::vector<uint8_t>(wire.begin(), wire.begin() + 7));
+    auto result = DecodeOracleDateView(OracleByteView(wire.data(), 7));
     if (wire.size() >= 11) {
         result.nanosecond = (static_cast<uint32_t>(wire[7]) << 24U) | (static_cast<uint32_t>(wire[8]) << 16U) |
                             (static_cast<uint32_t>(wire[9]) << 8U) | wire[10];
@@ -190,20 +194,14 @@ static std::vector<uint8_t> EncodeBinary(FLOAT value) {
 }
 
 template <class FLOAT, class INTEGER>
-static FLOAT DecodeBinary(const std::vector<uint8_t> &wire) {
+static FLOAT DecodeBinary(OracleByteView wire) {
     if (wire.size() != sizeof(INTEGER)) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle binary floating-point value has wrong size");
     }
-    auto bytes = wire;
-    if ((bytes[0] & 0x80U) != 0) {
-        bytes[0] &= 0x7fU;
-    } else {
-        for (auto &byte : bytes) {
-            byte = static_cast<uint8_t>(~byte);
-        }
-    }
+    const bool positive = (wire[0] & 0x80U) != 0;
     INTEGER bits = 0;
-    for (auto byte : bytes) {
+    for (size_t i = 0; i < wire.size(); i++) {
+        const auto byte = positive ? (i ? wire[i] : static_cast<uint8_t>(wire[i] & 0x7fU)) : static_cast<uint8_t>(~wire[i]);
         bits = static_cast<INTEGER>((bits << 8U) | byte);
     }
     FLOAT result;
@@ -219,11 +217,15 @@ std::vector<uint8_t> EncodeOracleBinaryDouble(double value) {
     return EncodeBinary<double, uint64_t>(value);
 }
 
-float DecodeOracleBinaryFloat(const std::vector<uint8_t> &wire) {
+float DecodeOracleBinaryFloat(const std::vector<uint8_t> &wire) { return DecodeOracleBinaryFloatView(OracleByteView(wire)); }
+
+float DecodeOracleBinaryFloatView(OracleByteView wire) {
     return DecodeBinary<float, uint32_t>(wire);
 }
 
-double DecodeOracleBinaryDouble(const std::vector<uint8_t> &wire) {
+double DecodeOracleBinaryDouble(const std::vector<uint8_t> &wire) { return DecodeOracleBinaryDoubleView(OracleByteView(wire)); }
+
+double DecodeOracleBinaryDoubleView(OracleByteView wire) {
     return DecodeBinary<double, uint64_t>(wire);
 }
 
@@ -344,7 +346,9 @@ std::vector<uint8_t> EncodeOracleNumber(const std::string &decimal) {
     return result;
 }
 
-std::string DecodeOracleNumber(const std::vector<uint8_t> &wire) {
+std::string DecodeOracleNumber(const std::vector<uint8_t> &wire) { return DecodeOracleNumberView(OracleByteView(wire)); }
+
+std::string DecodeOracleNumberView(OracleByteView wire) {
     if (wire.empty() || wire.size() > 21) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle NUMBER wire value has an invalid size");
     }
@@ -398,7 +402,9 @@ std::string DecodeOracleNumber(const std::vector<uint8_t> &wire) {
     return negative ? "-" + result : result;
 }
 
-std::optional<int64_t> TryDecodeOracleInteger(const std::vector<uint8_t> &wire) {
+std::optional<int64_t> TryDecodeOracleInteger(const std::vector<uint8_t> &wire) { return TryDecodeOracleIntegerView(OracleByteView(wire)); }
+
+std::optional<int64_t> TryDecodeOracleIntegerView(OracleByteView wire) {
     // The checks are DecodeOracleNumber's, answered with "no" rather than
     // an error so that the error stays where it was.
     if (wire.empty() || wire.size() > 21) {

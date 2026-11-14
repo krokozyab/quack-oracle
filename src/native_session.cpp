@@ -183,7 +183,9 @@ public:
         return result;
     }
 
-    OracleBatch Fetch(size_t requested_rows) override {
+    OracleBatch Fetch(size_t requested_rows) override { return FetchInternal(requested_rows, false); }
+    OracleBatch FetchPacked(size_t requested_rows) override { return FetchInternal(requested_rows, true); }
+    OracleBatch FetchInternal(size_t requested_rows, bool packed_requested) {
         if (closed || !lifetime->open || requested_rows == 0) {
             throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "Oracle cursor is closed or fetch size is zero");
         }
@@ -227,11 +229,16 @@ public:
             }
             auto response_limits=prefetch_limits;
             response_limits.maximum_rows=count;
+            bool packed_scalars = packed_requested && result.rows.empty();
+            for (const auto &column : columns) {
+                packed_scalars &= TtcFramingForType(column.oracle_type) == TtcColumnFraming::SCALAR;
+            }
             auto response=prefetch_active ?
                 channel.ReceiveDecodedLobPrefetchFetchResponse(handle,columns,response_limits,server_field_version,previous_row) :
-                channel.ReceiveDecodedFetchResponse(handle,columns,server_field_version,previous_row);
-            previous_row = response.last_row;
+                channel.ReceiveDecodedFetchResponse(handle,columns,server_field_version,previous_row,packed_scalars,count);
+            previous_row = std::move(response.last_row);
             exhausted = response.exhausted;
+            result.packed = std::move(response.packed);
             OracleBatch decoded;decoded.rows=std::move(response.rows);ResolveLobs(decoded,prefetch_active);
             result.rows.insert(result.rows.end(),std::make_move_iterator(decoded.rows.begin()),std::make_move_iterator(decoded.rows.end()));
             if (exhausted) {

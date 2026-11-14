@@ -612,6 +612,49 @@ bool TryWriteDenseVector(Vector &vector, idx_t row, const OracleColumn &column, 
 // not flat, a type it does not cover, and every value that would be refused —
 // takes the SetValue(ValueFor(...)) path itself, so a refusal raises exactly
 // the error it always did.
+void WriteOracleValueView(Vector &vector, idx_t row, const OracleColumn &column,
+                          const std::optional<oracle_scanner::OracleByteView> &wire) {
+    const auto fallback = [&] {
+        std::optional<std::vector<uint8_t>> owned;
+        if (wire) { owned.emplace(wire->begin(), wire->end()); }
+        WriteOracleValue(vector, row, column, owned);
+    };
+    if (vector.GetVectorType() != VectorType::FLAT_VECTOR) { fallback(); return; }
+    if (!wire) { FlatVector::SetNull(vector, row, true); return; }
+    const auto &type = vector.GetType();
+    if (column.oracle_type == 2 && type.id() == LogicalTypeId::BIGINT && MapNumber(column).kind == NumberMapping::BIGINT) {
+        if (const auto integer = oracle_scanner::TryDecodeOracleIntegerView(*wire)) {
+            FlatVector::SetNull(vector, row, false);
+            FlatVector::GetDataMutable<int64_t>(vector)[row] = *integer; return;
+        }
+    } else if (column.oracle_type == 12 || column.oracle_type == 180) {
+        vector.SetValue(row, TimestampValueFor(column, column.oracle_type == 12 ?
+            oracle_scanner::DecodeOracleDateView(*wire) : oracle_scanner::DecodeOracleTimestampView(*wire)));
+        return;
+    } else if ((column.oracle_type == 1 || column.oracle_type == 96) &&
+               column.character_set_form != 2 && type.id() == LogicalTypeId::VARCHAR && !column.xml) {
+        const auto *text = reinterpret_cast<const char *>(wire->data());
+        if (Value::StringIsValid(text, wire->size())) {
+            FlatVector::SetNull(vector, row, false);
+            FlatVector::GetDataMutable<string_t>(vector)[row] = StringVector::AddStringOrBlob(vector, text, wire->size()); return;
+        }
+    } else if (column.oracle_type == 23 && type.id() == LogicalTypeId::BLOB) {
+        FlatVector::SetNull(vector, row, false);
+        FlatVector::GetDataMutable<string_t>(vector)[row] = StringVector::AddStringOrBlob(vector,
+            reinterpret_cast<const char *>(wire->data()), wire->size()); return;
+    } else if (column.oracle_type == 100 && type.id() == LogicalTypeId::FLOAT) {
+        FlatVector::SetNull(vector, row, false);
+        FlatVector::GetDataMutable<float>(vector)[row] = oracle_scanner::DecodeOracleBinaryFloatView(*wire); return;
+    } else if (column.oracle_type == 101 && type.id() == LogicalTypeId::DOUBLE) {
+        FlatVector::SetNull(vector, row, false);
+        FlatVector::GetDataMutable<double>(vector)[row] = oracle_scanner::DecodeOracleBinaryDoubleView(*wire); return;
+    } else if (column.oracle_type == 252 && type.id() == LogicalTypeId::BOOLEAN && !wire->empty()) {
+        FlatVector::SetNull(vector, row, false);
+        FlatVector::GetDataMutable<bool>(vector)[row] = wire->back() == 1; return;
+    }
+    fallback();
+}
+
 void WriteOracleValue(Vector &vector, idx_t row, const OracleColumn &column,
                       const std::optional<std::vector<uint8_t>> &wire) {
     const auto through_value = [&] { vector.SetValue(row, ValueFor(column, wire)); };

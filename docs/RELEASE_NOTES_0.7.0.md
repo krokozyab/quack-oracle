@@ -10,6 +10,9 @@
 
 ## Behaviour changes
 
+- Scalar fetch batches are bounded to 64 MiB including cell descriptors and
+  validity metadata; exceeding the bound reports an explicit limit error.
+
 - Attached CREATE/CTAS, DROP and ALTER (ADD/DROP/RENAME COLUMN, RENAME TO)
   now execute Oracle DDL on separate sessions and refresh the local catalog.
   ALTER/DROP commit immediately and survive DuckDB rollback. Conflicting locks
@@ -29,6 +32,10 @@
   parallel range planning. Local filters, samples and locked scans retain local limits.
 
 ## Additions
+
+- Scalar scans use batch-owned byte storage and cell descriptors, preserving
+  NULLs and compressed-row continuation across packets and fetches. LOB/LONG/
+  binary ROWID and deferred reads retain their existing path.
 
 - Eligible COUNT(DISTINCT column) is computed entirely in Oracle and returns
   BIGINT. Supports exact numbers, BINARY_FLOAT/DOUBLE, DATE/TIMESTAMP without a

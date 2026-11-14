@@ -1140,27 +1140,36 @@ static void TestFetchResponseDecoderResumes() {
            expected.rows[21][1].value() == std::vector<uint8_t>({'s'}) &&
            expected.rows[21][2].value() == std::vector<uint8_t>({'c', 6}));
 
-    for (size_t step = 1; step <= 17; step++) {
-        TtcFetchResponseDecoder decoder(columns, 6, preceding);
-        bool complete = false;
-        for (size_t size = (std::min)(step, bytes.size());; size = (std::min)(size + step, bytes.size())) {
-            const std::vector<uint8_t> received(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(size));
-            try {
-                complete = decoder.Decode(received);
-            } catch (const ProtocolError &error) {
-                CHECK(error.Kind() == ProtocolErrorKind::TRUNCATED);
+    for (const bool packed : {false, true}) {
+        for (size_t step = 1; step <= 17; step++) {
+            TtcFetchResponseDecoder decoder(columns, 6, preceding, packed, 32);
+            bool complete = false;
+            for (size_t size = (std::min)(step, bytes.size());; size = (std::min)(size + step, bytes.size())) {
+                const std::vector<uint8_t> received(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(size));
+                try {
+                    complete = decoder.Decode(received);
+                } catch (const ProtocolError &error) {
+                    CHECK(error.Kind() == ProtocolErrorKind::TRUNCATED);
+                }
+                if (complete || size == bytes.size()) {
+                    break;
+                }
             }
-            if (complete || size == bytes.size()) {
-                break;
+            CHECK(complete);
+            auto resumed = decoder.Take();
+            if (packed) {
+                CHECK(resumed.packed.has_value() && resumed.rows.empty());
+                for (size_t row = 0; row < resumed.packed->RowCount(); row++) {
+                    resumed.rows.push_back(resumed.packed->MaterializeRow(row));
+                }
             }
+            CHECK(resumed.rows == expected.rows && resumed.last_row == expected.last_row &&
+                   resumed.bytes_consumed == expected.bytes_consumed && resumed.completed &&
+                   resumed.exhausted == expected.exhausted &&
+                   resumed.used_row_header_selection == expected.used_row_header_selection &&
+                   resumed.used_row_continuation == expected.used_row_continuation);
         }
-        CHECK(complete);
-        const auto resumed = decoder.Take();
-        CHECK(resumed.rows == expected.rows && resumed.last_row == expected.last_row &&
-               resumed.bytes_consumed == expected.bytes_consumed && resumed.completed &&
-               resumed.exhausted == expected.exhausted &&
-               resumed.used_row_header_selection == expected.used_row_header_selection &&
-               resumed.used_row_continuation == expected.used_row_continuation);
+
     }
 
     // A response cannot become shorter than what was already decoded from it.
@@ -1308,6 +1317,63 @@ static void TestTtcExecuteNoBindsCodec() {
     CHECK(std::search(encoded.begin(), encoded.end(), sql_bytes.begin(), sql_bytes.end()) != encoded.end());
     request.sql.clear();
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { EncodeTtcExecuteNoBindsRequest(request); });
+}
+
+static void TestPackedChunkedFetchAndPreviousRowOwnership() {
+    const std::vector<OracleColumn> columns = {OracleColumn {"A",23},OracleColumn {"B",1}};
+    const std::vector<uint8_t> large(800,'x');
+    ByteWriter response;
+    response.WriteByte(TTC_MESSAGE_ROW_DATA).WriteLengthPrefixed(large).WriteLengthPrefixed(std::nullopt).WriteByte(29);
+    const auto expected = DecodeTtcFetchResponse(response.Data(),columns,6);
+    for (size_t cut=1; cut<response.Data().size(); cut+=11) {
+        TtcFetchResponseDecoder decoder(columns,6,std::nullopt,true,2);
+        try { decoder.Decode(std::vector<uint8_t>(response.Data().begin(),response.Data().begin()+static_cast<std::ptrdiff_t>(cut))); }
+        catch (const ProtocolError &error) { CHECK(error.Kind()==ProtocolErrorKind::TRUNCATED); }
+        CHECK(decoder.Decode(response.Data()));
+        auto batch = decoder.Take();
+        CHECK(batch.packed->MaterializeRow(0)==expected.rows[0] && batch.last_row==expected.last_row);
+        ByteWriter next;
+        next.WriteByte(21).WriteUInt16LE(1).WriteByte(2).WriteByte(TTC_MESSAGE_ROW_DATA)
+            .WriteLengthPrefixed(std::vector<uint8_t>{'y'}).WriteByte(29);
+        TtcFetchResponseDecoder following(columns,6,batch.last_row,true,2);
+        batch.packed.reset(); batch.last_row.reset();
+        CHECK(following.Decode(next.Data()));
+        auto continued = following.Take();
+        CHECK(continued.packed->MaterializeRow(0)[0].value()==large);
+        CHECK(continued.packed->MaterializeRow(0)[1].value()==std::vector<uint8_t>({'y'}));
+    }
+    ByteWriter oversized;
+    oversized.WriteByte(TTC_MESSAGE_ROW_DATA).WriteByte(254).WriteUB4((16U<<20U)+1);
+    TtcFetchResponseDecoder limited(columns,6,std::nullopt,true);
+    ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED,[&] { limited.Decode(oversized.Data()); });
+}
+
+static void TestPackedBatchOwnsCellsAndBoundsMemory() {
+    OraclePackedBatch batch(3);
+    batch.AppendRow();
+    std::vector<uint8_t> value {'a','b'};
+    batch.AppendCellBytes(0, value.data(), value.size());
+    batch.AppendCellBytes(2, nullptr, 0);
+    value[0] = 'z';
+    CHECK(batch.MaterializeRow(0)[0].value() == std::vector<uint8_t>({'a','b'}));
+    CHECK(!batch.Get(0,1) && batch.Get(0,2) && batch.Get(0,2)->empty());
+    const auto bytes = batch.ByteCount();
+    batch.AppendRow(true);
+    CHECK(batch.ByteCount()==bytes && batch.MaterializeRow(1)==batch.MaterializeRow(0));
+    batch.ClearCell(0); batch.AppendCellBytes(0, value.data(), value.size());
+    CHECK(batch.MaterializeRow(0)[0].value()[0]=='a' && batch.MaterializeRow(1)[0].value()[0]=='z');
+    batch.Truncate(1,bytes);
+    batch.AppendRow(true);
+    CHECK(batch.MaterializeRow(0)==batch.MaterializeRow(1));
+    auto moved = std::move(batch);
+    moved.RemoveFirstRow();
+    CHECK(moved.RowCount()==1 && moved.Get(0,0)->size()==2 && !moved.Get(0,1));
+    ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [&] {
+        moved.AppendCellBytes(1, nullptr, OraclePackedBatch::MAXIMUM_BYTES);
+    });
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { moved.Get(2,0); });
+    OraclePackedBatch missing(1);
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { missing.AppendRow(true); });
 }
 
 static void TestTtcRowDataCodec() {
@@ -8765,6 +8831,8 @@ int main() {
     TestTtcErrorNamesTheFailingIteration();
     TestTtcErrorCarriesADmlRowId();
     TestTtcRowDataCodec();
+    TestPackedBatchOwnsCellsAndBoundsMemory();
+    TestPackedChunkedFetchAndPreviousRowOwnership();
     TestTtcNegotiation();
     TestO5LogonFlow();
     TestConnectDescriptor();

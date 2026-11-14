@@ -3278,14 +3278,14 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
         const auto batch = TranslatingOracleErrors("oracle_query could not fetch from Oracle", [&] {
             if (local) {
                 try {
-                    return local->cursor->Fetch(STANDARD_VECTOR_SIZE);
+                    return local->cursor->FetchPacked(STANDARD_VECTOR_SIZE);
                 } catch (...) {
                     local->session.Poison();
                     throw;
                 }
             }
             try {
-                return state.cursor->Fetch(STANDARD_VECTOR_SIZE);
+                return state.deferred ? state.cursor->Fetch(STANDARD_VECTOR_SIZE) : state.cursor->FetchPacked(STANDARD_VECTOR_SIZE);
             } catch (...) {
                 if (interrupt) {
                     interrupt->Stop();
@@ -3301,7 +3301,7 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
             }
         });
         state.metrics.fetch_nanoseconds += elapsed(fetch_started);
-        state.metrics.rows_fetched += batch.rows.size();
+        state.metrics.rows_fetched += batch.RowCount();
         if (local) {
             const auto io_now = local->session->IoStats();
             state.metrics.Add(io_now - local->last_io);
@@ -3320,9 +3320,9 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
         if (output.ColumnCount() != state.chunk_columns) {
             throw InternalException("oracle_query output chunk does not match its describe metadata");
         }
-        for (idx_t row_index = 0; row_index < batch.rows.size(); row_index++) {
-            const auto &row = batch.rows[row_index];
-            if (row.size() != state.columns.size()) {
+        for (idx_t row_index = 0; row_index < batch.RowCount(); row_index++) {
+            const auto width = batch.packed ? batch.packed->ColumnCount() : batch.rows[row_index].size();
+            if (width != state.columns.size()) {
                 throw InternalException("oracle_query row has a different column count from its describe metadata");
             }
             // A deferred scan fetches only the light columns, then the ROWID.
@@ -3330,8 +3330,13 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
             for (idx_t column_index = 0; column_index < written; column_index++) {
                 const auto vector_index = state.deferred ? state.deferred->light_vectors[column_index] : column_index;
                 TranslatingOracleErrors("oracle_query could not convert an Oracle value", [&] {
-                    WriteOracleValue(output.data[vector_index], row_index, state.columns[column_index],
-                                     row[column_index]);
+                    if (batch.packed) {
+                        WriteOracleValueView(output.data[vector_index], row_index, state.columns[column_index],
+                            batch.packed->Get(row_index, column_index));
+                    } else {
+                        WriteOracleValue(output.data[vector_index], row_index, state.columns[column_index],
+                            batch.rows[row_index][column_index]);
+                    }
                     return true;
                 });
             }
@@ -3342,13 +3347,13 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
         // then reads the validity mask by the vector's size and sees no NULL at
         // all: `col IS NULL` matched every row, and count(col) counted them. The
         // compiler cannot see that; the adapter suite now does.
-        output.SetChildCardinality(batch.rows.size());
+        output.SetChildCardinality(batch.RowCount());
         state.metrics.convert_nanoseconds += elapsed(convert_started);
         if (local && batch.exhausted) {
             local->cursor->Close();
             local->cursor.reset();
         }
-        if (state.local_filter && !batch.rows.empty()) {
+        if (state.local_filter && batch.RowCount() != 0) {
             // The filters Oracle was not sent. A chunk they empty is not the end of
             // the scan — an empty chunk means that — so fetch on until one has rows
             // or Oracle has no more.
@@ -3363,7 +3368,7 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
                 state.metrics.Add(io_now - state.last_io);
                 state.last_io = io_now;
             }
-            if (kept != batch.rows.size()) {
+            if (kept != batch.RowCount()) {
                 output.Slice(selection, kept);
             }
             if (kept == 0 && !batch.exhausted) {

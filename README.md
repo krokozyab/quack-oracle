@@ -403,6 +403,12 @@ FROM oracle_query('ora', 'SELECT id, label FROM app.items') AS i
 JOIN read_csv('sales.csv') AS s ON s.item_id = i.id;
 ```
 
+Scalar reads keep bytes in a batch-owned arena with cell offsets and a NULL
+bitmap, avoiding a heap allocation for every fetched cell. Compressed Oracle
+rows share unchanged bytes through descriptors; the last row is owned across
+fetch boundaries. Scalar batch storage is limited to 64 MiB including cell
+metadata. LOBs, LONG and binary ROWID frames retain their existing read path.
+
 ### Passing values safely (bind parameters)
 
 Never paste values into the SQL text. Pass them as a third argument instead —

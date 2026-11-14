@@ -132,6 +132,8 @@ struct FakeScript {
     //! Answer rows on the first Fetch and an empty exhausted batch on the second,
     //! the way a real cursor does.
     bool two_batch_fetch = false;
+    bool packed_fetch = false;
+    size_t packed_fetches = 0;
     // A parallel scan drives several sessions at once, all of them recording
     // into this one script. Unsynchronised, the recording loses entries and the
     // test that reads them back becomes a coin flip — which is how this was
@@ -337,6 +339,22 @@ public:
             return batch;
         }
         batch.exhausted = true;
+        return batch;
+    }
+
+    OracleBatch FetchPacked(size_t count) override {
+        auto batch = Fetch(count);
+        if (script->packed_fetch) {
+            script->packed_fetches++;
+            batch.packed.emplace(batch.columns.size());
+            for (const auto &row : batch.rows) {
+                batch.packed->AppendRow();
+                for (size_t i = 0; i < row.size(); i++) {
+                    if (row[i]) { batch.packed->AppendCellBytes(i, row[i]->data(), row[i]->size()); }
+                }
+            }
+            batch.rows.clear();
+        }
         return batch;
     }
 
@@ -731,6 +749,23 @@ void TestQueryTypeMappingAndValues() {
 // A scan stores values with WriteOracleValue rather than SetValue(ValueFor(...)).
 // For every mapped type, and for the values each must refuse, the two have to
 // store the same thing or raise the same error.
+void TestPackedFetchThroughSql() {
+    auto script = std::make_shared<FakeScript>();
+    script->packed_fetch = true; script->two_batch_fetch = true;
+    script->columns = {Column("ID",2,10,0),Column("V",1),Column("D",12)};
+    const auto day = oracle_scanner::EncodeOracleDate({2026,1,2,3,4,5});
+    script->rows = {{Number("1"),Text("first"),day},{Number("2"),Text("second"),day},{WireValue(),WireValue(),WireValue()}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    auto result = database.Query("SELECT ID,V,D FROM oracle_query('ora','SELECT ID,V,D FROM RV_PACKED') WHERE ID%2=0;");
+    CHECK(!result->HasError() && result->RowCount()==1);
+    CHECK(result->GetValue(0,0).ToString()=="2" && result->GetValue(1,0).ToString()=="second");
+    CHECK(result->GetValue(2,0).ToString()=="2026-01-02 03:04:05");
+    auto nulls = database.Query("SELECT count(*) FROM oracle_query('ora','SELECT ID,V,D FROM RV_PACKED') WHERE ID IS NULL AND V IS NULL AND D IS NULL;");
+    CHECK(!nulls->HasError() && nulls->GetValue(0,0).ToString()=="1");
+    CHECK(script->packed_fetches>=4);
+}
+
 void TestWriteOracleValueMatchesValueFor() {
     using Wire = std::optional<std::vector<uint8_t>>;
     auto timestamp_column = Column("ts", 180);
@@ -816,6 +851,14 @@ void TestWriteOracleValueMatchesValueFor() {
                 const auto written_error =
                     store([&] { duckdb::WriteOracleValue(written, row, column, wire); });
                 CHECK(expected_error == written_error);
+                duckdb::Vector viewed(type, STANDARD_VECTOR_SIZE);
+                std::optional<oracle_scanner::OracleByteView> view;
+                if (wire) { view.emplace(*wire); }
+                const auto view_error = store([&] { duckdb::WriteOracleValueView(viewed, row, column, view); });
+                CHECK(expected_error == view_error);
+                if (view_error.empty()) {
+                    CHECK(duckdb::Value::NotDistinctFrom(expected.GetValue(row), viewed.GetValue(row)));
+                }
                 if (!expected_error.empty()) {
                     refusals++;
                     continue;
@@ -5414,6 +5457,7 @@ int main() {
     TestInterruptReachesEveryTransactionPath();
     TestQueryTypeMappingAndValues();
     TestWriteOracleValueMatchesValueFor();
+    TestPackedFetchThroughSql();
     TestNewTypesReadThroughSql();
     TestBooleanAndLocalZoneReadThroughSql();
     TestProjectedColumns();

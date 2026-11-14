@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include "oracle_scanner/row_batch.hpp"
 #include <optional>
 #include <string>
 #include <vector>
@@ -21,8 +22,10 @@ struct OracleDateTime {
 
 std::vector<uint8_t> EncodeOracleDate(const OracleDateTime &value);
 OracleDateTime DecodeOracleDate(const std::vector<uint8_t> &wire);
+OracleDateTime DecodeOracleDateView(OracleByteView wire);
 std::vector<uint8_t> EncodeOracleTimestamp(const OracleDateTime &value, bool with_time_zone);
 OracleDateTime DecodeOracleTimestamp(const std::vector<uint8_t> &wire);
+OracleDateTime DecodeOracleTimestampView(OracleByteView wire);
 
 // A TIMESTAMP WITH TIME ZONE carries its date and time as UTC with the offset
 // beside them (captured from 19c: 05:06:07 at +04:00 arrives as 01:06:07), so
@@ -44,19 +47,23 @@ std::optional<int16_t> ParseOracleZoneOffset(const std::string &text);
 std::vector<uint8_t> EncodeOracleBinaryFloat(float value);
 std::vector<uint8_t> EncodeOracleBinaryDouble(double value);
 float DecodeOracleBinaryFloat(const std::vector<uint8_t> &wire);
+float DecodeOracleBinaryFloatView(OracleByteView wire);
 double DecodeOracleBinaryDouble(const std::vector<uint8_t> &wire);
+double DecodeOracleBinaryDoubleView(OracleByteView wire);
 
 // Converts through decimal text so Oracle NUMBER values never pass through a
 // binary floating-point representation. The encoder accepts ordinary or
 // scientific decimal notation and emits the canonical base-100 wire form.
 std::vector<uint8_t> EncodeOracleNumber(const std::string &decimal);
 std::string DecodeOracleNumber(const std::vector<uint8_t> &wire);
+std::string DecodeOracleNumberView(OracleByteView wire);
 
 // The same value as an integer, without the text: present only when the wire
 // form is well formed, holds a whole number and fits int64_t. A caller falls
 // back to DecodeOracleNumber for everything else, which is also where a
 // malformed value is reported.
 std::optional<int64_t> TryDecodeOracleInteger(const std::vector<uint8_t> &wire);
+std::optional<int64_t> TryDecodeOracleIntegerView(OracleByteView wire);
 
 // INTERVAL YEAR TO MONTH is 5 bytes: the year as a big-endian uint32 offset by
 // 0x80000000 and the month plus 60. INTERVAL DAY TO SECOND is 11: the day in the
