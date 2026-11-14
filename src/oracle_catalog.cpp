@@ -1492,7 +1492,7 @@ std::pair<std::string, OracleColumn> DdlType(const LogicalType &type) {
     }
     if (precision) {
         column.oracle_type = 2;
-        column.precision = precision;
+        column.precision = static_cast<int16_t>(precision);
         column.scale = 0;
         sql = "NUMBER(" + std::to_string(precision) + ",0)";
     }
@@ -1799,7 +1799,8 @@ public:
         for (const auto &name : names) {
             auto entry = OracleAttachedTableEntry::Create(context, catalog, *this, state, name.GetIdentifierName());
             if (entry) {
-                set.CreateEntry(system, entry->name, std::move(entry), LogicalDependencyList());
+                const Identifier entry_name(entry->name);
+                set.CreateEntry(system, entry_name, std::move(entry), LogicalDependencyList());
             }
         }
         defaults->created_all_entries = false;
@@ -1870,7 +1871,8 @@ public:
         }
         auto result = entry.get();
         const auto system = CatalogTransaction::GetSystemTransaction(catalog.GetDatabase());
-        if (!set.CreateEntry(system, entry->name, std::move(entry), LogicalDependencyList())) {
+        const Identifier entry_name(entry->name);
+        if (!set.CreateEntry(system, entry_name, std::move(entry), LogicalDependencyList())) {
             throw IOException("Oracle CREATE metadata cache could not be updated");
         }
         return result;

@@ -1559,6 +1559,7 @@ public:
         planner.dependencies.AddDependency(table);
         auto &source = planner.CreatePlan(*children[0]);
         std::vector<idx_t> indexes;
+        indexes.reserve(columns.size());
         for (idx_t i = 0; i < columns.size(); i++) {
             indexes.push_back(i);
         }
