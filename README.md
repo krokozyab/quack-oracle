@@ -935,10 +935,10 @@ use `oracle_execute`, `oracle_execute_transaction`, or `oracle_execute_many`.
 For DDL beyond the supported attached-table operations, use
 `oracle_execute_admin` and reattach the catalog.
 
-Explicit DEFAULT in a plain attached INSERT is currently refused before writing,
+Explicit DEFAULT in an attached INSERT or upsert is currently refused before writing,
 including mixed VALUES rows. Omit the column to apply its Oracle default, or use
 oracle_execute with Oracle INSERT SQL. Explicit NULL remains NULL. Attached
-MERGE/upsert retains its documented default handling.
+MERGE/upsert applies Oracle defaults only for omitted INSERT columns.
 
 ### Raw SQL in the attached transaction
 

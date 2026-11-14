@@ -3913,7 +3913,12 @@ void TestAttachedUpsertsUseOracleMerge() {
     for (const auto *sql : {
             "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT);",
             "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT),(91,NULL);",
-            "INSERT INTO ora.main.ITEMS(ID,LABEL) VALUES (90,DEFAULT) RETURNING ID;"}) {
+            "INSERT INTO ora.main.ITEMS(ID,LABEL) VALUES (90,DEFAULT) RETURNING ID;",
+            "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT) ON CONFLICT DO NOTHING;",
+            "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT),(91,DEFAULT) ON CONFLICT DO NOTHING;",
+            "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT),(91,NULL) ON CONFLICT DO NOTHING;",
+            "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT) ON CONFLICT(ID) DO UPDATE SET LABEL=excluded.LABEL;",
+            "INSERT OR REPLACE INTO ora.main.ITEMS VALUES (90,DEFAULT);"}) {
         const auto writes = script->counted_executes.size();
         auto result = database.Query(sql);
         CHECK(result->HasError() && result->GetError().find("explicit DEFAULT") != std::string::npos);

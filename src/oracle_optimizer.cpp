@@ -686,6 +686,26 @@ void Walk(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &op, Colum
                                   "and RETURNING are not supported; use oracle_execute with Oracle MERGE SQL");
 }
 
+void RejectOracleMergeSourceDefaults(LogicalOperator &source) {
+    // A DEFAULT inside VALUES lives in the expression get, not in the
+    // INSERT action projection. Inspect the complete source before rewriting.
+    if (source.type == LogicalOperatorType::LOGICAL_EXPRESSION_GET) {
+        LogicalOperatorVisitor::EnumerateExpressions(source, [&](unique_ptr<Expression> *expression) {
+            ExpressionIterator::EnumerateExpression(*expression, [&](unique_ptr<Expression> &part) {
+                if (part->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
+                    part->Cast<BoundFunctionExpression>().Function().GetName() ==
+                        Identifier("__oracle_scanner_default")) {
+                    throw NotImplementedException("Oracle MERGE/upsert does not support explicit DEFAULT values; "
+                                                  "omit the column or use oracle_execute with Oracle SQL");
+                }
+            });
+        });
+    }
+    for (auto &child : source.children) {
+        RejectOracleMergeSourceDefaults(*child);
+    }
+}
+
 void RewriteOracleMerges(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
     if (plan->type != LogicalOperatorType::LOGICAL_MERGE_INTO ||
         plan->Cast<LogicalMergeInto>().table.catalog.GetCatalogType() != "oracle_scanner") {
@@ -723,6 +743,7 @@ void RewriteOracleMerges(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
         RefuseOracleMerge();
     }
     auto &source = root.children[1 - target_side];
+    RejectOracleMergeSourceDefaults(*source);
     const auto source_bindings = source->GetColumnBindings();
     const auto is_source = [&](const Expression &expression) {
         bool valid = true;

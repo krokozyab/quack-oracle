@@ -2,6 +2,9 @@
 
 ## Fixes
 
+- Upserts reject explicit DEFAULT inside VALUES before writing, including mixed
+  rows, DO NOTHING, DO UPDATE and REPLACE; omitted columns retain Oracle defaults.
+
 - DDL lock refusals explain that the caller may hold the lock and require
   COMMIT or ROLLBACK, retaining Oracle error code 54.
 
