@@ -3391,7 +3391,8 @@ void TestAttachedDdlRefreshesAndCompensates() {
         } else if (sql.find("DROP COLUMN") != std::string::npos) {
             script->tables[name].columns.pop_back();
         } else if (sql.find("RENAME TO") != std::string::npos) {
-            const std::string renamed = "RV_RENAMED";
+            const auto last=sql.rfind('"');const auto first=sql.rfind('"',last-1);
+            const auto renamed=sql.substr(first+1,last-first-1);
             script->tables[renamed]=std::move(script->tables[name]); script->tables.erase(name);
             identities[renamed]=identities[name]; identities.erase(name);
         } else { CHECK(false && "unexpected DDL"); }
@@ -3425,6 +3426,11 @@ void TestAttachedDdlRefreshesAndCompensates() {
     database.Run("ROLLBACK;");
     CHECK(!database.Query("SELECT * FROM o.RV_RENAMED;")->HasError());
     CHECK(database.Query("SELECT * FROM o.RV_DDL;")->HasError());
+    database.Run("ALTER TABLE o.RV_RENAMED RENAME TO RV_DDL;");
+    auto revived=database.Query("SELECT table_name FROM duckdb_tables() WHERE database_name='o' AND table_name='RV_DDL';");
+    CHECK(!revived->HasError() && revived->RowCount()==1);
+    CHECK(!database.Query("SELECT * FROM o.RV_DDL;")->HasError());
+    database.Run("ALTER TABLE o.RV_DDL RENAME TO RV_RENAMED;");
     database.Run("BEGIN;");
     database.Run("DROP TABLE o.RV_RENAMED;");
     database.Run("ROLLBACK;");

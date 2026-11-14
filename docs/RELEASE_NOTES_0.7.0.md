@@ -2,6 +2,9 @@
 
 ## Fixes
 
+- Renaming a table back to a previously cached name restores its catalog entry,
+  including alias lookups and catalog inspection, without reattachment.
+
 - DELETE RETURNING initializes DuckDB 2.0's virtual ROWID output, preventing
   empty identities and uninitialized string data in returned chunks.
 

@@ -1540,7 +1540,19 @@ public:
         vector<Identifier> names;
         set.Scan([&](CatalogEntry &entry) { if (entry.type == CatalogType::TABLE_ENTRY) { names.push_back(entry.name); } });
         const auto system = CatalogTransaction::GetSystemTransaction(catalog.GetDatabase());
+        has_materialized_entries |= !names.empty();
         for (const auto &name : names) { set.DropEntry(system, name, true); }
+        if (has_materialized_entries) {
+            // A tombstone prevents DuckDB's default generator from running.
+            // Restore previously materialized names that Oracle has revived,
+            // without eagerly constructing every table in the remote schema.
+            std::unordered_set<std::string> scheduled;
+            for (const auto &name : names) { scheduled.insert(name.GetIdentifierName()); }
+            for (const auto &remote : state->ListObjects()) {
+                const auto head = set.GetHeadEntry(Identifier(remote));
+                if (head && head->deleted && scheduled.insert(remote).second) { names.emplace_back(remote); }
+            }
+        }
         for (const auto &name : names) {
             auto entry = OracleAttachedTableEntry::Create(context, catalog, *this, state, name.GetIdentifierName());
             if (entry) { set.CreateEntry(system, entry->name, std::move(entry), LogicalDependencyList()); }
@@ -1584,6 +1596,9 @@ public:
         created.back().object_id = DdlObjectId(context, state, name);
         if (created.back().object_id.empty()) { throw IOException("Oracle CREATE succeeded but its object identity could not be read; reconcile the table manually"); }
         Sync(context);
+        // Sync may already have restored a previously materialized name.
+        auto head = set.GetHeadEntry(Identifier(name));
+        if (head && !head->deleted) { return head; }
         auto entry = OracleAttachedTableEntry::Create(context, catalog, *this, state, name);
         if (!entry) { throw IOException("Oracle CREATE succeeded but its table could not be described"); }
         auto result = entry.get();
@@ -1675,6 +1690,7 @@ private:
     shared_ptr<OracleAttachedState> state;
     std::mutex cache_lock;
     idx_t cached_version = 0;
+    bool has_materialized_entries = false;
     DefaultGenerator *defaults = nullptr;
 };
 
