@@ -1248,7 +1248,8 @@ handshake and an authentication round trip: against a cloud endpoint that was
 | Oracle | Comes back as | Note |
 | --- | --- | --- |
 | `NUMBER(p,0)`, p ≤ 18 | `BIGINT` | |
-| `NUMBER(p,s)` | `DECIMAL(p,s)` | up to p = 38; `NUMBER(p,-s)` is a `BIGINT`, `NUMBER(2,4)` a `DECIMAL(4,4)` |
+| `NUMBER(p,0)`, 19 ≤ p ≤ 38 | `DECIMAL(p,0)` | Exact integer arithmetic |
+| `NUMBER(p,s)` | `DECIMAL(p,s)` | up to p = 38; negative scale uses `BIGINT` up to 18 effective digits, then `DECIMAL(p-s,0)` up to 38; `NUMBER(2,4)` is `DECIMAL(4,4)` |
 | `NUMBER` (unconstrained) | `VARCHAR` | exact only as text; see `oracle_unconstrained_number` below |
 | `VARCHAR2`, `CHAR` | `VARCHAR` | UTF-8, whatever the database character set is |
 | `DATE` | `TIMESTAMP` | an Oracle `DATE` carries a time, so it is not a DuckDB `DATE` |

@@ -146,7 +146,11 @@ NumberMapping MapNumber(const OracleColumn &column) {
         } else if (scale < 0 && scale > -128 && precision - scale <= 18) {
             // NUMBER(10,-2) holds whole numbers rounded to hundreds.
             result.kind = NumberMapping::BIGINT;
-        } else if (precision <= 38 && scale >= 1 && scale <= precision) {
+        } else if (scale < 0 && scale > -128 && precision - scale <= 38) {
+            result.kind = NumberMapping::DECIMAL;
+            result.width = static_cast<uint8_t>(precision - scale);
+            result.scale = 0;
+        } else if (precision <= 38 && scale >= 0 && scale <= precision) {
             result.kind = NumberMapping::DECIMAL;
             result.width = static_cast<uint8_t>(precision);
             result.scale = static_cast<uint8_t>(scale);

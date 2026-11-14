@@ -1032,10 +1032,29 @@ void TestNumberMappings() {
         return duckdb::MappedType(column);
     };
     CHECK(number(10, 0) == duckdb::LogicalType::BIGINT && number(18, 0) == duckdb::LogicalType::BIGINT);
-    CHECK(number(19, 0) == duckdb::LogicalType::VARCHAR);
+    CHECK(number(19, 0) == duckdb::LogicalType::DECIMAL(19, 0));
     // Rounded to hundreds: whole numbers, so an integer.
     CHECK(number(10, -2) == duckdb::LogicalType::BIGINT && number(16, -2) == duckdb::LogicalType::BIGINT);
-    CHECK(number(17, -2) == duckdb::LogicalType::VARCHAR);
+    CHECK(number(17, -2) == duckdb::LogicalType::DECIMAL(19, 0));
+    CHECK(number(25, 0) == duckdb::LogicalType::DECIMAL(25, 0));
+    CHECK(number(38, 0) == duckdb::LogicalType::DECIMAL(38, 0));
+    CHECK(number(36, -2) == duckdb::LogicalType::DECIMAL(38, 0));
+    CHECK(number(37, -2) == duckdb::LogicalType::VARCHAR);
+    for (const auto precision : {25, 38}) {
+        auto wide_script = std::make_shared<FakeScript>();
+        const auto maximum = std::string(precision, '9');
+        wide_script->columns = {Column("N", 2, precision, 0)};
+        wide_script->rows = {{Number(maximum)}, {Number("-" + maximum)}};
+        auto wide_factory = InstallFake(wide_script);
+        TestDatabase wide_database;
+        auto wide = wide_database.Query("SELECT * FROM oracle_query('ora', 'SELECT N FROM RV_NUMBERS');");
+        CHECK(!wide->HasError() && wide->RowCount() == 2);
+        CHECK(wide->GetTypes()[0] == duckdb::LogicalType::DECIMAL(precision, 0));
+        CHECK(wide->GetValue(0, 0).ToString() == maximum);
+        CHECK(wide->GetValue(0, 1).ToString() == "-" + maximum);
+        const auto bind = duckdb::OracleBindForColumn(wide->GetValue(0, 0), wide_script->columns[0], "1");
+        CHECK(bind.value && oracle_scanner::DecodeOracleNumber(*bind.value) == maximum);
+    }
     CHECK(number(5, 2) == duckdb::LogicalType::DECIMAL(5, 2));
     // More digits after the point than the precision: 0.0012 is NUMBER(2,4).
     CHECK(number(2, 4) == duckdb::LogicalType::DECIMAL(4, 4));
