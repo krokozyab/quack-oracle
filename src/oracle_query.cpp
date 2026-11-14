@@ -3050,6 +3050,19 @@ unique_ptr<LocalTableFunctionState> OracleQueryInitLocal(ExecutionContext &, Tab
     return make_uniq<OracleQueryLocalState>();
 }
 
+OperatorPartitionData OracleQueryPartitionData(ClientContext &, TableFunctionGetPartitionInput &input) {
+    if (input.partition_info.RequiresPartitionColumns()) {
+        throw InternalException("an Oracle scan has no partition columns");
+    }
+    // The ROWID ranges are claimed in table order, so each thread's batches rise
+    // and DuckDB can keep a parallel scan's rows in that order while every thread
+    // reads: without a batch, CREATE TABLE AS and INSERT ... SELECT, which keep
+    // insertion order, read the ranges one after another. A scan of one stream is
+    // one batch.
+    const auto *local = input.local_state ? dynamic_cast<const OracleQueryLocalState *>(input.local_state.get()) : nullptr;
+    return OperatorPartitionData(local ? local->batch_index : 0);
+}
+
 static bool DeferrableColumn(const OracleColumn &column) {
     switch (column.oracle_type) {
     case 112: // CLOB
@@ -3168,6 +3181,7 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
                 output.SetChildCardinality(0);
                 return;
             }
+            local->batch_index = chunk;
             try {
                 if (!local->session) {
                     local->session = AcquireOracleReadSession(context, state.secret_name, std::string(), state.config,

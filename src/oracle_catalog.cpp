@@ -996,6 +996,7 @@ public:
         function.sampling_pushdown = state->IsTable(object_name);
         function.init_local = OracleQueryInitLocal;
         function.get_metrics = OracleQueryMetrics;
+        function.get_partition_data = OracleQueryPartitionData;
         function.statistics = OracleAttachedScanStatistics;
         return function;
     }
@@ -1515,12 +1516,14 @@ std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const 
         // user may; without it the table is read with one session, because the
         // alternatives (a sample of its blocks, which comes back in a few clumps
         // and cut a 2,000,000-row table 99 to 1; USER_EXTENTS, which does not say
-        // where an extent starts) do not divide it evenly.
+        // where an extent starts) do not divide it evenly. The object number comes from
+        // ALL_OBJECTS, which shows every table the user can read, so DBA_EXTENTS is the
+        // one dictionary view that needs a grant.
         const auto reference = OracleObjectReference(bind.schema_name, bind.object_name);
         const auto extents = TextRows(
             *session,
             std::string("SELECT ROWIDTOCHAR(DBMS_ROWID.ROWID_CREATE(1, o.data_object_id, e.relative_fno, e.block_id, 0)), "
-                        "e.blocks FROM dba_extents e JOIN dba_objects o ON o.owner = e.owner AND o.object_name = "
+                        "e.blocks FROM dba_extents e JOIN all_objects o ON o.owner = e.owner AND o.object_name = "
                         "e.segment_name AND (o.subobject_name = e.partition_name OR (o.subobject_name IS NULL AND "
                         "e.partition_name IS NULL)) WHERE e.owner = ") +
                 (own ? std::string("USER") : owner) + " AND e.segment_name = " + name +

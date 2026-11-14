@@ -1124,6 +1124,13 @@ moments. On a 2,000,000-row table four sessions took 0.9 s against 2.2 s for one
 0.7 s; the result matched row for row. A partitioned table is cut the same way across its
 partitions. No numeric key is needed.
 
+Each range is a batch, numbered in ROWID order, so `CREATE TABLE ... AS`, `INSERT ... SELECT` and
+`COPY`, which keep insertion order, read in parallel too and get the rows in ROWID order: copying a
+1,000,000-row, seven-column table took 0.46 s through four sessions against 1.06 s through one. ROWID
+order is where the rows lie in the data files, which is usually, but not always, the order one
+session reads them in (that follows the order the extents were allocated); without `ORDER BY`,
+Oracle promises neither.
+
 It reads one stream instead, and says nothing, when: the setting is 0 or 1; the user cannot
 read `DBA_EXTENTS` (the extents give the cut points, and without them a table cannot be
 divided evenly — a sample of its blocks came back in a few clumps and cut a test table 99 to

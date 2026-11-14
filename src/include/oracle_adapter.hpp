@@ -362,9 +362,13 @@ struct OracleQueryLocalState final : LocalTableFunctionState {
     OracleSessionHandle session;
     std::unique_ptr<OracleCursor> cursor;
     OracleIoStats last_io;
+    //! The ROWID range the cursor reads, which is the batch its rows belong to.
+    idx_t batch_index = 0;
 };
 unique_ptr<LocalTableFunctionState> OracleQueryInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
                                                          GlobalTableFunctionState *global_state);
+//! The batch a scan's chunk belongs to: its ROWID range, in table order.
+OperatorPartitionData OracleQueryPartitionData(ClientContext &context, TableFunctionGetPartitionInput &input);
 void OracleQueryMetrics(TableFunctionGetMetricsInput &input);
 
 unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, TableFunctionInitInput &input);

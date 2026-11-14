@@ -2817,6 +2817,19 @@ void TestAttachedScanReadsInRowidRanges() {
         extents.push_back({Text("EXTENT" + std::to_string(index)), Number("1000")});
     }
     script->routes.push_back({"dba_extents", {{Column("LOW", 1), Column("BLOCKS", 2)}, extents}});
+    // Each range answers with rows of its own, rising from range to range, so the
+    // order a copy of the table keeps can be seen.
+    constexpr int ROWS_PER_RANGE = 2000; // the fake answers a fetch with every row, so one vector
+    for (int range = 0; range < 10; range++) {
+        std::vector<WireRow> rows;
+        for (int row = 0; row < ROWS_PER_RANGE; row++) {
+            rows.push_back({Number(std::to_string(range * 10000 + row))});
+        }
+        const std::string scan = "SELECT \"ID\" FROM \"FACTS\" AS OF SCN 424242 WHERE ";
+        script->routes.push_back({range == 0 ? scan + "ROWID < CHARTOROWID('EXTENT1')"
+                                             : scan + "ROWID >= CHARTOROWID('EXTENT" + std::to_string(range) + "')",
+                                  {{Column("ID", 2, 10, 0)}, std::move(rows)}});
+    }
     script->routes.push_back({"FROM user_tables", {text_columns({"TABLE_NAME"}), {{Text("FACTS")}}}});
     script->routes.push_back({"FROM user_views", {text_columns({"VIEW_NAME"}), {}}});
     const std::vector<OracleColumn> dictionary = {Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1),
@@ -2864,6 +2877,18 @@ void TestAttachedScanReadsInRowidRanges() {
         joined = joined || chunk.find("ROWID >= CHARTOROWID('EXTENT2') AND ROWID < CHARTOROWID('EXTENT3')") != std::string::npos;
     }
     CHECK(joined);
+    // CREATE TABLE AS keeps insertion order, which DuckDB holds to across threads
+    // only for a scan that says which batch each chunk belongs to; without that it
+    // reads the ranges one after another on one thread.
+    database.Run("SET threads = 4;");
+    auto plan = database.Query("EXPLAIN CREATE TABLE copied AS FROM o.main.FACTS;");
+    CHECK(!plan->HasError() && plan->RowCount() > 0 &&
+          plan->GetValue(1, 0).ToString().find("Batch Create Table As") != std::string::npos);
+    database.Run("CREATE TABLE copied AS FROM o.main.FACTS;");
+    auto copied = database.Query(
+        "SELECT count(*), bool_and(ID > previous) FROM (SELECT ID, lag(ID, 1, -1) OVER (ORDER BY rowid) previous FROM copied);");
+    CHECK(!copied->HasError() && copied->GetValue(0, 0).GetValue<int64_t>() == 10 * ROWS_PER_RANGE &&
+          copied->GetValue(1, 0).GetValue<bool>());
     // Once the transaction has written, the one session that sees its rows reads, as one stream.
     database.Run("BEGIN;");
     database.Run("INSERT INTO o.main.FACTS VALUES (5);");
