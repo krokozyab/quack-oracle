@@ -205,7 +205,8 @@ struct OracleWriteState final : ClientContextState {
     // The attached catalog's transaction manager calls this before committing
     // DuckDB's local catalog state. A failed statement cannot open a fresh
     // session and accidentally turn a partial transaction into success.
-    void Commit(const std::string &catalog_name) {
+    void Commit(const std::string &catalog_name, bool &commit_started) {
+        commit_started = false;
         PinnedOracleSession entry;
         {
             std::lock_guard<std::mutex> guard(lock);
@@ -221,6 +222,7 @@ struct OracleWriteState final : ClientContextState {
         }
         try {
             TranslatingOracleErrors("Oracle COMMIT failed", [&] {
+                commit_started = true;
                 entry.session->Commit();
                 return 0;
             });
@@ -967,8 +969,8 @@ void PoisonTransactionSession(ClientContext &context, const std::string &catalog
     }
 }
 
-void CommitOracleTransaction(ClientContext &context, const std::string &catalog_name) {
-    WriteStateFor(context).Commit(catalog_name);
+void CommitOracleTransaction(ClientContext &context, const std::string &catalog_name, bool &commit_started) {
+    WriteStateFor(context).Commit(catalog_name, commit_started);
 }
 
 OracleTransactionStatus GetOracleTransactionStatus(ClientContext &context, const std::string &catalog_name) {

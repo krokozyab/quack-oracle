@@ -499,7 +499,7 @@ std::string OracleSelectExpression(const OracleColumn &column);
 std::string OracleBindExpression(const OracleColumn &column, size_t bind_position);
 
 OracleWriteTarget ResolveOracleWriteTarget(ClientContext &context, const std::string &catalog_name);
-void CommitOracleTransaction(ClientContext &context, const std::string &catalog_name);
+void CommitOracleTransaction(ClientContext &context, const std::string &catalog_name, bool &commit_started);
 // Marks the pinned session as one that must not be reused: the transaction
 // ran something, such as a stored procedure, that can leave session state.
 void TaintTransactionSession(ClientContext &context, const std::string &catalog_name);

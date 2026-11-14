@@ -2,6 +2,9 @@
 
 ## Fixes
 
+- A commit rejected before the remote COMMIT starts compensates acknowledged
+  CREATEs. Only an attempted remote COMMIT retains tables for reconciliation.
+
 - Incomplete dictionary loads verify missing names with a per-table describe;
   CREATE/DROP IF EXISTS decisions no longer assume the requested object exists.
 

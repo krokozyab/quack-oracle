@@ -2006,19 +2006,24 @@ public:
     }
 
     ErrorData CommitTransaction(ClientContext &context, Transaction &transaction) override {
+        bool commit_started = false;
         try {
             // Generated dictionary entries use system transactions. The raw
             // SQL/DML path must have no local changes before remote COMMIT.
             if (transaction.Cast<DuckTransaction>().ChangesMade()) {
                 throw TransactionException("Oracle transactions cannot commit local catalog or storage changes");
             }
-            CommitOracleTransaction(context, catalog_name);
+            CommitOracleTransaction(context, catalog_name, commit_started);
             FinishOracleDdl(context, catalog_name, true);
         } catch (const std::exception &error) {
             RollbackOracleTransaction(context, catalog_name);
-            // A failed COMMIT can have an unknown remote outcome: retain tables for reconciliation.
-            FinishOracleDdl(context, catalog_name, true);
             DuckTransactionManager::RollbackTransaction(transaction);
+            // Only an attempted remote COMMIT can have an unknown outcome.
+            try {
+                FinishOracleDdl(context, catalog_name, commit_started);
+            } catch (const std::exception &cleanup_error) {
+                return ErrorData(IOException("%s; %s", error.what(), cleanup_error.what()));
+            }
             return ErrorData(error);
         }
         return DuckTransactionManager::CommitTransaction(context, transaction);

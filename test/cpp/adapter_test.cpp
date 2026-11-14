@@ -3705,6 +3705,14 @@ void TestAttachedDdlRefreshesAndCompensates() {
     refresh();
     database.Run("DETACH o;");
     database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner);");
+    database.Run("BEGIN;");
+    database.Run("CREATE TABLE o.RV_PRECOMMIT(ID INTEGER);");
+    database.Run("INSERT INTO o.RV_PRECOMMIT VALUES (1);");
+    const auto commits_before_poison = script->commits;
+    duckdb::PoisonTransactionSession(*database.con.context, "o");
+    CHECK(database.Query("COMMIT;")->HasError());
+    CHECK(script->commits == commits_before_poison);
+    CHECK(script->tables.count("RV_PRECOMMIT") == 0);
     for (const auto *unit : {"TIMESTAMP_S", "TIMESTAMP_MS"}) {
         script->batch_rows.clear();
         database.Run(std::string("CREATE TABLE o.RV_TS AS SELECT CAST(TIMESTAMP '2026-01-02 03:04:05.123' AS ")+unit+") ID;");
