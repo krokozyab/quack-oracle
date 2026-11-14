@@ -167,6 +167,9 @@ struct OracleAttachedState {
     mutable std::unordered_map<std::string, uint64_t> row_estimates;
     // NUM_DISTINCT per table and column, from the same statistics.
     mutable std::unordered_map<std::string, std::unordered_map<std::string, uint64_t>> distinct_estimates;
+    // Whether the session compares text by bytes (NLS_COMP = BINARY), read once at
+    // ATTACH. False when it could not be read: equality on text then stays in DuckDB.
+    bool nls_comp_binary = false;
 
     void ConnectAndDiscoverSchema() {
         OracleMetadataLease session(transaction_pool, config, password);
@@ -180,6 +183,7 @@ struct OracleAttachedState {
         current_schema.assign(batch.rows[0][0]->begin(), batch.rows[0][0]->end());
         cursor->Close();
         session.Finish();
+        ReadNlsComp();
         if (current_schema.empty()) {
             throw IOException("Oracle ATTACH received an empty current schema");
         }
@@ -378,6 +382,9 @@ struct OracleAttachedState {
                              std::string(row[offset + 5]->begin(), row[offset + 5]->end()) == "Y",
                              character_set_form};
         column.xml = xml;
+        // A column that declares a collation of its own is settled afterwards, by
+        // ApplyCollationsLocked; this is the default, NLS_COMP's.
+        column.compared_as_bytes = nls_comp_binary;
         return column;
     }
 
@@ -425,6 +432,77 @@ struct OracleAttachedState {
         column.vector_flags = static_cast<uint8_t>((dimensions == 0 ? oracle_scanner::ORACLE_VECTOR_COLUMN_FLEXIBLE_DIMENSIONS : 0) |
                                                    (parts[2] == "SPARSE" ? oracle_scanner::ORACLE_VECTOR_COLUMN_SPARSE : 0));
         return true;
+    }
+
+    // NLS_COMP decides how a column without a collation of its own compares text.
+    // Every session of this catalog signs in as the same user, so they all start
+    // from what this one is given, logon triggers included.
+    void ReadNlsComp() {
+        try {
+            OracleMetadataLease session(transaction_pool, config, password);
+            auto cursor =
+                session->Query("SELECT value FROM nls_session_parameters WHERE parameter = 'NLS_COMP'", {});
+            const auto batch = cursor->Fetch(1);
+            nls_comp_binary = !batch.rows.empty() && !batch.rows[0].empty() && batch.rows[0][0] &&
+                              std::string(batch.rows[0][0]->begin(), batch.rows[0][0]->end()) == "BINARY";
+            cursor->Close();
+            session.Finish();
+        } catch (const std::exception &) {
+            nls_comp_binary = false;
+        }
+    }
+
+    // Settles compared_as_bytes for the columns that declare a collation of their
+    // own (Oracle 12.2 and later, under MAX_STRING_SIZE = EXTENDED, as on
+    // Autonomous Database): BINARY compares by bytes whatever NLS_COMP is, and
+    // anything else (BINARY_CI, a linguistic sort, USING_NLS_SORT) does not. A
+    // server older than COLLATION has no column collations; any other failure
+    // leaves every character column to DuckDB, which is slower but not wrong.
+    void ApplyCollationsLocked(std::unordered_map<std::string, std::vector<OracleColumn>> &columns_by_object,
+                               const std::string &only_object) const {
+        std::string sql = "SELECT table_name, column_name, collation FROM " + View("tab_columns") +
+                          " WHERE collation IS NOT NULL AND collation <> 'USING_NLS_COMP'" +
+                          OwnerCondition("owner", "AND");
+        if (!only_object.empty()) {
+            sql += " AND table_name = " + Literal(only_object);
+        }
+        try {
+            OracleMetadataLease session(transaction_pool, config, password);
+            auto cursor = session->Query(sql, {});
+            for (;;) {
+                const auto batch = cursor->Fetch(STANDARD_VECTOR_SIZE);
+                for (const auto &row : batch.rows) {
+                    if (row.size() < 3 || !row[0] || !row[1] || !row[2]) {
+                        continue;
+                    }
+                    const auto entry = columns_by_object.find(std::string(row[0]->begin(), row[0]->end()));
+                    if (entry == columns_by_object.end()) {
+                        continue;
+                    }
+                    const std::string column_name(row[1]->begin(), row[1]->end());
+                    const std::string collation(row[2]->begin(), row[2]->end());
+                    for (auto &column : entry->second) {
+                        if (column.name == column_name) {
+                            column.compared_as_bytes = collation == "BINARY";
+                        }
+                    }
+                }
+                if (batch.exhausted) {
+                    break;
+                }
+            }
+            cursor->Close();
+            session.Finish();
+        } catch (const std::exception &error) {
+            if (std::string(error.what()).find("ORA-00904") != std::string::npos) {
+                return; // no COLLATION column: a server before 12.2
+            }
+            for (auto &entry : columns_by_object) {
+                for (auto &column : entry.second) {
+                    column.compared_as_bytes = false;
+                }
+            }
+        }
     }
 
     // Gives every VECTOR column in `columns` the shape the dictionary states,
@@ -552,6 +630,7 @@ struct OracleAttachedState {
         cursor->Close();
         session.Finish();
         ApplyVectorShapesLocked(column_cache, std::string());
+        ApplyCollationsLocked(column_cache, std::string());
         metadata_complete = !truncated;
     }
 
@@ -588,6 +667,7 @@ struct OracleAttachedState {
         std::unordered_map<std::string, std::vector<OracleColumn>> by_object;
         by_object.emplace(object_name, std::move(columns));
         ApplyVectorShapesLocked(by_object, object_name);
+        ApplyCollationsLocked(by_object, object_name);
         return std::move(by_object.begin()->second);
     }
 

@@ -137,10 +137,12 @@ void PushTopN(ClientContext &context, LogicalTopN &top) {
 //  - COUNT(*), COUNT(column), SUM, MIN and MAX of a column, not DISTINCT, with no
 //    FILTER or ORDER BY; no GROUPING SETS or GROUPING();
 //  - SUM only of an exact number (integer or fixed-scale decimal), whose result
-//    type matches DuckDB's; MIN and MAX and the group keys only of numbers, dates
-//    and timestamps, which compare the same in both engines. Text is left out:
-//    Oracle may group and order it by a collation (NLS_COMP, blank-padded CHAR)
-//    where DuckDB compares bytes; floating point is left out because the order of
+//    type matches DuckDB's; MIN and MAX only of numbers, dates and timestamps,
+//    which order the same in both engines, and group keys of those and of the
+//    VARCHAR2 columns Oracle compares by bytes (OracleColumn::compared_as_bytes).
+//    Other text is left out: Oracle may compare it by a collation (NLS_COMP, a
+//    column's COLLATE, blank-padded CHAR) where DuckDB compares bytes, and text
+//    order follows NLS_SORT; floating point is left out because the order of
 //    addition changes the result;
 //  - every filter was translated into the WHERE clause, none is left for DuckDB
 //    to apply to the rows (it would then see groups instead of rows), and the
@@ -222,7 +224,12 @@ bool PlanPushedAggregate(ClientContext &context, LogicalAggregate &aggregate, Lo
 		}
 		const auto &source = bind.columns[column];
 		const auto type = MappedType(source);
-		if (!KeyType(type) || type != group->GetReturnType() || OracleColumnRoundsOnRead(source)) {
+		// Grouping needs only equality, so a VARCHAR2 Oracle compares by bytes
+		// groups as DuckDB would: the same values together, and no empty string
+		// on either side, since Oracle stores '' as NULL.
+		const bool text_key = type.id() == LogicalTypeId::VARCHAR && source.oracle_type == 1 &&
+		                      source.character_set_form != 2 && !source.xml && source.compared_as_bytes;
+		if ((!KeyType(type) && !text_key) || type != group->GetReturnType() || OracleColumnRoundsOnRead(source)) {
 			return false;
 		}
 		add(Quoted(source), source, type, type);

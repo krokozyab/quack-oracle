@@ -325,6 +325,12 @@ std::string OracleLiteral(const Value &constant, const OracleColumn &column) {
             // not one this translator has shown to be the same predicate.
             Refuse("a string comparison against a national character set column");
         }
+        if (!column.compared_as_bytes) {
+            // Equality on text follows a collation as ordering does: under
+            // NLS_COMP = LINGUISTIC with a case-insensitive NLS_SORT, or a
+            // column declared COLLATE BINARY_CI, 'shipped' = 'SHIPPED' in Oracle.
+            Refuse("a string comparison against a column Oracle compares by a collation rather than by bytes");
+        }
         std::string literal = "'";
         for (const auto character : text) {
             if (character == '\'') {
@@ -356,7 +362,8 @@ std::string ComparisonOperator(ExpressionType comparison, const OracleColumn &co
         if (column.oracle_type != 2 && column.oracle_type != 12 && column.oracle_type != 180) {
             // Ordering of character values follows NLS_SORT and NLS_COMP, which
             // this client never negotiates, so a range comparison on text has
-            // no provable meaning here. Equality does not depend on collation.
+            // no provable meaning here. (Equality is pushed only for a column known
+            // to compare by bytes; see OracleColumn::compared_as_bytes.)
             // Chronological order does not depend on anything a session sets.
             Refuse("an ordered comparison on a column that is not NUMBER, DATE or TIMESTAMP");
         }
@@ -484,8 +491,8 @@ std::string TranslateExpression(const Expression &expression, const OracleColumn
                    (op.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL ? " IS NULL" : " IS NOT NULL");
         case ExpressionType::COMPARE_IN: {
             // An IN list is a disjunction of equalities, and equality carries
-            // the same proof: exact for NUMBER, collation-independent for
-            // VARCHAR2, and refused for an empty string. Each value goes
+            // the same proof: exact for NUMBER, for VARCHAR2 only when the column
+            // compares by bytes, and refused for an empty string. Each value goes
             // through the same literal check, so a list containing one
             // unprovable value refuses as a whole rather than being partly
             // applied.

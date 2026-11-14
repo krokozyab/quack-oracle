@@ -286,13 +286,32 @@ class FakeCursor final : public OracleCursor {
 public:
     FakeCursor(std::shared_ptr<FakeScript> script_p, const std::string &sql = std::string())
         : script(std::move(script_p)) {
+        // The catalog's collation probes also read the dictionary views other
+        // routes name (`FROM user_tab_columns`); only a route written for them answers.
+        const bool collation_probe = sql.find("collation IS NOT NULL") != std::string::npos ||
+                                     sql.find("FROM nls_session_parameters") != std::string::npos;
         for (const auto &route : script->routes) {
+            if (collation_probe && route.first.find("collation") == std::string::npos &&
+                route.first.find("nls_session_parameters") == std::string::npos) {
+                continue;
+            }
             if (sql.find(route.first) != std::string::npos) {
                 answer = &route.second;
                 return;
             }
         }
         if (ProjectScriptedTable(*script, sql, projected)) {
+            answer = &projected;
+            return;
+        }
+        // What a catalog asks of every database, answered as a default database
+        // would unless a route says otherwise: text compares by bytes, and no
+        // column declares a collation of its own.
+        if (sql.find("FROM nls_session_parameters WHERE parameter = 'NLS_COMP'") != std::string::npos) {
+            projected = {{Column("VALUE", 1)}, {{Text("BINARY")}}};
+            answer = &projected;
+        } else if (sql.find("collation IS NOT NULL") != std::string::npos) {
+            projected = {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("COLLATION", 1)}, {}};
             answer = &projected;
         }
     }
@@ -1284,6 +1303,8 @@ void TestNullsSurviveAboveTheScan() {
 // changes the answer rather than merely slowing it down.
 void TestFilterPushdownTranslatesOnlyTheProvenSubset() {
     std::vector<OracleColumn> columns = {Column("ID", 2), Column("LABEL", 1), Column("TAG", 96)};
+    // As a catalog marks a VARCHAR2 the session compares by bytes (NLS_COMP = BINARY).
+    columns[1].compared_as_bytes = true;
     const std::vector<duckdb::column_t> scanned = {0, 1, 2};
 
     // DuckDB 2.0 hands a scan ExpressionFilters only: LogicalGet converts every
@@ -1311,7 +1332,7 @@ void TestFilterPushdownTranslatesOnlyTheProvenSubset() {
     CHECK(translate(0, constant(duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::BIGINT(2))) ==
            "\"ID\" >= 2");
 
-    // VARCHAR2 equality does not depend on collation; the literal is escaped.
+    // VARCHAR2 equality on a column compared by bytes; the literal is escaped.
     CHECK(translate(1, constant(duckdb::ExpressionType::COMPARE_EQUAL, duckdb::Value("beta"))) ==
            "\"LABEL\" = 'beta'");
     CHECK(translate(1, constant(duckdb::ExpressionType::COMPARE_EQUAL, duckdb::Value("O'Hara"))) ==
@@ -1341,6 +1362,11 @@ void TestFilterPushdownTranslatesOnlyTheProvenSubset() {
     // Character ordering follows NLS_SORT and NLS_COMP, which are never
     // negotiated, so a range comparison on text has no provable meaning.
     refused(1, constant(duckdb::ExpressionType::COMPARE_LESSTHAN, duckdb::Value("m")), "not NUMBER");
+    // Equality follows a collation too: under NLS_COMP = LINGUISTIC with BINARY_CI, or
+    // a column declared COLLATE BINARY_CI, 'beta' = 'BETA' in Oracle.
+    columns[1].compared_as_bytes = false;
+    refused(1, constant(duckdb::ExpressionType::COMPARE_EQUAL, duckdb::Value("beta")), "by a collation");
+    columns[1].compared_as_bytes = true;
 
     // A date reads back as a real TIMESTAMP now, so its filters are timestamp
     // comparisons and can be pushed: TO_DATE and TO_TIMESTAMP with an explicit
@@ -2794,6 +2820,84 @@ void TestVectorSearchArguments() {
     CHECK(script->queries.back().find("FROM \"SALES\".\"MixedCase\" t") != std::string::npos);
     CHECK(script->queries.back().find("t.\"E\"\"MB\"") != std::string::npos);
     std::cout << "oracle_vector_search refuses what it cannot put in a statement safely" << std::endl;
+}
+
+// Oracle compares text by bytes only under NLS_COMP = BINARY and for a column that
+// declares no collation of its own (or BINARY). Elsewhere 'beta' = 'BETA' can hold,
+// so equality and grouping on such a column stay in DuckDB, and the answer is
+// DuckDB's; on a column compared by bytes both go to Oracle.
+void TestTextComparesByTheSessionCollation() {
+    const auto text_columns = [](std::initializer_list<const char *> names) {
+        std::vector<OracleColumn> result;
+        for (const auto *name : names) {
+            result.push_back(Column(name, 1));
+        }
+        return result;
+    };
+    const auto script_for = [&](const char *nls_comp) {
+        auto script = std::make_shared<FakeScript>();
+        script->routes.push_back({"SELECT USER FROM DUAL", {text_columns({"USER"}), {{Text("APP")}}}});
+        script->routes.push_back({"nls_session_parameters", {text_columns({"VALUE"}), {{Text(nls_comp)}}}});
+        script->routes.push_back({"collation IS NOT NULL",
+                                  {text_columns({"TABLE_NAME", "COLUMN_NAME", "COLLATION"}),
+                                   {{Text("ITEMS"), Text("CODE"), Text("BINARY_CI")}}}});
+        script->routes.push_back({"FROM user_tables", {text_columns({"TABLE_NAME"}), {{Text("ITEMS")}}}});
+        script->routes.push_back({"FROM user_views", {text_columns({"VIEW_NAME"}), {}}});
+        script->routes.push_back(
+            {"FROM user_tab_columns",
+             {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+               Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+              {{Text("ITEMS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("N")},
+               {Text("ITEMS"), Text("LABEL"), Text("VARCHAR2"), Number("20"), WireValue(), WireValue(), Text("Y")},
+               {Text("ITEMS"), Text("CODE"), Text("VARCHAR2"), Number("20"), WireValue(), WireValue(), Text("Y")}}}});
+        script->routes.push_back({"FROM user_constraints", {text_columns({"TABLE_NAME", "COLUMN_NAME"}), {}}});
+        script->tables["ITEMS"] = {{Column("ID", 2, 10, 0), Column("LABEL", 1), Column("CODE", 1)},
+                                   {{Number("1"), Text("beta"), Text("beta")},
+                                    {Number("2"), Text("BETA"), Text("BETA")}}};
+        return script;
+    };
+    const auto pushed = [](const std::shared_ptr<FakeScript> &script, const std::string &fragment) {
+        return script->queries.back().find(fragment) != std::string::npos;
+    };
+    {
+        auto script = script_for("BINARY");
+        auto factory = InstallFake(script);
+        TestDatabase database;
+        database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner);");
+        // LABEL compares by bytes: the equality goes to Oracle.
+        CHECK(!database.Query("SELECT ID FROM o.main.ITEMS WHERE LABEL = 'beta';")->HasError());
+        CHECK(pushed(script, "\"LABEL\" = 'beta'"));
+        // CODE is declared BINARY_CI: Oracle would match 'BETA' too, so DuckDB filters.
+        auto code = database.Query("SELECT ID FROM o.main.ITEMS WHERE CODE = 'beta';");
+        CHECK(!code->HasError() && code->RowCount() == 1 && code->GetValue(0, 0).ToString() == "1");
+        CHECK(!pushed(script, "\"CODE\" ="));
+        // Grouping needs only equality: by LABEL in Oracle, by CODE in DuckDB.
+        database.Run("SET oracle_aggregate_pushdown = true;");
+        script->routes.insert(script->routes.begin(),
+                              {"GROUP BY", {{Column("C0", 1), Column("C1", 2, 18, 0)},
+                                            {{Text("BETA"), Number("1")}, {Text("beta"), Number("1")}}}});
+        auto by_label = database.Query("SELECT LABEL, count(*) FROM o.main.ITEMS GROUP BY LABEL ORDER BY LABEL;");
+        CHECK(!by_label->HasError() && by_label->RowCount() == 2);
+        CHECK(pushed(script, "GROUP BY \"LABEL\""));
+        auto by_code = database.Query("SELECT CODE, count(*) FROM o.main.ITEMS GROUP BY CODE ORDER BY CODE;");
+        CHECK(!by_code->HasError() && by_code->RowCount() == 2);
+        CHECK(!pushed(script, "GROUP BY"));
+    }
+    {
+        // A session that compares linguistically, as a logon trigger or the
+        // instance's NLS_COMP can make it: no text column compares by bytes.
+        auto script = script_for("LINGUISTIC");
+        auto factory = InstallFake(script);
+        TestDatabase database;
+        database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner);");
+        auto label = database.Query("SELECT ID FROM o.main.ITEMS WHERE LABEL = 'beta';");
+        CHECK(!label->HasError() && label->RowCount() == 1);
+        CHECK(!pushed(script, "\"LABEL\" ="));
+        database.Run("SET oracle_aggregate_pushdown = true;");
+        CHECK(!database.Query("SELECT LABEL, count(*) FROM o.main.ITEMS GROUP BY LABEL;")->HasError());
+        CHECK(!pushed(script, "GROUP BY"));
+    }
+    std::cout << "text equality and grouping go to Oracle only where it compares by bytes" << std::endl;
 }
 
 // With oracle_parallel_scan a big table is read as ROWID ranges cut at extent
@@ -4833,6 +4937,7 @@ int main() {
     TestJoinKeysReachOracle();
     TestHeavyColumnsAreReadAfterTheFilter();
     TestAttachedScanReadsInRowidRanges();
+    TestTextComparesByTheSessionCollation();
     TestCallableArgumentsOfTheNewTypes();
     TestVectorSearchArguments();
     TestParallelScanShardsOneSnapshot();

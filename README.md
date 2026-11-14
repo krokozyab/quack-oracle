@@ -505,11 +505,15 @@ an error and pushdown was off by default.)
 
 Pushed down: `=`, `<>`, `<`, `<=`, `>`, `>=`, `IS NULL`, `IS NOT NULL`, `IN`
 (up to 16,384 values, as lists of 1,000), and `AND`/`OR` of those, on number, date and timestamp
-columns, and `=`, `<>` and `IN` on `VARCHAR2` columns against a non-empty constant
-(equality does not depend on collation). Ordered comparisons of text, `LIKE`, and any
-comparison on a `CHAR` or `NVARCHAR2` column are applied by DuckDB to the rows that come
-back, because Oracle's collation and its blank-padded `CHAR` comparison depend on session
-settings this client does not negotiate.
+columns, and `=`, `<>` and `IN` on `VARCHAR2` columns against a non-empty constant when
+Oracle compares that column by bytes, as DuckDB does: the session's `NLS_COMP` is `BINARY`
+(read once at `ATTACH`) and the column declares no collation of its own, or `BINARY`. Under
+`NLS_COMP = LINGUISTIC` with a case-insensitive `NLS_SORT`, or on a column declared
+`COLLATE BINARY_CI` (possible where `MAX_STRING_SIZE = EXTENDED`, as on Autonomous Database),
+`'shipped' = 'SHIPPED'` holds in Oracle, so those comparisons stay in DuckDB. Ordered
+comparisons of text, `LIKE`, and any comparison on a `CHAR` or `NVARCHAR2` column are applied
+by DuckDB to the rows that come back, because Oracle orders text by `NLS_SORT` and compares
+`CHAR` blank-padded.
 
 ### What else goes to Oracle
 
@@ -547,7 +551,7 @@ only ever a narrowing: DuckDB still checks every row against the join.
 When one side of a join is an attached table, DuckDB sends the other side's keys to
 the scan once they are known; they reach Oracle as `IN` lists (numbers also as `BETWEEN` ranges),
 so a small build side reads a few rows instead of the table. Text keys of `VARCHAR2` columns work
-the same way, because equality does not depend on collation. DuckDB builds an `IN` list only up to
+the same way where Oracle compares the column by bytes (see above). DuckDB builds an `IN` list only up to
 its own `dynamic_or_filter_threshold` (50 by default); `SET dynamic_or_filter_threshold = 5000`
 lets a larger build side through, and a list over Oracle's 1000-entry limit is sent as several
 lists joined by `OR`, up to 16384 values (more than that is read unfiltered, as before). A
@@ -586,9 +590,10 @@ so the groups travel, not the rows. Covered: `count(*)`, `count(col)`, `sum`, `m
 or without `GROUP BY`, without `DISTINCT`, `FILTER`, `ORDER BY` or `GROUPING SETS`. `sum` is
 pushed for exact numbers only (integers arrive as text and are read as `HUGEINT`, fixed-scale
 decimals as `DECIMAL(38,s)`, the types DuckDB itself returns); `min`, `max` and group keys for
-numbers, dates and timestamps. Text keys and floating point are left to DuckDB (Oracle may
-group and order text by a collation or blank-padding where DuckDB compares bytes, and the order of
-addition changes a floating-point sum). Every filter must have gone to Oracle too, and the scan
+numbers, dates and timestamps, and group keys also for `VARCHAR2` columns Oracle compares by
+bytes (grouping needs only equality; see the filters above). Other text keys, `min`/`max` of text,
+`avg`, and floating point are left to DuckDB (Oracle may compare text by a collation or
+blank-padding and orders it by `NLS_SORT`, and the order of addition changes a floating-point sum). Every filter must have gone to Oracle too, and the scan
 must have no sample and no join filter coming later; otherwise the plan is unchanged.
 `SET oracle_aggregate_pushdown = false` turns it off. 60 random aggregate queries (up to two
 group keys, NULLs, ties, decimals, dates, timestamps, pushed filters) returned the same rows with

@@ -59,6 +59,12 @@ struct OracleColumn {
     // write binds a CLOB inside XMLTYPE(:n), so the column is only ever text on
     // this side. Never set on a describe.
     bool xml = false;
+    // Set by a catalog on a character column Oracle compares byte by byte, as
+    // DuckDB does: the session's NLS_COMP is BINARY and the column declares no
+    // collation of its own, or declares BINARY. Any other column compares by a
+    // collation, under which BINARY_CI makes 'a' equal 'A', so equality on it
+    // is not DuckDB's. Never set on a describe.
+    bool compared_as_bytes = false;
     // What a NUMBER with no declared precision becomes in DuckDB, chosen by the
     // oracle_unconstrained_number setting when the columns are described: text
     // (the default, which loses nothing), DOUBLE, or a fixed DECIMAL.
