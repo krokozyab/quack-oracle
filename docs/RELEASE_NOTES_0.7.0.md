@@ -1,116 +1,89 @@
-# 0.7.0 (draft)
+# oracle_scanner 0.7.0
 
-## Fixes
+Built for DuckDB v2.0.0. Install with `INSTALL oracle_scanner FROM community;`
+once the release is published. Table DDL, upserts and several Oracle schemas
+through one `ATTACH`; more work sent to Oracle; a faster fetch path; and two
+corrections. Everything below was verified against Oracle 19c and Free 23ai and
+is covered by tests.
 
-- With incomplete metadata, exact table spelling is checked before case-insensitive
-  fallback. Fallback verifies uniqueness against the object list, preventing DROP
-  from selecting another cached case variant.
+## New through `ATTACH`
 
-- Upserts reject explicit DEFAULT inside VALUES before writing, including mixed
-  rows, DO NOTHING, DO UPDATE and REPLACE; omitted columns retain Oracle defaults.
+- **Create, change and drop Oracle tables.** `CREATE TABLE`, `CREATE TABLE … AS
+  SELECT`, `DROP TABLE` and `ALTER TABLE` (`ADD`, `DROP` and `RENAME COLUMN`,
+  `RENAME TO`) now run in Oracle, and the attached catalog sees the result at
+  once, without `DETACH` and `ATTACH`. Prepared statements over a changed table
+  are bound again. Oracle commits DDL on its own, so the DDL runs on a separate
+  session: it does not commit the DML of your open transaction, and `ALTER` and
+  `DROP` stay done after a DuckDB `ROLLBACK`. A table created inside a
+  transaction that rolls back, fails or is closed is dropped again, after its
+  object id has been checked, so a table someone else put under that name is
+  left alone. This is compensation, not atomic DDL: if the cleanup itself fails,
+  the table stays and the error says so. A table locked by uncommitted DML,
+  including your own, is refused at once with ORA-00054 rather than waited on.
+  The DuckDB-to-Oracle type mapping and what is refused (`TEMPORARY`,
+  `OR REPLACE`, `CHECK` and foreign keys, generated columns, expression defaults,
+  `CASCADE`) are in the README.
+- **Upserts.** `INSERT … ON CONFLICT DO NOTHING`, `ON CONFLICT … DO UPDATE SET
+  col = excluded.col` (or a constant), `INSERT OR REPLACE` and a `MERGE INTO`
+  statement run as one Oracle `MERGE` with array binds. Attached tables now show
+  their enforced primary and unique keys to DuckDB, which is what the conflict
+  target needs. Columns you leave out keep their Oracle defaults. A source that
+  repeats a key, also after conversion to the column type (`'70'` and `'070'`
+  into a NUMBER key), is refused before anything is written. Refused, with
+  `oracle_execute` and your own `MERGE` as the way round: conditions on the
+  actions, expressions over the old row, changing a key, `RETURNING`, `NULL` keys,
+  an explicit `DEFAULT` in the source, and keys whose Oracle equality is not
+  byte equality (`CHAR`/`NCHAR`, text compared by a collation, `BINARY_FLOAT`
+  and `BINARY_DOUBLE`). Oracle's `MERGE` is not an atomic upsert: two sessions
+  merging the same new key at once can end with ORA-00001 in the second.
+- **Several Oracle schemas in one attachment.** `o.hr.employees` and
+  `o.sales.orders` work side by side, `USE o.hr` too, and writes to several
+  schemas share one Oracle transaction. `main` stays the owner chosen by
+  `SCHEMA` (or the signed-in user). Oracle grants still decide what can be read.
+  Owners are discovered at `ATTACH` without `SCHEMA`, at most 4,096 of them;
+  a schema created or granted later needs a new `ATTACH`.
 
-- DDL lock refusals explain that the caller may hold the lock and require
-  COMMIT or ROLLBACK, retaining Oracle error code 54.
+## More of the query runs in Oracle
 
-- CREATE compensation locks, verifies OBJECT_ID and drops in one server block,
-  removing the gap between client sessions. Concurrent external DDL remains
-  outside the compensation guarantee because Oracle DDL implicitly commits.
+- **`LIMIT` without `ORDER BY`.** `SELECT … FROM o.big LIMIT 5` used to plan a
+  parallel ROWID-range read of the whole table for five rows. A constant `LIMIT`
+  (with `OFFSET`, `limit + offset`) is now sent as `FETCH FIRST n ROWS ONLY` and
+  read through one session, unless a filter stays in DuckDB, the scan is sampled
+  or it locks rows for an `UPDATE`. `oracle_top_n_pushdown = false` turns it off.
+- **`count(DISTINCT col)`.** Counted entirely by Oracle for exact numbers,
+  `BINARY_FLOAT`/`BINARY_DOUBLE`, `DATE` and `TIMESTAMP` without a time zone, and
+  text Oracle compares byte by byte, so one row comes back instead of every
+  distinct value. `avg` still runs in DuckDB.
+- **`MERGE` in `oracle_execute`**, `oracle_execute_transaction` and
+  `oracle_execute_many`, with Oracle's affected-row count.
 
-- oracle_top_n_pushdown=false also disables unordered LIMIT pushdown.
+## Faster
 
-- Schema discovery truncates at 4,096 owners instead of failing ATTACH. Explicit
-  SCHEMA skips discovery; missing named owners are cached until reattachment.
+- **Fetching.** Fetched values now share one buffer per batch instead of one
+  allocation per cell, and exact `NUMBER` values go straight into DuckDB
+  `DECIMAL` storage without passing through text. Reading a 1M-row, 7-column
+  table through one session took 0.94 s and now takes 0.76 s on the local test
+  machine, with 28% less client CPU. A batch over 64 MiB, which only a select
+  list of thousands of columns reaches, is decoded the old way.
 
-- A commit rejected before the remote COMMIT starts compensates acknowledged
-  CREATEs. Only an attempted remote COMMIT retains tables for reconciliation.
+## Results that were wrong
 
-- Incomplete dictionary loads verify missing names with a per-table describe;
-  CREATE/DROP IF EXISTS decisions no longer assume the requested object exists.
-
-- Skipping protocol bytes checks bounds and advances without allocating or copying.
-
-- Attached MERGE rejects duplicate source keys after target-type conversion,
-  before issuing remote writes, including duplicates across source batches.
-
-- Updating an indexed column writes only explicitly assigned columns; unchanged
-  values are not read back through potentially lossy mappings or rewritten.
-
-- Renaming a table back to a previously cached name restores its catalog entry,
-  including alias lookups and catalog inspection, without reattachment.
-
-- DELETE RETURNING initializes DuckDB 2.0's virtual ROWID output, preventing
-  empty identities and uninitialized string data in returned chunks.
-
-- Unsupported operations requiring DuckDB-local storage now distinguish unsupported
-  MERGE/upsert from the administrative SQL route for DROP and ALTER.
+- **`INSERT … VALUES (1, DEFAULT)` wrote `NULL`.** An explicit `DEFAULT` through
+  `ATTACH` was sent as `NULL` instead of the column's Oracle default. It is now
+  refused; leave the column out and Oracle fills it in, as before.
+- **`DELETE … RETURNING rowid` returned empty or broken values.** The returned
+  chunk left DuckDB 2.0's virtual ROWID column uninitialized. It now holds the
+  deleted rows' ROWIDs.
 
 ## Behaviour changes
 
-- Attached MERGE/upsert refuses CHAR/NCHAR, national or nonbinary text, and
-  BINARY_FLOAT/DOUBLE conflict keys before writing; raw Oracle MERGE remains available.
-
-- Plain attached INSERT refuses explicit DEFAULT before writing instead of
-  silently inserting NULL. Omitted columns retain Oracle defaults; use the raw
-  Oracle INSERT API when explicit DEFAULT values are required.
-
-- SCHEMA selects the owner behind `main`; it no longer limits the attachment to
-  one owner. Oracle grants still control access. Schema discovery lists visible
-  non-Oracle-maintained owners. `main` is reserved; case-colliding owner aliases
-  are refused, and discovery/named lookup are bounded to 4,096 names. Reattach
-  after external schema/grant changes. READ_ONLY applies to every owner.
-
-- Packed scalar storage is bounded to 64 MiB including cell descriptors and
-  validity metadata. A response exceeding that budget is decoded through the
-  ordinary path without another remote fetch. Both paths allow scalar values
-  through 16 MiB; response reassembly bounds remain enforced.
-
-- Attached CREATE/CTAS, DROP and ALTER (ADD/DROP/RENAME COLUMN, RENAME TO)
-  now execute Oracle DDL on separate sessions and refresh the local catalog.
-  ALTER/DROP commit immediately and survive DuckDB rollback. Conflicting locks
-  are checked with LOCK TABLE NOWAIT; caller DML is not committed by DDL.
-- CREATE/CTAS rollback attempts a compensating DROP after identity verification,
-  including statement failures and connection close. This is not atomic DDL;
-  failed cleanup or lost acknowledgements can require manual reconciliation.
-  Unknown COMMIT outcomes preserve tables. Existing IF NOT EXISTS targets are retained.
-- DuckDB-to-Oracle DDL types, literal defaults, supported constraints and limits
-  are documented in README. Read-back types follow Oracle metadata; BOOLEAN
-  becomes NUMBER(1,0), and TIMESTAMPTZ uses WITH LOCAL TIME ZONE.
-
-- Declared `NUMBER(19..38,0)` now reads as `DECIMAL(p,0)` instead of text.
-  Negative-scale declarations with 19..38 effective digits use `DECIMAL(p-s,0)`.
-  Unconstrained NUMBER and values exceeding 38 effective digits retain their mapping.
-- Eligible constant LIMIT/OFFSET scans now bound the Oracle result and avoid
-  parallel range planning. Local filters, samples and locked scans retain local limits.
-
-## Additions
-
-- One ATTACH exposes multiple accessible Oracle owners as schemas, including
-  cross-schema joins, transactional writes and supported table DDL. Owner caches
-  are isolated; transaction sessions and DDL invalidation are shared per catalog.
-  Named-owner CTAS and schema-scoped CREATE rollback are supported.
-
-- Exact NUMBER-to-DECIMAL reads decode directly into portable scaled integers
-  through 38 digits. Values needing rounding or error reporting retain the
-  existing conversion semantics.
-
-- Scalar scans use batch-owned byte storage and cell descriptors, preserving
-  NULLs and compressed-row continuation across packets and fetches. LOB/LONG/
-  binary ROWID and deferred reads retain their existing path.
-
-- Eligible COUNT(DISTINCT column) is computed entirely in Oracle and returns
-  BIGINT. Supports exact numbers, BINARY_FLOAT/DOUBLE, DATE/TIMESTAMP without a
-  time zone and VARCHAR2 compared as bytes. NULL and empty-input semantics match
-  DuckDB. Rounded NUMBER mappings, unsafe text, local filters, samples, aggregate
-  FILTER/ORDER BY and expressions keep local execution. AVG remains local.
-
-- MERGE is accepted as DML by the raw execution APIs, with Oracle affected-row counts
-  and the same transaction ownership as INSERT, UPDATE and DELETE.
-
-- Attached tables expose enforced PRIMARY KEY and UNIQUE keys to DuckDB's conflict binder.
-- ON CONFLICT DO NOTHING, restricted DO UPDATE and INSERT OR REPLACE with one
-  unique key use native Oracle MERGE array DML. Missing columns keep Oracle defaults.
-- The attached MERGE operator supports equality on enforced keys, one INSERT
-  and optional source-column/constant UPDATE. Conditional actions, old-row
-  expressions, key changes, RETURNING and NULL source keys are refused.
-- Concurrent merges of the same new key can fail with ORA-00001; no automatic
-  replay is added. Source deduplication follows DuckDB's conflict binder.
+- **`NUMBER(19)` to `NUMBER(38)` read as `DECIMAL(p,0)`, not text.** Arithmetic,
+  `sum` and joins now work on them without a cast. A negative scale with 19 to
+  38 significant digits becomes `DECIMAL(p-s,0)`. `NUMBER` without a precision
+  keeps the `oracle_unconstrained_number` setting. A query that relied on these
+  columns being `VARCHAR` needs a change.
+- **`SCHEMA` in `ATTACH` picks the owner behind `main`; it no longer limits the
+  attachment to that owner.** See the schema item above. `READ_ONLY` applies to
+  every schema.
+- **`MERGE INTO` and `INSERT OR REPLACE` through `ATTACH`** no longer fail with a
+  message about DDL; they run or are refused as described above.
