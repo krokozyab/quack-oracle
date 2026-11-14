@@ -38,10 +38,11 @@ constexpr size_t TTC_MODULE_MAXIMUM = 48;
 constexpr size_t TTC_ACTION_MAXIMUM = 32;
 constexpr size_t TTC_CLIENT_INFO_MAXIMUM = 64;
 
-// A message the server puts in front of or inside a response (type 23). The
-// only one decoded is the session-return report it sends after the attributes
-// above change, listing the values it now holds; it is skipped, and anything
-// else is refused rather than guessed at. Returns the offset after it.
+// A message the server puts in front of or inside a response (type 23): the
+// report of session attributes just set, Transaction Guard's LTXID with a
+// COMMIT, Application Continuity's replay context, and the rest of the opcodes
+// python-oracledb and rust-oracledb know. Each is skipped, and an unknown one is
+// refused rather than guessed at. Returns the offset after it.
 constexpr uint8_t TTC_MESSAGE_SERVER_PIGGYBACK = 23;
 size_t SkipTtcServerPiggyback(const std::vector<uint8_t> &message, size_t offset);
 //! The same on a buffer: how many bytes of it the piggyback at its start takes.

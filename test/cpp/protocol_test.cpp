@@ -8491,10 +8491,41 @@ static void TestServerPiggybacksAreSkipped() {
     changed.back() = 0x01; // flags: a length of one byte ...
     changed.push_back(0x01); // ... holding 1, a session change
     ExpectError(ProtocolErrorKind::UNSUPPORTED, [&] { (void)SkippedTtcServerPiggybackBytes(changed.data(), changed.size()); });
+    // An opcode no reference knows is refused rather than guessed at.
     ExpectError(ProtocolErrorKind::UNSUPPORTED, [&] {
-        const std::vector<uint8_t> other {0x17, 0x01, 0x00};
+        const std::vector<uint8_t> other {0x17, 0x06, 0x00};
         (void)SkippedTtcServerPiggybackBytes(other.data(), other.size());
     });
+
+    // The other opcodes, laid out as python-oracledb Thin and rust-oracledb read
+    // them; each is followed by a STATUS that must be left where it is.
+    const std::vector<std::vector<uint8_t>> others {
+        {0x17, 0x01},                                            // query cache invalidation
+        {0x17, 0x03},                                            // trace event
+        {0x17, 0x02, 0x01, 0x05, 0x03, 'a', 'b', 'c'},           // OS pid: UB2, bytes
+        {0x17, 0x07, 0x01, 0x04, 0x04, 0xde, 0xad, 0xbe, 0xef},  // LTXID: UB4 length, bytes
+        {0x17, 0x07, 0x00},                                      // an empty LTXID
+        {0x17, 0x08, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, 0x02, 0x02, 0xaa, 0xbb}, // replay context
+        {0x17, 0x09, 0x01, 0x01, 0x01},                          // extended sync
+        {0x17, 0x04, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x02, 0x02, 'k', 'y', 0x01, 0x01, 0x01, 'v', 0x00, 0x00,
+         0x01, 0x2a, 0x01, 0x07},                                // session return: one pair, flags, sid, serial
+        {0x17, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},        // session return with no pairs
+        {0x17, 0x0a, 0x01, 0x01, 0x08, 0x00, 0x01, 0x05, 0x01, 0x06}, // session signature: three UB8
+    };
+    for (const auto &piggyback : others) {
+        auto followed = piggyback;
+        followed.insert(followed.end(), {0x09, 0x01, 0x01, 0x02, 0xc6, 0x10});
+        CHECK(SkippedTtcServerPiggybackBytes(followed.data(), followed.size()) == piggyback.size());
+        if (piggyback.size() > 2) {
+            ExpectError(ProtocolErrorKind::TRUNCATED, [&] {
+                (void)SkippedTtcServerPiggybackBytes(piggyback.data(), piggyback.size() - 1);
+            });
+        }
+    }
+    // A COMMIT on a service with Transaction Guard is acknowledged behind an LTXID.
+    auto acknowledged = others[3];
+    acknowledged.insert(acknowledged.end(), {0x09, 0x01, 0x01, 0x02, 0xc6, 0x10});
+    CHECK(SkipTtcServerPiggyback(acknowledged, 0) == others[3].size());
     std::cout << "a server piggyback inside a response is skipped" << std::endl;
 }
 

@@ -4,6 +4,7 @@
 #include "oracle_scanner/ttc_describe.hpp"
 #include "oracle_scanner/ttc_fetch_response.hpp"
 #include "oracle_scanner/ttc_parameter.hpp"
+#include "oracle_scanner/ttc_piggyback.hpp"
 
 #include <string>
 
@@ -44,7 +45,12 @@ TtcErrorInfo DecodeTtcExecuteCompletion(const std::vector<uint8_t> &message, uin
         // success fallback: DML must preserve the TTIOER row count.
         size_t offset = 0;
         // Each prefix is read where it stands rather than from a copy of the rest.
-        while (offset < message.size() && message[offset] == TTC_MESSAGE_PARAMETER) {
+        while (offset < message.size() &&
+               (message[offset] == TTC_MESSAGE_PARAMETER || message[offset] == TTC_MESSAGE_SERVER_PIGGYBACK)) {
+            if (message[offset] == TTC_MESSAGE_SERVER_PIGGYBACK) {
+                offset += SkippedTtcServerPiggybackBytes(message.data() + offset, message.size() - offset);
+                continue;
+            }
             const auto parameter = DecodeTtcReturnParameterPrefix(message.data() + offset, message.size() - offset);
             offset += parameter.bytes_consumed;
         }

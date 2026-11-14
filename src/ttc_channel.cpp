@@ -45,8 +45,19 @@ size_t TtcChannel::PendingCloseCursorCount() const {
     return pending_close_cursors.size();
 }
 
+// What the server puts ahead of an acknowledgement: the report of attributes just
+// set, ahead of a ping's; Transaction Guard's LTXID, ahead of a COMMIT's.
+static void SkipLeadingServerPiggybacks(std::vector<uint8_t> &response) {
+    size_t offset = 0;
+    while (offset < response.size() && response[offset] == TTC_MESSAGE_SERVER_PIGGYBACK) {
+        offset = SkipTtcServerPiggyback(response, offset);
+    }
+    response.erase(response.begin(), response.begin() + static_cast<std::ptrdiff_t>(offset));
+}
+
 TtcTransactionStatus TtcChannel::ReceiveTransactionStatus(uint8_t server_field_version) {
-    const auto response = Receive();
+    auto response = Receive();
+    SkipLeadingServerPiggybacks(response);
     // Transaction calls can fail just like DML. Use the existing structured
     // error decoder and negotiated server version; never guess from text or
     // mistake a rejected COMMIT for a malformed STATUS acknowledgement.
@@ -64,11 +75,7 @@ TtcTransactionStatus TtcChannel::ReceiveTransactionStatus(uint8_t server_field_v
 void TtcChannel::Ping(uint8_t sequence, uint8_t server_field_version) {
     Send({TTC_MESSAGE_FUNCTION, TTC_FUNCTION_PING, sequence});
     auto response = Receive();
-    // The report of the attributes just set comes ahead of the acknowledgement.
-    while (!response.empty() && response.front() == TTC_MESSAGE_SERVER_PIGGYBACK) {
-        const auto after = SkipTtcServerPiggyback(response, 0);
-        response.erase(response.begin(), response.begin() + static_cast<std::ptrdiff_t>(after));
-    }
+    SkipLeadingServerPiggybacks(response);
     if (IsTtcErrorMessage(response)) {
         const auto error = DecodeTtcErrorPrefix(response, server_field_version);
         if (error.error_number != 0) {

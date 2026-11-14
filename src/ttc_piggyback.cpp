@@ -83,7 +83,20 @@ std::vector<uint8_t> EncodeTtcEndToEndPiggyback(uint8_t sequence, const TtcEndTo
 }
 
 size_t SkippedTtcServerPiggybackBytes(const uint8_t *data, size_t size) {
-    constexpr uint8_t SESSION_RETURN = 5;
+    // The opcodes and their layouts as python-oracledb Thin and rust-oracledb
+    // read them; the two agree field for field. Only SYNC (5) is in a capture of
+    // this client's (19c, after the end-to-end attributes change); LTXID (7)
+    // was seen live on 23ai Free, sent with a COMMIT on a service with
+    // Transaction Guard. Each is skipped: nothing in them is used here.
+    constexpr uint8_t QUERY_CACHE_INVALIDATION = 1;
+    constexpr uint8_t OS_PID_MTS = 2;
+    constexpr uint8_t TRACE_EVENT = 3;
+    constexpr uint8_t SESSION_RETURN = 4;
+    constexpr uint8_t SYNC = 5;
+    constexpr uint8_t LTXID = 7;
+    constexpr uint8_t AC_REPLAY_CONTEXT = 8;
+    constexpr uint8_t EXT_SYNC = 9;
+    constexpr uint8_t SESSION_SIGNATURE = 10;
     constexpr size_t MAX_ELEMENTS = 1024;
     constexpr size_t MAX_VALUE_BYTES = 64U << 10U;
     if (size == 0 || data[0] != TTC_MESSAGE_SERVER_PIGGYBACK) {
@@ -92,30 +105,88 @@ size_t SkippedTtcServerPiggybackBytes(const uint8_t *data, size_t size) {
     ByteReader reader(data, size);
     reader.ReadByte();
     const auto opcode = reader.ReadByte();
-    if (opcode != SESSION_RETURN) {
+    // A key and a value, each length-prefixed when present, and a flags field.
+    const auto skip_pairs = [&](size_t elements) {
+        if (elements > MAX_ELEMENTS) {
+            throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "TTC server piggyback has too many entries");
+        }
+        for (size_t index = 0; index < elements; index++) {
+            if (reader.ReadUB2() > 0) {
+                (void)reader.ReadLengthPrefixed(MAX_VALUE_BYTES);
+            }
+            if (reader.ReadUB2() > 0) {
+                (void)reader.ReadLengthPrefixed(MAX_VALUE_BYTES);
+            }
+            reader.ReadUB2();
+        }
+    };
+    // A UB4 length and, when it is not zero, the bytes with their own prefix.
+    const auto skip_long_bytes = [&]() {
+        if (reader.ReadUB4() > 0) {
+            (void)reader.ReadLengthPrefixed(MAX_VALUE_BYTES);
+        }
+    };
+    switch (opcode) {
+    case QUERY_CACHE_INVALIDATION:
+    case TRACE_EVENT:
+        break;
+    case OS_PID_MTS:
+        reader.ReadUB2();
+        (void)reader.ReadLengthPrefixed(MAX_VALUE_BYTES);
+        break;
+    case SYNC: {
+        // The report of the session attributes just set, listing the values the
+        // server now holds; it only echoes what the client sent.
+        reader.ReadUB2(); // data types
+        reader.ReadByte();
+        const auto elements = reader.ReadUB2();
+        reader.ReadByte();
+        skip_pairs(elements);
+        if (reader.ReadUB4() != 0) {
+            throw ProtocolError(ProtocolErrorKind::UNSUPPORTED, "TTC session-return report carries a session change");
+        }
+        break;
+    }
+    case SESSION_RETURN: {
+        reader.ReadUB2();
+        reader.ReadByte();
+        const auto elements = reader.ReadUB2();
+        if (elements > 0) {
+            reader.ReadByte();
+            skip_pairs(elements);
+        }
+        reader.ReadUB4(); // flags
+        reader.ReadUB4(); // session id
+        reader.ReadUB2(); // serial number
+        break;
+    }
+    case LTXID:
+        // Transaction Guard's logical transaction id, sent with a COMMIT.
+        skip_long_bytes();
+        break;
+    case AC_REPLAY_CONTEXT:
+        // Application Continuity's replay context.
+        reader.ReadUB2();
+        reader.ReadByte();
+        reader.ReadUB4(); // flags
+        reader.ReadUB4(); // error code
+        reader.ReadByte(); // queue
+        skip_long_bytes();
+        break;
+    case EXT_SYNC:
+        reader.ReadUB2();
+        reader.ReadByte();
+        break;
+    case SESSION_SIGNATURE:
+        reader.ReadUB2();
+        reader.ReadByte();
+        reader.ReadUB8(); // flags
+        reader.ReadUB8(); // client signature
+        reader.ReadUB8(); // server signature
+        break;
+    default:
         throw ProtocolError(ProtocolErrorKind::UNSUPPORTED,
                             "TTC server piggyback " + std::to_string(opcode) + " is not supported");
-    }
-    reader.ReadUB2();
-    reader.ReadByte();
-    const auto elements = reader.ReadUB2();
-    if (elements > MAX_ELEMENTS) {
-        throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "TTC session-return report has too many entries");
-    }
-    reader.ReadByte();
-    for (size_t index = 0; index < elements; index++) {
-        // A key and a value, each length-prefixed when present, and a flags
-        // field; the report only echoes what the client just set.
-        if (reader.ReadUB2() > 0) {
-            (void)reader.ReadLengthPrefixed(MAX_VALUE_BYTES);
-        }
-        if (reader.ReadUB2() > 0) {
-            (void)reader.ReadLengthPrefixed(MAX_VALUE_BYTES);
-        }
-        reader.ReadUB2();
-    }
-    if (reader.ReadUB4() != 0) {
-        throw ProtocolError(ProtocolErrorKind::UNSUPPORTED, "TTC session-return report carries a session change");
     }
     return reader.Position();
 }
