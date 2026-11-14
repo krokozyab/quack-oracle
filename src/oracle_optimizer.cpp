@@ -28,6 +28,7 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
+#include "duckdb/planner/operator/logical_limit.hpp"
 
 namespace duckdb {
 
@@ -124,6 +125,28 @@ void PushTopN(ClientContext &context, LogicalTopN &top) {
 	}
 	bind->top_n = std::move(keys);
 	bind->top_n_rows = top.limit + top.offset;
+}
+
+// Keep LIMIT in DuckDB as well: Oracle only bounds how many rows cross the wire.
+void PushLimit(LogicalLimit &limit) {
+    if (limit.limit_val.Type() != LimitNodeType::CONSTANT_VALUE ||
+        (limit.offset_val.Type() != LimitNodeType::UNSET && limit.offset_val.Type() != LimitNodeType::CONSTANT_VALUE)) {
+        return;
+    }
+    const auto rows = limit.limit_val.GetConstantValue();
+    const auto offset = limit.offset_val.Type() == LimitNodeType::CONSTANT_VALUE ? limit.offset_val.GetConstantValue() : 0;
+    auto *node = limit.children[0].get();
+    while (node->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+        node = node->children[0].get();
+    }
+    if (node->type != LogicalOperatorType::LOGICAL_GET) {
+        return;
+    }
+    auto &get = node->Cast<LogicalGet>();
+    auto *bind = get.bind_data ? dynamic_cast<OracleQueryBindData *>(get.bind_data.get()) : nullptr;
+    if (bind && bind->deferred_scan && !bind->for_update) {
+        bind->limit_rows = rows + offset;
+    }
 }
 
 // Aggregates. `SELECT g, count(*), sum(x) FROM o.T WHERE ... GROUP BY g` plans as
@@ -604,6 +627,9 @@ void PushJoin(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &op, C
 void Walk(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &op, ColumnBindingReplacer &replacer,
           bool aggregates, bool joins) {
 	auto &context = input.context;
+	if (op->type == LogicalOperatorType::LOGICAL_LIMIT) {
+        PushLimit(op->Cast<LogicalLimit>());
+    }
 	if (op->type == LogicalOperatorType::LOGICAL_TOP_N) {
 		PushTopN(context, op->Cast<LogicalTopN>());
 	}
@@ -660,7 +686,13 @@ void RegisterOracleOptimizer(DatabaseInstance &db) {
 // The ORDER BY ... FETCH FIRST clause for a pushed Top-N, or empty when the keys
 // were not pushable after all (see OracleQueryInit).
 std::string OracleTopNClause(const OracleQueryBindData &bind) {
+	if (bind.for_update) {
+        return std::string();
+    }
 	if (bind.top_n.empty()) {
+        if (bind.limit_rows) {
+            return " FETCH FIRST " + std::to_string(*bind.limit_rows) + " ROWS ONLY";
+        }
 		return std::string();
 	}
 	std::string clause = " ORDER BY ";

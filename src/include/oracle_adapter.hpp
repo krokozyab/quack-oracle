@@ -258,6 +258,7 @@ struct OracleQueryBindData final : TableFunctionData {
     //! OptimizeOraclePlan; used only when every filter went to Oracle.
     vector<OracleTopNKey> top_n;
     idx_t top_n_rows = 0;
+    std::optional<idx_t> limit_rows;
     //! ` ORDER BY ... FETCH FIRST n ROWS ONLY` when the scan applies it, built at init.
     std::string order_clause;
     //! A scan of one statement the optimizer wrote — an AGGREGATE or a JOIN of

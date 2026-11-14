@@ -2760,6 +2760,21 @@ void TestJoinKeysReachOracle() {
     CHECK(script->queries.back().find("WHERE") != std::string::npos &&
           (script->queries.back().find("BETWEEN") != std::string::npos ||
            script->queries.back().find("IN (") != std::string::npos));
+    {
+        duckdb::OracleQueryBindData locked;
+        locked.limit_rows = 5;
+        locked.for_update = true;
+        CHECK(duckdb::OracleTopNClause(locked).empty());
+    }
+    CHECK(!database.Query("SELECT ID FROM o.main.FACTS LIMIT 5;")->HasError());
+    CHECK(script->queries.back().find("FETCH FIRST 5 ROWS ONLY") != std::string::npos);
+    CHECK(!database.Query("SELECT ID FROM o.main.FACTS TABLESAMPLE SYSTEM (10%) LIMIT 5;")->HasError());
+    CHECK(script->queries.back().find("FETCH FIRST") == std::string::npos);
+    CHECK(!database.Query("SELECT ID FROM o.main.FACTS LIMIT 5 OFFSET 2;")->HasError());
+    CHECK(script->queries.back().find("FETCH FIRST 7 ROWS ONLY") != std::string::npos);
+    CHECK(script->queries.back().find("CHARTOROWID") == std::string::npos);
+    CHECK(!database.Query("SELECT ID FROM o.main.FACTS WHERE abs(ID) > 1000 LIMIT 5;")->HasError());
+    CHECK(script->queries.back().find("FETCH FIRST") == std::string::npos);
     // ORDER BY ... LIMIT over a number is ranked by Oracle, which returns only the first rows; DuckDB's
     // own TOP_N stays above it. The setting turns it off.
     auto top = database.Query("SELECT ID FROM o.main.FACTS ORDER BY ID DESC NULLS FIRST LIMIT 5 OFFSET 2;");

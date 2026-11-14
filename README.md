@@ -633,8 +633,11 @@ for tables of tens of millions of rows, with `SEED` for `REPEATABLE`), so 1% of 
 2,000,000-row table sends 20,000 rows, not 2,000,000. Block sampling on a table of a few
 hundred thousand rows came back as 0 rows in some runs, so smaller tables are sampled by
 row. A sample of a view, a `BERNOULLI` sample and a sample taken after a filter inside
-the sampled query stay in DuckDB. `LIMIT` needs nothing of the kind: the scan reads one
-batch of 2,048 rows and stops (`SELECT * FROM o.BIG LIMIT 10` moved 2,048 rows of 2,000,000).
+the sampled query stay in DuckDB.
+
+A constant `LIMIT`, including `LIMIT … OFFSET …`, is sent as `FETCH FIRST limit+offset ROWS ONLY`
+when directly above an attached scan through projections. Every filter must run in Oracle;
+samples and scans locked `FOR UPDATE` keep their limit in DuckDB. Such bounded reads use one session.
 
 #### JSON paths
 

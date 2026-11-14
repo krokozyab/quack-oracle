@@ -10,3 +10,5 @@
 - Declared `NUMBER(19..38,0)` now reads as `DECIMAL(p,0)` instead of text.
   Negative-scale declarations with 19..38 effective digits use `DECIMAL(p-s,0)`.
   Unconstrained NUMBER and values exceeding 38 effective digits retain their mapping.
+- Eligible constant LIMIT/OFFSET scans now bound the Oracle result and avoid
+  parallel range planning. Local filters, samples and locked scans retain local limits.
