@@ -1027,8 +1027,9 @@ struct OracleAttachedState {
             if (!metadata_loaded) {
                 LoadSchemaColumnsLocked();
             }
-            if (column_cache.find(requested) != column_cache.end()) {
-                return column_cache.at(requested).empty() ? std::string() : requested;
+            const auto exact = column_cache.find(requested);
+            if (exact != column_cache.end() && !exact->second.empty()) {
+                return requested;
             }
             std::string found;
             size_t matches = 0;

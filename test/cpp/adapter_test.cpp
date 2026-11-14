@@ -3780,6 +3780,15 @@ void TestAttachedDdlRefreshesAndCompensates() {
     CHECK(script->tables.count("RV_MISSING") == 1);
     database.Run("DROP TABLE o.RV_MISSING;");
     database.Run("DROP TABLE IF EXISTS o.RV_MISSING;");
+    script->tables["RV_CASED"] = {{Column("ID", 2, 10, 0)}, {}};
+    identities["RV_CASED"] = std::to_string(next_id++);
+    refresh();
+    database.Run("DETACH o;");
+    database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner);");
+    database.Run("CREATE TABLE IF NOT EXISTS o.RV_Cased(ID INTEGER);");
+    database.Run("CREATE TABLE IF NOT EXISTS o.RV_Cased(ID INTEGER);");
+    CHECK(script->tables.count("RV_CASED") == 1 && script->tables.count("RV_Cased") == 0);
+    database.Run("DROP TABLE o.RV_CASED;");
     incomplete_dictionary = false;
     refresh();
     database.Run("DETACH o;");
