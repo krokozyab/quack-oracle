@@ -428,9 +428,19 @@ Value ValueFor(const OracleColumn &column, const std::optional<std::vector<uint8
         return Value(
             FormatDateTime(oracle_scanner::OracleZonedWallClock(oracle_scanner::DecodeOracleTimestamp(*wire))));
     case 231: {
-        // The session time zone is UTC (see the auth parameters), so this wall
-        // time is the instant. DuckDB's TIMESTAMPTZ keeps microseconds.
-        const auto timestamp = TimestampValueFor(column, oracle_scanner::DecodeOracleTimestamp(*wire));
+        // Fetched as Oracle stores it, on the wall clock of the database time
+        // zone, which the session that described the column looked up. A
+        // region's offset depends on the date and is not known here.
+        if (column.database_zone_is_region) {
+            throw NotImplementedException(
+                "Oracle column \"%s\" is TIMESTAMP WITH LOCAL TIME ZONE in a database whose DBTIMEZONE is a region, "
+                "not an offset; select SYS_EXTRACT_UTC(\"%s\") or CAST(\"%s\" AS TIMESTAMP WITH TIME ZONE) instead",
+                column.name, column.name, column.name);
+        }
+        const auto utc = oracle_scanner::OracleDatabaseZoneToUtc(oracle_scanner::DecodeOracleTimestamp(*wire),
+                                                                 column.database_zone_minutes);
+        // DuckDB's TIMESTAMPTZ keeps microseconds.
+        const auto timestamp = TimestampValueFor(column, utc);
         return Value::TIMESTAMPTZ(timestamp_tz_t(timestamp.GetValue<timestamp_t>().value));
     }
     case 252:

@@ -66,6 +66,26 @@ public:
 
     const std::vector<OracleColumn> &Columns() const override { return columns; }
 
+    bool HasLocalZoneColumn() const {
+        for (const auto &column : columns) {
+            if (column.oracle_type == 231) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Gives each TIMESTAMP WITH LOCAL TIME ZONE column the database time zone
+    // its values are fetched in; see OracleColumn::database_zone_minutes.
+    void SetDatabaseZone(int16_t minutes, bool region) {
+        for (auto &column : columns) {
+            if (column.oracle_type == 231) {
+                column.database_zone_minutes = minutes;
+                column.database_zone_is_region = region;
+            }
+        }
+    }
+
     // A LOB column's row data is a locator, not a value. Reading the content is
     // a separate call per value, which is why this is the only place it can
     // happen: above the session nothing has a channel, and below it nothing
@@ -418,8 +438,36 @@ std::unique_ptr<OracleCursor> NativeOracleSession::Query(const std::string &sql,
     // Like every other operation: an ORA-01013 answering an accepted Cancel is
     // observed here, which is what makes the session usable again afterwards.
     return RunNativeOperation(*lifetime, [&]() -> std::unique_ptr<OracleCursor> {
-        return OpenQuery(sql, binds);
+        auto cursor = OpenQuery(sql, binds);
+        AnnotateDatabaseZone(*cursor);
+        return cursor;
     });
+}
+
+void NativeOracleSession::AnnotateDatabaseZone(OracleCursor &opened) {
+    auto &cursor = static_cast<NativeOracleCursor &>(opened);
+    if (!cursor.HasLocalZoneColumn()) {
+        return;
+    }
+    // Asked once per session, and only of a session that meets the type: it is a
+    // property of the database, and every other session would pay a round trip
+    // for nothing. The DTY exchange could carry it, but only with capability bits
+    // the captured request this client sends does not set.
+    if (!database_zone) {
+        auto zone = OpenQuery("SELECT DBTIMEZONE FROM DUAL", {});
+        const auto batch = zone->Fetch(1);
+        zone->Close();
+        if (batch.rows.size() != 1 || batch.rows[0].size() != 1 || !batch.rows[0][0]) {
+            throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle returned no DBTIMEZONE");
+        }
+        std::string text(batch.rows[0][0]->begin(), batch.rows[0][0]->end());
+        while (!text.empty() && text.back() == ' ') {
+            text.pop_back();
+        }
+        const auto offset = ParseOracleZoneOffset(text);
+        database_zone = std::make_pair(offset.value_or(static_cast<int16_t>(0)), !offset.has_value());
+    }
+    cursor.SetDatabaseZone(database_zone->first, database_zone->second);
 }
 
 std::unique_ptr<OracleCursor> NativeOracleSession::OpenQuery(const std::string &sql, const std::vector<OracleBind> &binds) {
@@ -685,7 +733,7 @@ std::vector<OracleBind> NativeOracleSession::ExecuteReturning(const std::string 
 
 OracleCallResult NativeOracleSession::Call(const OracleCallRequest &request) {
     RequireOpen();
-    return RunNativeOperation(*lifetime, [&]() {
+    auto called = RunNativeOperation(*lifetime, [&]() {
         const auto call = channel->LockCall();
         const auto sql = BuildOracleCallBlock(request);
         std::vector<OracleBind> binds;
@@ -760,6 +808,17 @@ OracleCallResult NativeOracleSession::Call(const OracleCallRequest &request) {
         }
         return result;
     });
+    // Outside the call's lock, which the zone lookup takes for its own query.
+    RunNativeOperation(*lifetime, [&]() {
+        for (auto &cursor : called.explicit_cursors) {
+            AnnotateDatabaseZone(*cursor);
+        }
+        for (auto &cursor : called.implicit_cursors) {
+            AnnotateDatabaseZone(*cursor);
+        }
+        return true;
+    });
+    return called;
 }
 
 void NativeOracleSession::Commit() {

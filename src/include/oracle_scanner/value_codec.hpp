@@ -31,6 +31,16 @@ OracleDateTime DecodeOracleTimestamp(const std::vector<uint8_t> &wire);
 // returned unchanged.
 OracleDateTime OracleZonedWallClock(const OracleDateTime &utc);
 
+// A TIMESTAMP WITH LOCAL TIME ZONE is fetched as Oracle stores it: the wall time
+// in the database time zone, whatever the session's is (captured from 23ai Free
+// with DBTIMEZONE +03:00: 12:00 UTC arrives as 15:00). This is that wall time as
+// UTC, given the zone's offset in minutes.
+OracleDateTime OracleDatabaseZoneToUtc(const OracleDateTime &wall, int16_t zone_minutes);
+
+// DBTIMEZONE as an offset in minutes: `+03:00` is 180, `-05:30` is -330. Empty
+// for a region name, whose offset depends on the date.
+std::optional<int16_t> ParseOracleZoneOffset(const std::string &text);
+
 std::vector<uint8_t> EncodeOracleBinaryFloat(float value);
 std::vector<uint8_t> EncodeOracleBinaryDouble(double value);
 float DecodeOracleBinaryFloat(const std::vector<uint8_t> &wire);

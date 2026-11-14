@@ -7,6 +7,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <utility>
 #include <vector>
 
 namespace oracle_scanner {
@@ -44,6 +46,7 @@ private:
     uint8_t NextSequence();
     void RequireOpen() const;
     std::unique_ptr<OracleCursor> OpenQuery(const std::string &sql, const std::vector<OracleBind> &binds);
+    void AnnotateDatabaseZone(OracleCursor &cursor);
     uint64_t ExecuteStatement(const std::string &sql, const std::vector<OracleBind> &binds, OracleSqlKind kind);
     //! Runs `operation` with the binds of one statement, sending any LOB value
     //! too large for an ordinary bind through a temporary LOB that is released
@@ -59,6 +62,8 @@ private:
     // Present when the session was opened to be reused across callers.
     std::shared_ptr<OracleIoDeadlineBinding> deadline_binding;
     uint8_t next_sequence = 1;
+    // DBTIMEZONE as (offset in minutes, is a region), once something needed it.
+    std::optional<std::pair<int16_t, bool>> database_zone;
 };
 
 } // namespace oracle_scanner

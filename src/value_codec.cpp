@@ -123,13 +123,10 @@ static void CivilFromDays(int64_t days, OracleDateTime &value) {
     value.year = static_cast<int32_t>(year_of_era + era * 400 + (month <= 2 ? 1 : 0));
 }
 
-OracleDateTime OracleZonedWallClock(const OracleDateTime &utc) {
-    if (!utc.has_offset) {
-        return utc;
-    }
-    auto result = utc;
-    int64_t minutes = static_cast<int64_t>(utc.hour) * 60 + utc.minute + utc.offset_minutes;
-    int64_t days = DaysFromCivil(utc.year, utc.month, utc.day);
+static OracleDateTime ShiftedByMinutes(const OracleDateTime &value, int64_t shift) {
+    auto result = value;
+    int64_t minutes = static_cast<int64_t>(value.hour) * 60 + value.minute + shift;
+    int64_t days = DaysFromCivil(value.year, value.month, value.day);
     while (minutes < 0) {
         minutes += 1440;
         days--;
@@ -142,6 +139,36 @@ OracleDateTime OracleZonedWallClock(const OracleDateTime &utc) {
     result.minute = static_cast<uint8_t>(minutes % 60);
     CivilFromDays(days, result);
     return result;
+}
+
+OracleDateTime OracleZonedWallClock(const OracleDateTime &utc) {
+    if (!utc.has_offset) {
+        return utc;
+    }
+    return ShiftedByMinutes(utc, utc.offset_minutes);
+}
+
+OracleDateTime OracleDatabaseZoneToUtc(const OracleDateTime &wall, int16_t zone_minutes) {
+    return ShiftedByMinutes(wall, -static_cast<int64_t>(zone_minutes));
+}
+
+std::optional<int16_t> ParseOracleZoneOffset(const std::string &text) {
+    // DBTIMEZONE reads `+03:00`, `-05:30` or a region name such as `Europe/Moscow`.
+    if (text.size() != 6 || (text[0] != '+' && text[0] != '-') || text[3] != ':') {
+        return std::nullopt;
+    }
+    for (const auto index : {1, 2, 4, 5}) {
+        if (text[index] < '0' || text[index] > '9') {
+            return std::nullopt;
+        }
+    }
+    const int hours = (text[1] - '0') * 10 + (text[2] - '0');
+    const int minutes = (text[4] - '0') * 10 + (text[5] - '0');
+    if (hours > 14 || minutes > 59) {
+        return std::nullopt;
+    }
+    const auto total = hours * 60 + minutes;
+    return static_cast<int16_t>(text[0] == '-' ? -total : total);
 }
 
 template <class FLOAT, class INTEGER>

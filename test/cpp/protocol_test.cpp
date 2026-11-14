@@ -2104,6 +2104,27 @@ static void TestValueCodecs() {
     // Without an offset there is nothing to add, and nothing is.
     CHECK(wall({2026, 4, 30, 21, 45, 9, 0, 0, false}) == "2026-4-30 21:45:9");
 
+    // A local-zone value arrives on the database zone's wall clock; taking the
+    // zone's offset away gives UTC, across a day and a year, either way.
+    const auto utc_of = [](OracleDateTime wall_clock, int16_t zone) {
+        const auto utc = OracleDatabaseZoneToUtc(wall_clock, zone);
+        return std::to_string(utc.year) + "-" + std::to_string(utc.month) + "-" + std::to_string(utc.day) + " " +
+               std::to_string(utc.hour) + ":" + std::to_string(utc.minute) + ":" + std::to_string(utc.second) + "." +
+               std::to_string(utc.nanosecond);
+    };
+    CHECK(utc_of({2026, 1, 15, 15, 0, 0, 500, 0, false}, 180) == "2026-1-15 12:0:0.500");
+    CHECK(utc_of({2027, 1, 1, 2, 0, 0, 0, 0, false}, 180) == "2026-12-31 23:0:0.0");
+    CHECK(utc_of({2026, 12, 31, 20, 30, 0, 0, 0, false}, -330) == "2027-1-1 2:0:0.0");
+    CHECK(utc_of({2026, 6, 1, 8, 0, 0, 0, 0, false}, 0) == "2026-6-1 8:0:0.0");
+    CHECK(ParseOracleZoneOffset("+03:00") == std::optional<int16_t>(180));
+    CHECK(ParseOracleZoneOffset("-05:30") == std::optional<int16_t>(-330));
+    CHECK(ParseOracleZoneOffset("+00:00") == std::optional<int16_t>(0));
+    CHECK(!ParseOracleZoneOffset("Europe/Moscow"));
+    CHECK(!ParseOracleZoneOffset("UTC"));
+    CHECK(!ParseOracleZoneOffset("+3:00"));
+    CHECK(!ParseOracleZoneOffset("+15:00"));
+    CHECK(!ParseOracleZoneOffset("+03:60"));
+
     for (auto input : {0.0, -0.0, 1.25, -18.5, std::numeric_limits<double>::infinity()}) {
         auto decoded = DecodeOracleBinaryDouble(EncodeOracleBinaryDouble(input));
         CHECK(decoded == input);

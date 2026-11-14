@@ -65,6 +65,13 @@ struct OracleColumn {
     // collation, under which BINARY_CI makes 'a' equal 'A', so equality on it
     // is not DuckDB's. Never set on a describe.
     bool compared_as_bytes = false;
+    // For TIMESTAMP WITH LOCAL TIME ZONE (231): a fetched value is the wall time
+    // in the database time zone (DBTIMEZONE), the form Oracle stores it in, not
+    // the session's. This is that zone's offset from UTC in minutes, set by the
+    // session that described the column. database_zone_is_region says DBTIMEZONE
+    // names a region instead, whose offset depends on the date.
+    int16_t database_zone_minutes = 0;
+    bool database_zone_is_region = false;
     // What a NUMBER with no declared precision becomes in DuckDB, chosen by the
     // oracle_unconstrained_number setting when the columns are described: text
     // (the default, which loses nothing), DOUBLE, or a fixed DECIMAL.

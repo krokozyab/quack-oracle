@@ -1246,7 +1246,7 @@ handshake and an authentication round trip: against a cloud endpoint that was
 | `NCHAR`, `NVARCHAR2` | `VARCHAR` | converted from UTF-16, and written back as UTF-16 |
 | `INTERVAL YEAR TO MONTH` | `INTERVAL` | whole months |
 | `INTERVAL DAY TO SECOND` | `INTERVAL` | days and microseconds; a finer fraction is refused |
-| `TIMESTAMP WITH LOCAL TIME ZONE` | `TIMESTAMPTZ` | an instant; sessions opened here use UTC |
+| `TIMESTAMP WITH LOCAL TIME ZONE` | `TIMESTAMPTZ` | an instant. Oracle sends it on the wall clock of the database time zone, so a session that meets one asks for `DBTIMEZONE` once; a `DBTIMEZONE` that names a region rather than an offset is refused, with `SYS_EXTRACT_UTC(col)` as the way round |
 | `BOOLEAN` (23ai) | `BOOLEAN` | |
 | `JSON` (23ai) | `JSON` | the stored OSON image, decoded to JSON text |
 | `VECTOR` (23ai) | `FLOAT[n]`, `DOUBLE[n]`, `TINYINT[n]`, `UTINYINT[n]`; `STRUCT` for `SPARSE` | by the column's declared format and dimensions |

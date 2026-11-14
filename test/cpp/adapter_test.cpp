@@ -1220,6 +1220,23 @@ void TestBooleanAndLocalZoneReadThroughSql() {
     TestDatabase fine_database;
     auto refused = fine_database.Query("SELECT * FROM oracle_query('ora', 'SELECT l FROM app.items')");
     CHECK(refused->HasError() && refused->GetError().find("sub-microsecond") != std::string::npos);
+
+    // The value arrives on the database zone's wall clock, which the session that
+    // described it looked up: 15:00 in a +03:00 database is 12:00 UTC.
+    auto zoned = std::make_shared<FakeScript>();
+    zoned->columns = {Column("L", 231)};
+    zoned->columns[0].scale = 6;
+    zoned->columns[0].database_zone_minutes = 180;
+    zoned->rows = {{oracle_scanner::EncodeOracleTimestamp({2026, 1, 15, 15, 0, 0, 0, 0, false}, false)}};
+    auto zoned_factory = InstallFake(zoned);
+    TestDatabase zoned_database;
+    auto shifted = zoned_database.Query("SELECT l FROM oracle_query('ora', 'SELECT l FROM app.items')");
+    CHECK(!shifted->HasError() &&
+          shifted->GetValue(0, 0) == duckdb::Value::TIMESTAMPTZ(duckdb::timestamp_tz_t(1768478400000000LL)));
+    // A region's offset depends on the date, so such a value is refused, with a way round it.
+    zoned->columns[0].database_zone_is_region = true;
+    auto region = zoned_database.Query("SELECT l FROM oracle_query('ora', 'SELECT l FROM app.items')");
+    CHECK(region->HasError() && region->GetError().find("SYS_EXTRACT_UTC") != std::string::npos);
     std::cout << "BOOLEAN and local-zone columns read as DuckDB types" << std::endl;
 }
 
