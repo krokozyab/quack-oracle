@@ -57,9 +57,8 @@ using oracle_scanner::OpenOracleSession;
 
 namespace {
 
-// Where a refusal of DDL through ATTACH sends the user. The catalog never turns
-// a DuckDB statement into Oracle DDL: Oracle commits DDL at once, so it could not
-// belong to the DuckDB transaction the statement runs in.
+// Administrative route for DDL outside the supported attached-table subset.
+// Changes made through that API require a reattach to refresh metadata.
 constexpr const char *ORACLE_DDL_ROUTE =
     "Run the DDL with oracle_execute_admin('<secret>', '<statement>'), then DETACH and ATTACH again to see it";
 
@@ -120,10 +119,13 @@ private:
     std::shared_ptr<OracleSession> session;
 };
 
-// ATTACH keeps no shared TTC channel. Metadata discovery and every scan open
-// their own native session, matching oracle_query's proven ownership model.
-// This makes the initial catalog explicitly read-only and avoids pretending
-// that a DuckDB transaction spans an Oracle session.
+// Owners have independent metadata caches, but one attachment shares its DDL
+// epoch, DDL lock and transaction-session pool across every schema alias.
+struct OracleAttachedEpoch {
+    std::mutex ddl_lock;
+    std::atomic<idx_t> version {0};
+};
+
 struct OracleAttachedState {
     ConnectionConfig config;
     std::string password;
@@ -131,18 +133,17 @@ struct OracleAttachedState {
     // OracleTransactionSessionPool. Null when oracle_transaction_pool_size is 0.
     std::shared_ptr<oracle_scanner::OracleTransactionSessionPool> transaction_pool;
 
-    ~OracleAttachedState() {
-        if (transaction_pool) {
-            transaction_pool->Close();
-        }
-    }
     // The name the ATTACH resolved, so scans of this catalog share one pool.
     std::string secret_name;
     std::string current_schema;
-    // ATTACH ... (SCHEMA 'X'): the schema whose objects this catalog lists, when
-    // it is not the connected user's. Empty reads the user's own through the
-    // USER_ views; set, it reads the ALL_ views for this owner.
+    // Empty preserves the default owner's unqualified SQL. Named aliases keep
+    // their explicit owner, using USER_ metadata only for the connected user.
     std::string owner;
+    bool named_schema = false;
+    shared_ptr<OracleAttachedEpoch> epoch = make_shared_ptr<OracleAttachedEpoch>();
+    mutable idx_t metadata_version = 0;
+    bool OwnDictionary() const { return owner.empty() || owner == current_schema; }
+    std::string EffectiveOwner() const { return owner.empty() ? current_schema : owner; }
 
     static std::string Literal(const std::string &text) {
         std::string result = "'";
@@ -156,12 +157,12 @@ struct OracleAttachedState {
     }
     // `user_tables` or `all_tables`, whichever this catalog reads.
     std::string View(const char *name) const {
-        return std::string(owner.empty() ? "user_" : "all_") + name;
+        return std::string(OwnDictionary() ? "user_" : "all_") + name;
     }
     // A condition on the owner column, with the word that joins it to what
     // comes before. Empty for the connected user's own schema.
     std::string OwnerCondition(const char *column, const char *joiner) const {
-        return owner.empty() ? std::string() : std::string(" ") + joiner + " " + column + " = " + Literal(owner);
+        return OwnDictionary() ? std::string() : std::string(" ") + joiner + " " + column + " = " + Literal(owner);
     }
     mutable std::mutex metadata_lock;
     mutable bool objects_loaded = false;
@@ -195,14 +196,18 @@ struct OracleAttachedState {
     // ATTACH. False when it could not be read: equality on text then stays in DuckDB.
     bool nls_comp_binary = false;
 
-    std::mutex ddl_lock;
-    std::atomic<idx_t> ddl_version {0};
-    void InvalidateMetadata() {
-        std::lock_guard<std::mutex> guard(metadata_lock);
+    void RefreshMetadataLocked() const {
+        const auto version = epoch->version.load();
+        if (metadata_version == version) { return; }
         objects_loaded = metadata_loaded = metadata_complete = primary_keys_loaded = tables_loaded = row_estimates_loaded = false;
         object_names.clear(); column_cache.clear(); primary_key_cache.clear(); table_names.clear();
         row_estimates.clear(); distinct_estimates.clear(); value_bounds.clear();
-        ++ddl_version;
+        metadata_version = version;
+    }
+    void InvalidateMetadata() {
+        ++epoch->version;
+        std::lock_guard<std::mutex> guard(metadata_lock);
+        RefreshMetadataLocked();
     }
 
     void ConnectAndDiscoverSchema() {
@@ -230,15 +235,15 @@ struct OracleAttachedState {
     // a schema, else the one schema that matches ignoring case (names are
     // upper case unless they were created quoted). The connected user's own
     // schema needs no qualification and is read through the USER_ views.
-    void ResolveOwner() {
+    bool ResolveOwner(bool missing_ok = false) {
         const auto lookup = [&](const std::string &condition) {
             std::vector<std::string> found;
             OracleMetadataLease session(transaction_pool, config, password);
-            auto cursor = TranslatingOracleErrors("Oracle ATTACH could not look up the SCHEMA option", [&] {
+            auto cursor = TranslatingOracleErrors("Oracle ATTACH could not look up a schema", [&] {
                 return session->Query("SELECT username FROM all_users WHERE " + condition, {});
             });
             for (;;) {
-                const auto batch = TranslatingOracleErrors("Oracle ATTACH could not look up the SCHEMA option",
+                const auto batch = TranslatingOracleErrors("Oracle ATTACH could not look up a schema",
                                                            [&] { return cursor->Fetch(8); });
                 for (const auto &row : batch.rows) {
                     if (!row.empty() && row[0]) {
@@ -257,15 +262,15 @@ struct OracleAttachedState {
         if (found.empty()) {
             found = lookup("UPPER(username) = UPPER(" + Literal(owner) + ")");
         }
+        if (found.empty() && missing_ok) { return false; }
         if (found.size() != 1) {
             throw BinderException(found.empty() ? "Oracle ATTACH: there is no schema \"%s\" that this user can see"
                                                 : "Oracle ATTACH: schema \"%s\" matches several users by case; write it exactly",
                                   owner);
         }
         owner = found[0];
-        if (owner == current_schema) {
-            owner.clear();
-        }
+        if (owner == current_schema && !named_schema) { owner.clear(); }
+        return true;
     }
 
     // The cap existed because each object then cost a dictionary round trip on
@@ -274,6 +279,7 @@ struct OracleAttachedState {
     std::vector<std::string> ListObjects() const {
         constexpr size_t maximum_objects = 1U << 16U;
         std::lock_guard<std::mutex> lock(metadata_lock);
+        RefreshMetadataLocked();
         if (objects_loaded) {
             return object_names;
         }
@@ -717,7 +723,7 @@ struct OracleAttachedState {
                 return session->Query("SELECT c.table_name, k.column_name FROM " + View("constraints") + " c JOIN " +
                                       View("cons_columns") + " k ON k.constraint_name = c.constraint_name AND "
                                       "k.table_name = c.table_name" +
-                                      (owner.empty() ? std::string() : " AND k.owner = c.owner") +
+                                      (OwnDictionary() ? std::string() : " AND k.owner = c.owner") +
                                       " WHERE c.constraint_type = 'P'" + OwnerCondition("c.owner", "AND") + " AND "
                                       "c.status = 'ENABLED' AND c.validated = 'VALIDATED' AND c.deferrable = 'NOT DEFERRABLE' ORDER BY c.table_name, "
                                       "k.position",
@@ -748,13 +754,14 @@ struct OracleAttachedState {
 
     bool IsTable(const std::string &object_name) const {
         std::lock_guard<std::mutex> lock(metadata_lock);
+        RefreshMetadataLocked();
         if (!tables_loaded) {
             tables_loaded = true;
             try {
                 OracleMetadataLease session(transaction_pool, config, password);
                 auto cursor = TranslatingOracleErrors("Oracle ATTACH could not list tables", [&] {
                     return session->Query("SELECT table_name FROM " + View("tables") +
-                                              (owner.empty() ? std::string() : " WHERE owner = " + Literal(owner)),
+                                              (OwnDictionary() ? std::string() : " WHERE owner = " + Literal(owner)),
                                           {});
                 });
                 for (;;) {
@@ -787,6 +794,7 @@ struct OracleAttachedState {
     // read leaves the tables without estimates, as before.
     std::optional<uint64_t> RowEstimate(const std::string &object_name) const {
         std::lock_guard<std::mutex> lock(metadata_lock);
+        RefreshMetadataLocked();
         if (!row_estimates_loaded) {
             row_estimates_loaded = true;
             try {
@@ -872,6 +880,7 @@ struct OracleAttachedState {
                                                         const std::vector<OracleColumn> &columns) const {
         (void)RowEstimate(object_name); // loads the statistics
         std::lock_guard<std::mutex> lock(metadata_lock);
+        RefreshMetadataLocked();
         std::vector<std::optional<uint64_t>> result(columns.size());
         const auto table = distinct_estimates.find(object_name);
         if (table == distinct_estimates.end()) {
@@ -892,6 +901,7 @@ struct OracleAttachedState {
                                                                       const std::vector<OracleColumn> &columns) const {
         (void)RowEstimate(object_name); // loads the statistics
         std::lock_guard<std::mutex> lock(metadata_lock);
+        RefreshMetadataLocked();
         std::vector<std::optional<std::pair<double, double>>> result(columns.size());
         const auto table = value_bounds.find(object_name);
         if (table == value_bounds.end()) {
@@ -930,6 +940,7 @@ struct OracleAttachedState {
 
     std::vector<std::string> PrimaryKeyColumns(const std::string &object_name) const {
         std::lock_guard<std::mutex> lock(metadata_lock);
+        RefreshMetadataLocked();
         if (!primary_keys_loaded) {
             LoadPrimaryKeysLocked();
         }
@@ -942,12 +953,13 @@ struct OracleAttachedState {
 
     std::vector<std::vector<std::string>> UniqueKeys(const std::string &object_name) const {
         std::lock_guard<std::mutex> lock(metadata_lock);
+        RefreshMetadataLocked();
         std::vector<std::vector<std::string>> result;
         try {
             OracleMetadataLease session(transaction_pool, config, password);
             auto cursor = session->Query("SELECT c.constraint_name, k.column_name, c.constraint_type FROM " + View("constraints") +
                 " c JOIN " + View("cons_columns") + " k ON k.constraint_name=c.constraint_name AND k.table_name=c.table_name" +
-                (owner.empty() ? std::string() : " AND k.owner=c.owner") +
+                (OwnDictionary() ? std::string() : " AND k.owner=c.owner") +
                 " WHERE c.constraint_type='U' AND c.status='ENABLED' AND c.validated='VALIDATED'" +
                 " AND c.deferrable='NOT DEFERRABLE' AND c.table_name=" + KeywordHelper::WriteQuotedAndEscaped(object_name, '\'') +
                 OwnerCondition("c.owner", "AND") + " ORDER BY c.constraint_name,k.position", {});
@@ -983,6 +995,7 @@ struct OracleAttachedState {
     // not yet provide the exact Oracle type mapping this catalog path needs.
     std::vector<OracleColumn> TryDescribe(const std::string &object_name) const {
         std::lock_guard<std::mutex> lock(metadata_lock);
+        RefreshMetadataLocked();
         if (!metadata_loaded) {
             LoadSchemaColumnsLocked();
         }
@@ -1009,6 +1022,7 @@ struct OracleAttachedState {
     std::string ResolveObjectName(const std::string &requested) const {
         {
             std::lock_guard<std::mutex> lock(metadata_lock);
+            RefreshMetadataLocked();
             if (!metadata_loaded) {
                 LoadSchemaColumnsLocked();
             }
@@ -1440,7 +1454,7 @@ std::shared_ptr<oracle_scanner::OracleIoDeadline> DdlDeadline(optional_ptr<Clien
 }
 
 void RunAttachedDdl(optional_ptr<ClientContext> context, const shared_ptr<OracleAttachedState> &state, const std::string &sql, bool cleanup = false, const std::string &lock_table = std::string()) {
-    std::lock_guard<std::mutex> guard(state->ddl_lock);
+    std::lock_guard<std::mutex> guard(state->epoch->ddl_lock);
     auto config = state->config;
     config.io_deadline = DdlDeadline(context, cleanup);
     if (cleanup) { config.connect_cancelled = nullptr; }
@@ -1532,9 +1546,11 @@ public:
         defaults = generator.get();
         GetCatalogSet(CatalogType::TABLE_ENTRY).SetDefaultGenerator(std::move(generator));
     }
+    shared_ptr<OracleAttachedState> State() const { return state; }
+    static bool IsRelation(CatalogType type) { return type==CatalogType::TABLE_ENTRY || type==CatalogType::VIEW_ENTRY; }
     void Sync(ClientContext &context) {
         std::lock_guard<std::mutex> guard(cache_lock);
-        const auto version = state->ddl_version.load();
+        const auto version = state->epoch->version.load();
         if (version == cached_version) { return; }
         auto &set = GetCatalogSet(CatalogType::TABLE_ENTRY);
         vector<Identifier> names;
@@ -1561,18 +1577,19 @@ public:
         cached_version = version;
     }
     optional_ptr<CatalogEntry> LookupEntry(CatalogTransaction transaction, const EntryLookupInfo &lookup) override {
-        if (transaction.context) { Sync(*transaction.context); }
+        if (transaction.context && IsRelation(lookup.GetCatalogType())) { Sync(*transaction.context); }
         return DuckSchemaEntry::LookupEntry(transaction, lookup);
     }
     CatalogSet::EntryLookup LookupEntryDetailed(CatalogTransaction transaction, const EntryLookupInfo &lookup) override {
-        if (transaction.context) { Sync(*transaction.context); }
+        if (transaction.context && IsRelation(lookup.GetCatalogType())) { Sync(*transaction.context); }
         return DuckSchemaEntry::LookupEntryDetailed(transaction, lookup);
     }
     void Scan(ClientContext &context, CatalogType type, const std::function<void(CatalogEntry &)> &callback) override {
-        Sync(context); DuckSchemaEntry::Scan(context, type, callback);
+        if (IsRelation(type)) { Sync(context); }
+        DuckSchemaEntry::Scan(context, type, callback);
     }
     void Scan(CatalogTransaction transaction, CatalogType type, const std::function<void(CatalogEntry &)> &callback) override {
-        if (transaction.context) { Sync(*transaction.context); }
+        if (transaction.context && IsRelation(type)) { Sync(*transaction.context); }
         DuckSchemaEntry::Scan(transaction, type, callback);
     }
     optional_ptr<CatalogEntry> CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) override {
@@ -1622,7 +1639,7 @@ public:
         auto undo = context.registered_state->Get<OracleDdlUndo>("oracle_scanner.ddl_undo");
         if (undo) {
             auto &created = undo->created[catalog.GetName().GetIdentifierName()];
-            created.erase(std::remove_if(created.begin(), created.end(), [&](const OracleDdlUndo::Created &item) { return item.name == name; }), created.end());
+            created.erase(std::remove_if(created.begin(), created.end(), [&](const OracleDdlUndo::Created &item) { return item.name == name && item.state->EffectiveOwner() == state->EffectiveOwner(); }), created.end());
         }
         Sync(context);
     }
@@ -1681,7 +1698,7 @@ public:
         if (!renamed.empty()) {
             auto undo = context.registered_state->Get<OracleDdlUndo>("oracle_scanner.ddl_undo");
             if (undo) {
-                for (auto &item : undo->created[catalog.GetName().GetIdentifierName()]) { if (item.name == name) { item.name = renamed; } }
+                for (auto &item : undo->created[catalog.GetName().GetIdentifierName()]) { if (item.name == name && item.state->EffectiveOwner() == state->EffectiveOwner()) { item.name = renamed; } }
             }
         }
         Sync(context);
@@ -1741,7 +1758,8 @@ public:
                                         LogicalCreateTable &op, PhysicalOperator &source) override {
         auto &schema = op.schema;
         planner.dependencies.AddDependency(schema);
-        (void)CreateDdl(op.info->Base(), state->owner);
+        const auto table_state = schema.Cast<OracleSchemaEntry>().State();
+        (void)CreateDdl(op.info->Base(), table_state->owner);
         std::vector<OracleColumn> columns;
         for (const auto &column : op.info->Base().columns.Physical()) {
             auto declared = DdlType(column.Type()).second;
@@ -1750,7 +1768,7 @@ public:
         }
         auto base = shared_ptr<CreateInfo>(op.info->base->Copy().release());
         auto target = WriteTarget();
-        target.schema_name = state->owner;
+        target.schema_name = table_state->owner;
         target.object_name = op.info->Base().GetTableName().GetIdentifierName();
         auto create = [&schema, base](ClientContext &caller) {
             BoundCreateTableInfo bound(schema, base->Copy());
@@ -1760,37 +1778,128 @@ public:
     }
 
     ErrorData SupportsCreateTable(BoundCreateTableInfo &info) override {
-        try { (void)CreateDdl(info.Base(), state->owner); }
+        try { (void)CreateDdl(info.Base(), info.schema.Cast<OracleSchemaEntry>().State()->owner); }
         catch (const std::exception &error) { return ErrorData(error); }
         return ErrorData();
     }
-    optional_idx GetCatalogVersion(ClientContext &) override { return state->ddl_version.load(); }
+    optional_idx GetCatalogVersion(ClientContext &) override { return state->epoch->version.load(); }
 
 
     optional_ptr<CatalogEntry> CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) override {
-        if (info.SchemaName() == Identifier(DEFAULT_SCHEMA)) {
-            // DuckCatalog::Initialize creates `main` itself, and it may run
-            // more than once; that schema is the attached Oracle schema, and it
-            // is the only one there is.
+        if (info.internal && info.SchemaName() == Identifier(DEFAULT_SCHEMA)) {
+            // DuckCatalog initializes the legacy default-owner alias itself.
+            // Other Oracle owners are registered by lookup/discovery below.
             auto entry = make_uniq<OracleSchemaEntry>(*this, info, state);
             auto result = entry.get();
             if (!GetSchemaCatalogSet().CreateEntry(transaction, info.SchemaName(), std::move(entry), LogicalDependencyList())) { return nullptr; }
             return result;
         }
-        throw NotImplementedException("Oracle ATTACH exposes one schema and cannot create another");
+        throw NotImplementedException("Oracle ATTACH cannot create Oracle users/schemas; use an existing Oracle schema");
+    }
+
+    void AlterSchema(CatalogTransaction, SchemaCatalogEntry &, AlterSchemaInfo &) override {
+        throw NotImplementedException("Oracle ATTACH cannot alter Oracle users/schemas");
     }
 
     void DropSchema(ClientContext &, DropInfo &) override {
         throw NotImplementedException("Oracle ATTACH cannot drop a schema. %s", ORACLE_DDL_ROUTE);
     }
 
+    bool SupportsNestedSchemas() const override { return false; }
+
+    optional_ptr<SchemaCatalogEntry> LookupSchema(CatalogTransaction transaction, const EntryLookupInfo &lookup,
+                                                  OnEntryNotFound if_not_found) override {
+        return LookupSchemaPath(transaction, lookup, if_not_found, [&](const EntryLookupInfo &root) -> optional_ptr<CatalogEntry> {
+            if (root.GetEntryIdentifier() == Identifier(DEFAULT_SCHEMA)) {
+                return GetSchemaCatalogSet().GetEntry(transaction, root.GetEntryIdentifier());
+            }
+            return NamedSchema(root.GetEntryName()).get();
+        });
+    }
+
+    void ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) override {
+        DiscoverSchemas();
+        DuckCatalog::ScanSchemas(context, std::move(callback));
+    }
+
+    optional_ptr<SchemaCatalogEntry> NamedSchema(const std::string &requested, bool known_owner = false) {
+        std::lock_guard<std::mutex> guard(schema_lock);
+        const auto cached = schema_aliases.find(requested);
+        if (cached != schema_aliases.end()) { return cached->second; }
+        if (schema_aliases.size() >= 4096) { throw BinderException("Oracle ATTACH exceeds the 4096 named-schema limit"); }
+        auto scoped = make_shared_ptr<OracleAttachedState>();
+        scoped->config = state->config; scoped->password = state->password;
+        scoped->secret_name = state->secret_name; scoped->transaction_pool = state->transaction_pool;
+        scoped->current_schema = state->current_schema; scoped->nls_comp_binary = state->nls_comp_binary;
+        scoped->epoch = state->epoch; scoped->named_schema = true; scoped->owner = requested;
+        if (!known_owner && requested != state->current_schema && requested != state->owner && !scoped->ResolveOwner(true)) { return nullptr; }
+        const auto system = CatalogTransaction::GetSystemTransaction(GetDatabase());
+        auto existing = GetSchemaCatalogSet().GetEntry(system, Identifier(scoped->owner));
+        if (existing) {
+            auto &schema = existing->Cast<OracleSchemaEntry>();
+            if (schema.State()->EffectiveOwner() != scoped->owner) {
+                throw BinderException("Oracle schemas with case-colliding names cannot coexist in one ATTACH; use separate attachments with SCHEMA");
+            }
+            schema_aliases.emplace(requested,&schema); return &schema;
+        }
+        CreateSchemaInfo info;
+        info.SetQualifiedName(QualifiedName({Identifier(scoped->owner)},Identifier()));
+        auto entry = make_uniq<OracleSchemaEntry>(*this,info,scoped);
+        auto result = entry.get();
+        if (!GetSchemaCatalogSet().CreateEntry(system,info.SchemaName(),std::move(entry),LogicalDependencyList())) {
+            throw CatalogException("Oracle schema could not be registered");
+        }
+        schema_aliases.emplace(requested,result);
+        return result;
+    }
+
+    void DiscoverSchemas() {
+        std::vector<std::string> owners;
+        {
+            std::lock_guard<std::mutex> guard(discovery_lock);
+            if (schemas_discovered) { return; }
+            OracleMetadataLease session(state->transaction_pool,state->config,state->password);
+            auto cursor = TranslatingOracleErrors("Oracle ATTACH could not list accessible schemas",[&] {
+                return session->Query("SELECT DISTINCT o.owner FROM all_objects o JOIN all_users u ON u.username=o.owner "
+                    "WHERE u.oracle_maintained='N' AND o.object_type IN ('TABLE','VIEW') ORDER BY o.owner",{});
+            });
+            // Validate the dictionary shape before interpreting names.
+            if (cursor->Columns().size()==1 && StringUtil::CIEquals(cursor->Columns()[0].name,"OWNER")) {
+                for (;;) {
+                    const auto batch = cursor->Fetch(128);
+                    for (const auto &row : batch.rows) {
+                        if (row.size()!=1 || !row[0]) { throw IOException("Oracle schema listing returned an invalid owner"); }
+                        if (owners.size()>=4096) { throw BinderException("Oracle ATTACH exceeds the 4096 named-schema limit"); }
+                        owners.emplace_back(row[0]->begin(),row[0]->end());
+                    }
+                    if (batch.exhausted) { break; }
+                }
+            }
+            cursor->Close(); session.Finish();
+            // Materialization is outside CatalogSet scanning and its locks.
+            std::unordered_map<std::string,size_t> counts;
+            for (const auto &owner : owners) { ++counts[StringUtil::Lower(owner)]; }
+            for (const auto &owner : owners) {
+                if (owner == state->EffectiveOwner() || StringUtil::CIEquals(owner,DEFAULT_SCHEMA) ||
+                    counts[StringUtil::Lower(owner)] != 1) { continue; }
+                NamedSchema(owner,true);
+            }
+            schemas_discovered = true;
+        }
+    }
+
     void Initialize(bool) override {
         state->ConnectAndDiscoverSchema();
         DuckCatalog::Initialize(false);
+        DiscoverSchemas();
     }
 
 private:
     shared_ptr<OracleAttachedState> state;
+    std::mutex schema_lock;
+    std::mutex discovery_lock;
+    bool schemas_discovered = false;
+    std::unordered_map<std::string,OracleSchemaEntry *> schema_aliases;
 };
 
 constexpr int64_t ORACLE_TRANSACTION_POOL_DEFAULT_SIZE = 2;

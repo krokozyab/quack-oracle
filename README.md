@@ -482,13 +482,49 @@ can stay in one SQL dialect:
 
 You can also `INSERT`, `UPDATE` and `DELETE` here — see the next section.
 
-**Another user's schema.** Most people connect as a reader, not as the owner of the
-data. `ATTACH 'ora' AS hr (TYPE oracle_scanner, SCHEMA 'HR')` mounts that schema's
-tables and views instead — what `ALL_TABLES` and `ALL_VIEWS` show for that owner —
-and every statement names the table as `"HR"."EMPLOYEES"`. The name is resolved
-against `ALL_USERS`: as written, else the one user it matches ignoring case. Writes
-need the grants Oracle itself would ask for. One attachment is one schema; attach
-again, under another alias, for a second.
+### Several Oracle schemas in one ATTACH
+
+An attachment exposes accessible Oracle owners as DuckDB schemas. The same
+connection and credentials serve every owner; Oracle grants control access.
+
+```sql
+ATTACH 'ora' AS o (TYPE oracle_scanner);
+SELECT * FROM o.hr.employees;
+SELECT * FROM o.sales.orders;
+SELECT e.id, r.amount
+FROM o.hr.employees e JOIN o.sales.orders r ON e.id = r.employee_id;
+USE o.hr;
+SELECT * FROM employees;
+```
+
+`o.main` remains the default owner's alias: the connected user, or the owner
+selected with `ATTACH 'ora' AS o (TYPE oracle_scanner, SCHEMA 'HR')`.
+The SCHEMA option selects that default; it does not restrict access to other
+owners. Existing `o.table` queries keep their default-schema meaning; `USE`
+changes DuckDB's search path normally. Addressing the default owner by its Oracle
+name also materializes that alias, so catalog inspection can show its tables
+under both names. `main` is reserved for the default alias; to use an Oracle
+owner named MAIN as the default, select it with SCHEMA.
+
+At ATTACH, discovery lists non-Oracle-maintained owners with visible tables or
+views. Explicit owner names are resolved lazily against ALL_USERS, including
+empty schemas: exact spelling first, then a unique match ignoring case. Table
+metadata, keys and statistics have separate caches per owner. Eligible joins
+across owners can execute as one Oracle statement. Discovery and named-schema
+lookup are bounded to 4,096 names. DuckDB names are case-insensitive, so two
+Oracle owners that differ only by case cannot coexist as named schemas in one
+attachment; an explicit conflicting lookup is refused. Discovery skips those
+pairs. Use separate attachments with exact SCHEMA options for them.
+
+DML across schemas shares one Oracle transaction and reads its own writes;
+COMMIT/ROLLBACK ends it for every owner. READ_ONLY covers all schemas.
+Supported table DDL targets the named owner, refreshes cached aliases and
+prepared plans throughout this attachment, and keeps the immediate-commit and
+CREATE-compensation rules below. It requires the same Oracle privileges as
+running that DDL directly; the extension grants none. CREATE/DROP/ALTER SCHEMA
+cannot create, remove or change Oracle users. For external DDL, grants or owner
+changes, DETACH/ATTACH to refresh discovery and metadata. Separate attachments
+have independent caches.
 
 ### Creating and changing Oracle tables through ATTACH
 

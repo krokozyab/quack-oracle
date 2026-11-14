@@ -220,12 +220,14 @@ static bool ProjectScriptedTable(const FakeScript &script, const std::string &sq
         return false;
     }
     auto object = sql.substr(from_at + 7);
+    std::string owner;
     auto object_end = object.find('"');
     if (object_end == std::string::npos) {
         return false;
     }
     if (object.compare(object_end, 3, "\".\"") == 0) {
-        // "OWNER"."TABLE": the table is the second name.
+        // Prefer an owner-qualified fixture when owners reuse a table name.
+        owner = object.substr(0,object_end);
         object = object.substr(object_end + 3);
         object_end = object.find('"');
         if (object_end == std::string::npos) {
@@ -233,7 +235,8 @@ static bool ProjectScriptedTable(const FakeScript &script, const std::string &sq
         }
     }
     object.erase(object_end);
-    const auto table = script.tables.find(object);
+    auto table = owner.empty() ? script.tables.end() : script.tables.find(owner+"."+object);
+    if (table == script.tables.end()) { table = script.tables.find(object); }
     if (table == script.tables.end()) {
         return false;
     }
@@ -2676,6 +2679,191 @@ void TestHeavyColumnsAreReadAfterTheFilter() {
 // ATTACH ... (SCHEMA 'x') lists another user's tables through the ALL_ views,
 // qualifies every statement with the owner, and settles the name against
 // ALL_USERS. The connected user's own schema, named or not, stays on USER_.
+void TestMultipleOracleSchemasShareTransactionsAndIsolateMetadata() {
+    auto script = std::make_shared<FakeScript>();
+    script->affected_rows=1;
+    script->sessions_reusable=true;
+    std::map<std::string,std::map<std::string,FakeTable>> models;
+    std::map<std::string,std::string> identities;
+    int next_id=1;
+    for (const auto *owner : {"APP","HR","SALES","Mixed"}) {
+        models[owner]["RV_T"]={{Column("ID",2,10,0),Column("V",1)},{{Number("1"),Text(owner)}}};
+        identities[std::string(owner)+".RV_T"]=std::to_string(next_id++);
+    }
+    const auto refresh = [&] {
+        script->routes.clear();script->tables.clear();
+        script->routes.push_back({"SELECT 1 FROM DUAL",{{Column("PROBE",2,10,0)},{{Number("1")}}}});
+        script->routes.push_back({"SELECT USER FROM DUAL",{{Column("USER",1)},{{Text("APP")}}}});
+        FakeResponse owners {{Column("OWNER",1)}, {}};
+        for (const auto &owner : models) { if (!owner.second.empty()) { owners.rows.push_back({Text(owner.first)}); } }
+        script->routes.push_back({"SELECT DISTINCT o.owner",std::move(owners)});
+        script->routes.push_back({"collation IS NOT NULL",{{Column("TABLE_NAME",1),Column("COLUMN_NAME",1),Column("COLLATION",1)},{}}});
+        script->routes.push_back({"c.constraint_type='U'",{{Column("CONSTRAINT_NAME",1),Column("COLUMN_NAME",1),Column("CONSTRAINT_TYPE",1)},{}}});
+        for (const auto &owner : models) {
+            script->routes.push_back({"username = '"+owner.first+"'",{{Column("USERNAME",1)},{{Text(owner.first)}}}});
+            FakeResponse folded {{Column("USERNAME",1)}, {}};
+            for (const auto &other : models) {
+                if (duckdb::StringUtil::CIEquals(owner.first,other.first)) { folded.rows.push_back({Text(other.first)}); }
+            }
+            script->routes.push_back({"UPPER(username) = UPPER('"+owner.first+"')",std::move(folded)});
+            FakeResponse tables {{Column("TABLE_NAME",1)}, {}};
+            FakeResponse dictionary {{Column("TABLE_NAME",1),Column("COLUMN_NAME",1),Column("DATA_TYPE",1),
+                Column("DATA_LENGTH",2),Column("DATA_PRECISION",2),Column("DATA_SCALE",2),Column("NULLABLE",1)}, {}};
+            FakeResponse keys {{Column("TABLE_NAME",1),Column("COLUMN_NAME",1)}, {}};
+            for (const auto &table : owner.second) {
+                const auto qualified=owner.first+"."+table.first;
+                script->tables[qualified]=table.second;
+                if (owner.first=="APP") { script->tables[table.first]=table.second; }
+                tables.rows.push_back({Text(table.first)});
+                for (const auto &column : table.second.columns) {
+                    dictionary.rows.push_back({Text(table.first),Text(column.name),Text(column.oracle_type==2?"NUMBER":"VARCHAR2"),
+                        Number("40"),column.oracle_type==2?Number(std::to_string(column.precision)):WireValue(),
+                        Number("0"),Text(column.name=="ID"&&table.first=="RV_T"?"N":"Y")});
+                }
+                if (table.first=="RV_T") { keys.rows.push_back({Text(table.first),Text("ID")}); }
+                const auto id_filter="object_name='"+table.first+"'"+(owner.first=="APP"?"":" AND owner = '"+owner.first+"'");
+                script->routes.push_back({id_filter,{{Column("OBJECT_ID",1)},{{Text(identities[qualified])}}}});
+            }
+            const bool own=owner.first=="APP";
+            script->routes.push_back({own?"FROM user_tables":"FROM all_tables WHERE owner = '"+owner.first+"'",std::move(tables)});
+            script->routes.push_back({own?"FROM user_views":"FROM all_views WHERE owner = '"+owner.first+"'",{{Column("VIEW_NAME",1)},{}}});
+            script->routes.push_back({own?"FROM user_tab_columns":"FROM all_tab_columns WHERE owner = '"+owner.first+"'",std::move(dictionary)});
+            script->routes.push_back({own?"FROM user_constraints":"c.owner = '"+owner.first+"'",std::move(keys)});
+        }
+        for (const auto *requested : {"hr","sales","mixed"}) {
+            if (!models.count(requested)) {
+                script->routes.push_back({std::string("username = '")+requested+"'",{{Column("USERNAME",1)},{}}});
+            }
+            FakeResponse folded {{Column("USERNAME",1)}, {}};
+            for (const auto &owner : models) {
+                if (duckdb::StringUtil::CIEquals(owner.first,requested)) { folded.rows.push_back({Text(owner.first)}); }
+            }
+            script->routes.push_back({std::string("UPPER(username) = UPPER('")+requested+"')",std::move(folded)});
+        }
+    };
+    refresh();
+    script->admin_action = [&](const std::string &sql) {
+        if (sql=="ALTER SESSION SET DDL_LOCK_TIMEOUT=0") { return; }
+        const auto begin=sql.find('"');const auto end=sql.find('"',begin+1);
+        CHECK(begin!=std::string::npos && end!=std::string::npos);
+        std::string owner="APP",name=sql.substr(begin+1,end-begin-1);
+        if (sql.compare(end,3,"\".\"")==0) {
+            owner=name;const auto last=sql.find('"',end+3);name=sql.substr(end+3,last-end-3);
+        }
+        auto &tables=models[owner];const auto qualified=owner+"."+name;
+        if (sql.find("CREATE TABLE ")==0) {
+            CHECK(!tables.count(name));tables[name]={{Column("ID",2,10,0)},{}};
+            identities[qualified]=std::to_string(next_id++);
+        } else if (sql.find("DROP TABLE ")==0) {
+            CHECK(tables.erase(name)==1);identities.erase(qualified);
+        } else if (sql.find(" ADD (")!=std::string::npos) {
+            const auto start=sql.find('"',sql.find(" ADD ("));const auto finish=sql.find('"',start+1);
+            tables.at(name).columns.push_back(Column(sql.substr(start+1,finish-start-1),2,10,0));
+            for (auto &row : tables.at(name).rows) { row.push_back(Number("7")); }
+        } else if (sql.find(" RENAME TO ")!=std::string::npos) {
+            const auto at=sql.rfind("\"");const auto from=sql.rfind("\"",at-1);
+            const auto renamed=sql.substr(from+1,at-from-1);
+            tables[renamed]=std::move(tables.at(name));tables.erase(name);
+            identities[owner+"."+renamed]=identities.at(qualified);identities.erase(qualified);
+        } else { CHECK(false && "unexpected DDL in multi-schema fixture"); }
+        refresh();
+    };
+    auto factory=InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS o(TYPE oracle_scanner);");
+    const auto label = [&](const std::string &table) {
+        auto result=database.Query("SELECT V FROM "+table+";");
+        CHECK(!result->HasError() && result->RowCount()==1);return result->GetValue(0,0).ToString();
+    };
+    CHECK(label("o.main.RV_T")=="APP");
+    CHECK(label("o.HR.RV_T")=="HR");
+    CHECK(label("o.hr.RV_T")=="HR");
+    CHECK(label("o.SALES.RV_T")=="SALES");
+    CHECK(label("o.APP.RV_T")=="APP");
+    CHECK(script->queries.back().find("FROM \"APP\".\"RV_T\"")!=std::string::npos);
+    CHECK(label("o.\"Mixed\".RV_T")=="Mixed");
+    auto listed=database.Query("SELECT schema_name FROM duckdb_tables() WHERE database_name='o' AND table_name='RV_T' AND schema_name IN ('HR','SALES') ORDER BY 1;");
+    CHECK(!listed->HasError() && listed->RowCount()==2);
+    database.Run("USE o.HR;");CHECK(label("RV_T")=="HR");database.Run("USE memory.main;");
+    database.Run("BEGIN;");
+    database.Run("INSERT INTO o.HR.RV_T VALUES(2,'hr');");
+    CHECK(script->counted_executes.back().find("INSERT INTO \"HR\".\"RV_T\"")==0);
+    const auto pinned=script->sessions_opened;
+    database.Run("INSERT INTO o.SALES.RV_T VALUES(2,'sales');");
+    CHECK(script->sessions_opened==pinned);
+    CHECK(script->counted_executes.back().find("INSERT INTO \"SALES\".\"RV_T\"")==0);
+    const auto rollbacks=script->rollbacks;database.Run("ROLLBACK;");CHECK(script->rollbacks>rollbacks);
+    const auto after_rollback_sessions=script->sessions_opened;
+    database.Run("INSERT INTO o.HR.RV_T VALUES(2,'up') ON CONFLICT(ID) DO UPDATE SET V=excluded.V;");
+    CHECK(script->sessions_opened==after_rollback_sessions);
+    CHECK(script->counted_executes.back().find("MERGE INTO \"HR\".\"RV_T\"")==0);
+    database.Run("SET oracle_join_pushdown=true;");
+    script->routes.insert(script->routes.begin(),{"JOIN (SELECT",{{Column("C0",2,10,0),Column("C1",2,10,0)},{{Number("1"),Number("1")}}}});
+    auto joined=database.Query("SELECT a.ID,b.ID FROM o.HR.RV_T a JOIN o.SALES.RV_T b ON a.ID=b.ID;");
+    CHECK(!joined->HasError() && joined->RowCount()==1);
+    CHECK(script->queries.back().find("FROM \"HR\".\"RV_T\"")!=std::string::npos);
+    CHECK(script->queries.back().find("FROM \"SALES\".\"RV_T\"")!=std::string::npos);
+    database.Run("SET oracle_aggregate_pushdown=true;");
+    script->routes.insert(script->routes.begin(),{"COUNT(DISTINCT",{{Column("C0",2,18,0)},{{Number("1")}}}});
+    CHECK(!database.Query("SELECT count(DISTINCT ID) FROM o.SALES.RV_T;")->HasError());
+    CHECK(script->queries.back().find("FROM \"SALES\".\"RV_T\"")!=std::string::npos);
+    database.Run("PREPARE hr_read AS SELECT * FROM o.HR.RV_T;");
+    database.Run("PREPARE sales_read AS SELECT * FROM o.SALES.RV_T;");
+    duckdb::Connection peer(database.db);
+    MaterializedQueryResult peer_ddl(peer.Query("ALTER TABLE o.HR.RV_T ADD COLUMN X INTEGER DEFAULT 7;"));
+    CHECK(!peer_ddl.HasError());
+    CHECK(database.Query("EXECUTE hr_read;")->ColumnCount()==3);
+    CHECK(database.Query("EXECUTE sales_read;")->ColumnCount()==2);
+    database.Run("PREPARE main_read AS SELECT * FROM o.main.RV_T;");
+    database.Run("ALTER TABLE o.APP.RV_T ADD COLUMN X INTEGER DEFAULT 7;");
+    CHECK(database.Query("EXECUTE main_read;")->ColumnCount()==3);
+    database.Run("BEGIN;");
+    database.Run("CREATE TABLE o.HR.RV_NEW(ID INTEGER);");
+    database.Run("CREATE TABLE o.SALES.RV_NEW(ID INTEGER);");
+    database.Run("ALTER TABLE o.HR.RV_NEW RENAME TO RV_RENAMED;");
+    database.Run("ROLLBACK;");
+    CHECK(!models["HR"].count("RV_NEW") && !models["HR"].count("RV_RENAMED") && !models["SALES"].count("RV_NEW"));
+    database.Run("BEGIN;");
+    database.Run("CREATE TABLE o.HR.RV_NEW(ID INTEGER);");
+    database.Run("CREATE TABLE o.SALES.RV_NEW(ID INTEGER);");
+    database.Run("DROP TABLE o.HR.RV_NEW;");
+    database.Run("ROLLBACK;");CHECK(!models["SALES"].count("RV_NEW"));
+    database.Run("BEGIN;");
+    database.Run("CREATE TABLE o.main.RV_ALIAS(ID INTEGER);");
+    database.Run("ALTER TABLE o.APP.RV_ALIAS RENAME TO RV_ALIAS_NEW;");
+    database.Run("ROLLBACK;");
+    CHECK(!models["APP"].count("RV_ALIAS") && !models["APP"].count("RV_ALIAS_NEW"));
+    database.Run("CREATE TABLE o.SALES.RV_CTAS AS SELECT 1::INTEGER ID;");
+    CHECK(script->admin_executes.back().find("CREATE TABLE \"SALES\".\"RV_CTAS\"")==0);
+    CHECK(script->counted_executes.back().find("INSERT INTO \"SALES\".\"RV_CTAS\"")==0);
+    database.Run("DROP TABLE o.SALES.RV_CTAS;");
+    database.Run("ATTACH 'ora' AS d(TYPE oracle_scanner,SCHEMA 'HR');");
+    CHECK(database.Query("DESCRIBE d.main.RV_T;")->RowCount()==3);
+    database.Run("ALTER TABLE d.HR.RV_T ADD COLUMN Y INTEGER DEFAULT 7;");
+    CHECK(database.Query("DESCRIBE d.main.RV_T;")->RowCount()==4);
+    // Non-table DDL must not fall through to DuckCatalog's local schema storage.
+    const auto before=script->admin_executes.size();
+    CHECK(database.Query("CREATE SCHEMA o.RV_BAD;")->HasError());
+    CHECK(database.Query("ALTER SCHEMA o.HR RENAME TO RV_BAD;")->HasError());
+    CHECK(database.Query("DROP SCHEMA o.HR CASCADE;")->HasError());
+    CHECK(script->admin_executes.size()==before);
+    CHECK(database.Query("SELECT * FROM o.RV_MISSING.RV_T;")->HasError());
+    database.Run("ATTACH 'ora' AS ro(TYPE oracle_scanner,READ_ONLY);");
+    CHECK(database.Query("INSERT INTO ro.HR.RV_T VALUES(9,'no');")->HasError());
+    CHECK(database.Query("CREATE TABLE ro.SALES.RV_NO(ID INTEGER);")->HasError());
+    CHECK(script->admin_executes.size()==before);
+    models["hr"]=models["SALES"];refresh();
+    database.Run("ATTACH 'ora' AS cases(TYPE oracle_scanner);");
+    CHECK(label("cases.HR.RV_T")=="HR");
+    auto collision=database.Query("SELECT * FROM cases.\"hr\".RV_T;");
+    CHECK(collision->HasError() && collision->GetError().find("case-colliding")!=std::string::npos);
+    const auto before_type_queries=script->queries.size();
+    CHECK(database.Query("SELECT * FROM oracle_query_transaction_typed('o','SELECT ID FROM RV_T',['ID'],['NOT_A_TYPE']);")->HasError());
+    CHECK(script->queries.size()==before_type_queries);
+    CHECK(!database.Query("SELECT 42;")->HasError());
+    std::cout << "multiple Oracle schemas isolate metadata and share one transaction" << std::endl;
+}
+
 void TestAttachToAnotherSchema() {
     const auto text_columns = [](std::initializer_list<const char *> names) {
         std::vector<OracleColumn> result;
@@ -5526,6 +5714,7 @@ int main() {
     TestAttachedCatalogNamesTheNewTypes();
     TestInsertBindsMatchTheValuePath();
     TestAttachToAnotherSchema();
+    TestMultipleOracleSchemasShareTransactionsAndIsolateMetadata();
     TestUntranslatableFiltersRunLocally();
     TestJsonAndVectorColumnsThroughSql();
     TestXmlTypeColumnsAreText();

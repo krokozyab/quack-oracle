@@ -13,6 +13,12 @@
 
 ## Behaviour changes
 
+- SCHEMA selects the owner behind `main`; it no longer limits the attachment to
+  one owner. Oracle grants still control access. Schema discovery lists visible
+  non-Oracle-maintained owners. `main` is reserved; case-colliding owner aliases
+  are refused, and discovery/named lookup are bounded to 4,096 names. Reattach
+  after external schema/grant changes. READ_ONLY applies to every owner.
+
 - Scalar fetch batches are bounded to 64 MiB including cell descriptors and
   validity metadata; exceeding the bound reports an explicit limit error.
 
@@ -35,6 +41,11 @@
   parallel range planning. Local filters, samples and locked scans retain local limits.
 
 ## Additions
+
+- One ATTACH exposes multiple accessible Oracle owners as schemas, including
+  cross-schema joins, transactional writes and supported table DDL. Owner caches
+  are isolated; transaction sessions and DDL invalidation are shared per catalog.
+  Named-owner CTAS and schema-scoped CREATE rollback are supported.
 
 - Exact NUMBER-to-DECIMAL reads decode directly into portable scaled integers
   through 38 digits. Values needing rounding or error reporting retain the
