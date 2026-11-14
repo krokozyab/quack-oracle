@@ -482,21 +482,67 @@ against `ALL_USERS`: as written, else the one user it matches ignoring case. Wri
 need the grants Oracle itself would ask for. One attachment is one schema; attach
 again, under another alias, for a second.
 
-**What `ATTACH` will not do: DDL.** `CREATE TABLE`, `CREATE TABLE ... AS`, `DROP TABLE`, `ALTER TABLE`
-and `CREATE`/`DROP SCHEMA` on an attached catalog are refused with an error that says what to do
-instead. The catalog never turns a DuckDB statement into Oracle DDL, because Oracle commits DDL at
-once and it could not be part of the DuckDB transaction the statement runs in. Run DDL as its own
-step with `oracle_execute_admin`, then `DETACH` and `ATTACH` again so the catalog sees the change:
+### Creating and changing Oracle tables through ATTACH
+
+`CREATE TABLE`, `CREATE TABLE ... AS SELECT`, `DROP TABLE`, and `ALTER TABLE`
+(`ADD COLUMN`, `DROP COLUMN`, `RENAME COLUMN`, `RENAME TO`) execute Oracle DDL
+on a separate session. The attached catalog refreshes immediately, including
+prepared queries, without DETACH/ATTACH. READ_ONLY attachments refuse these writes.
+Identifiers are quoted with the spelling supplied in SQL.
 
 ```sql
-SELECT * FROM oracle_execute_admin('ora', 'CREATE TABLE ITEMS_COPY (ID NUMBER(10), LABEL VARCHAR2(50))');
-DETACH o;
-ATTACH 'ora' AS o (TYPE oracle_scanner);
-INSERT INTO o.ITEMS_COPY SELECT id, label FROM 'items.parquet';   -- writes work as usual
+CREATE TABLE o.ITEMS_COPY (ID INTEGER PRIMARY KEY, LABEL VARCHAR DEFAULT 'new');
+INSERT INTO o.ITEMS_COPY SELECT id, label FROM 'items.parquet';
+ALTER TABLE o.ITEMS_COPY ADD COLUMN NOTE VARCHAR;
+CREATE TABLE o.ITEM_IDS AS SELECT ID FROM o.ITEMS_COPY;
+DROP TABLE o.ITEM_IDS;
 ```
 
-To copy DuckDB data into a new Oracle table, create the table this way first and fill it with
-`INSERT ... SELECT`. [Section 5](#5-write-data) lists what `oracle_execute_admin` accepts.
+**Oracle commits DDL immediately.** ALTER and DROP survive DuckDB ROLLBACK.
+DDL does not commit the caller's INSERT/UPDATE/DELETE transaction, because it
+uses a different session. If that transaction holds a conflicting lock, DDL
+fails at a `LOCK TABLE … NOWAIT` preflight (`DDL_LOCK_TIMEOUT=0` is also set).
+The preflight requires permission to lock the target table and does not prevent
+a new lock acquired concurrently after that check.
+
+CREATE/CTAS is visible in Oracle immediately. On DuckDB ROLLBACK, CTAS failure
+or connection close, the extension attempts a compensating DROP of tables it
+created in that transaction, after rolling back its DML. It checks Oracle's
+object identity first and refuses to drop a replacement table. Explicit
+ROLLBACK reports cleanup errors; connection destruction cannot report them.
+Cleanup uses a separate bounded I/O budget. Lost CREATE acknowledgements,
+cleanup failures, and concurrent external DDL can require manual reconciliation;
+this is compensation, not transactional Oracle DDL. An unknown COMMIT outcome
+preserves created tables for reconciliation. IF NOT EXISTS never owns or drops
+an existing table. DROP uses Oracle's usual recycle-bin behaviour.
+
+DuckDB declarations and CTAS source types map as follows. Reading the table
+back uses the normal Oracle type mapping, so the DuckDB type can change.
+
+| DuckDB type | Oracle declaration |
+| --- | --- |
+| BOOLEAN | NUMBER(1,0); reads as BIGINT |
+| TINYINT / SMALLINT / INTEGER / BIGINT | NUMBER(3/5/10/19,0) |
+| UTINYINT / USMALLINT / UINTEGER / UBIGINT | NUMBER(3/5/10/20,0) |
+| HUGEINT | NUMBER(38,0); values requiring 39 digits are rejected |
+| DECIMAL(p,s) | NUMBER(p,s) |
+| VARCHAR | VARCHAR2(4000 BYTE); Oracle treats empty strings as NULL |
+| BLOB | BLOB |
+| FLOAT / DOUBLE | BINARY_FLOAT / BINARY_DOUBLE |
+| DATE | DATE |
+| TIMESTAMP_S / TIMESTAMP_MS / TIMESTAMP / TIMESTAMP_NS | TIMESTAMP(0/3/6/9) |
+| TIMESTAMPTZ | TIMESTAMP(6) WITH LOCAL TIME ZONE; stores instants, not original zone names |
+
+CREATE supports NOT NULL, PRIMARY KEY, UNIQUE and literal defaults matching the
+column type. ADD COLUMN supports a literal default and NOT NULL. Generated
+columns, CHECK/FOREIGN KEY, temporary tables, OR REPLACE, cascading changes,
+ALTER TYPE, expression defaults and unlisted types are refused. CREATE/DROP
+SCHEMA is unsupported. CTAS creates the table first and loads it through array
+DML; it does not run a remote Oracle SELECT.
+
+For other DDL use `oracle_execute_admin`. Changes made through that API or
+outside the extension still require DETACH/ATTACH to refresh this catalog.
+[Section 5](#5-write-data) lists the administrative API's accepted statements.
 
 ### Pushing filters down to Oracle
 
@@ -1397,9 +1443,10 @@ statement, not a script.
 ### `oracle_execute accepts only INSERT, UPDATE, DELETE, or MERGE`
 
 <a id="i-need-to-run-create-table-or-another-ddl-statement"></a>
-You are trying to run DDL. `oracle_execute`, `oracle_execute_transaction` and an attached
-catalog run DML only; DDL has a function of its own, which runs one statement on a session of its
-own, outside any DuckDB transaction (Oracle commits DDL at once):
+You are trying to run DDL through a DML API. Use the attached catalog for the
+supported table operations described above, or `oracle_execute_admin` for Oracle SQL.
+The administrative API runs one statement on a separate session, outside any
+DuckDB transaction (Oracle commits DDL at once):
 
 ```sql
 SELECT * FROM oracle_execute_admin('ora', 'CREATE TABLE t (id NUMBER(10), label VARCHAR2(50))');

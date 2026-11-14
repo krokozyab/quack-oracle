@@ -975,6 +975,11 @@ OracleTransactionStatus GetOracleTransactionStatus(ClientContext &context, const
     return WriteStateFor(context).Status(catalog_name);
 }
 
+std::function<void()> OracleRollbackForCleanup(ClientContext &context, const std::string &catalog_name) {
+    auto state = context.registered_state->GetOrCreate<OracleWriteState>("oracle_scanner.write_state");
+    return [state, catalog_name] { state->Discard(catalog_name); };
+}
+
 void RollbackOracleTransaction(ClientContext &context, const std::string &catalog_name) noexcept {
     try {
         WriteStateFor(context).Discard(catalog_name);
@@ -1073,6 +1078,7 @@ namespace {
 class OracleInsertGlobalState final : public GlobalSinkState {
 public:
     uint64_t inserted_rows = 0;
+    bool skip = false;
     // Filled only for RETURNING: the table rows as Oracle made them, which is
     // the whole point — a DEFAULT, a sequence or a trigger is exactly what the
     // caller could not have known before the insert.
@@ -1092,14 +1098,14 @@ class OracleInsertOperator final : public PhysicalOperator {
 public:
     OracleInsertOperator(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
                          OracleWriteTarget target_p, std::string sql_p, std::vector<idx_t> source_indexes_p,
-                         std::vector<OracleColumn> bound_columns_p, std::vector<OracleColumn> returned_columns_p, idx_t merge_keys_p = 0)
+                         std::vector<OracleColumn> bound_columns_p, std::vector<OracleColumn> returned_columns_p, idx_t merge_keys_p = 0, std::function<bool(ClientContext &)> create_p = nullptr)
         : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
           target(std::move(target_p)), sql(std::move(sql_p)), source_indexes(std::move(source_indexes_p)),
-          bound_columns(std::move(bound_columns_p)), returned_columns(std::move(returned_columns_p)), merge_keys(merge_keys_p) {
+          bound_columns(std::move(bound_columns_p)), returned_columns(std::move(returned_columns_p)), merge_keys(merge_keys_p), create(std::move(create_p)) {
     }
 
     string GetName() const override {
-        return merge_keys ? "ORACLE_MERGE" : "ORACLE_INSERT";
+        return create ? "ORACLE_CREATE_AS" : (merge_keys ? "ORACLE_MERGE" : "ORACLE_INSERT");
     }
 
     bool IsSink() const override {
@@ -1112,6 +1118,7 @@ public:
 
     unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override {
         auto state = make_uniq<OracleInsertGlobalState>();
+        state->skip = create && !create(context);
         if (!returned_columns.empty()) {
             state->returned = make_uniq<ColumnDataCollection>(context, types);
         }
@@ -1124,7 +1131,7 @@ public:
 
     SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override {
         auto &global_state = input.global_state.Cast<OracleInsertGlobalState>();
-        if (chunk.size() == 0) {
+        if (chunk.size() == 0 || global_state.skip) {
             return SinkResultType::NEED_MORE_INPUT;
         }
         chunk.Flatten();
@@ -1237,6 +1244,7 @@ private:
     //! order, which is the shape DuckDB evaluates the RETURNING list over.
     std::vector<OracleColumn> returned_columns;
     idx_t merge_keys = 0;
+    std::function<bool(ClientContext &)> create;
 };
 
 // UPDATE and DELETE share everything but how a row's binds are built: both send
@@ -1491,6 +1499,36 @@ private:
 unique_ptr<LogicalOperator> MakeOracleMergePlan(TableCatalogEntry &table, TableIndex table_index, OracleWriteTarget target,
     std::string sql, std::vector<OracleColumn> columns, idx_t key_count, unique_ptr<LogicalOperator> source) {
     return make_uniq<OracleMergePlan>(table, table_index, std::move(target), std::move(sql), std::move(columns), key_count, std::move(source));
+}
+
+PhysicalOperator &PlanOracleCreateAs(ClientContext &context, PhysicalPlanGenerator &planner,
+    PhysicalOperator &source, vector<LogicalType> types, OracleWriteTarget target,
+    std::vector<OracleColumn> columns, std::function<bool(ClientContext &)> create) {
+    vector<unique_ptr<Expression>> expressions;
+    vector<LogicalType> input_types;
+    std::vector<idx_t> indexes;
+    std::string names, values;
+    for (idx_t i = 0; i < columns.size(); i++) {
+        unique_ptr<Expression> expression = make_uniq<BoundReferenceExpression>(source.types[i], i);
+        auto type = source.types[i];
+        if (type.id() == LogicalTypeId::BOOLEAN) {
+            type = LogicalType::BIGINT;
+            expression = BoundCastExpression::AddCastToType(context, std::move(expression), type);
+        } else if (type.id() == LogicalTypeId::TIMESTAMP_SEC || type.id() == LogicalTypeId::TIMESTAMP_MS) {
+            type = LogicalType::TIMESTAMP;
+            expression = BoundCastExpression::AddCastToType(context, std::move(expression), type);
+        }
+        expressions.push_back(std::move(expression)); input_types.push_back(type); indexes.push_back(i);
+        names += (names.empty() ? "" : ", ") + KeywordHelper::WriteQuotedAndEscaped(columns[i].name, '"');
+        values += (values.empty() ? "" : ", ") + OracleBindExpression(columns[i], i+1);
+    }
+    auto &projection = planner.Make<PhysicalProjection>(std::move(input_types), std::move(expressions), source.estimated_cardinality);
+    projection.children.push_back(source);
+    auto sql = "INSERT INTO " + OracleObjectReference(target.schema_name, target.object_name) + " (" + names + ") VALUES (" + values + ")";
+    auto &sink = planner.Make<OracleInsertOperator>(std::move(types), source.estimated_cardinality, std::move(target),
+        std::move(sql), std::move(indexes), std::move(columns), std::vector<OracleColumn>(), 0, std::move(create));
+    sink.children.push_back(projection);
+    return sink;
 }
 
 PhysicalOperator &PlanOracleInsert(ClientContext &, PhysicalPlanGenerator &planner, LogicalInsert &op,

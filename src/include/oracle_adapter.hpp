@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+
 // Internal seam between the DuckDB adapter's translation units. The catalog and
 // the table functions both need the scan's bind data and the Oracle-to-DuckDB
 // conversions, so those live here rather than in one anonymous namespace.
@@ -499,6 +501,7 @@ void CommitOracleTransaction(ClientContext &context, const std::string &catalog_
 // Marks the pinned session as one that must not be reused: the transaction
 // ran something, such as a stored procedure, that can leave session state.
 void TaintTransactionSession(ClientContext &context, const std::string &catalog_name);
+std::function<void()> OracleRollbackForCleanup(ClientContext &context, const std::string &catalog_name);
 void RollbackOracleTransaction(ClientContext &context, const std::string &catalog_name) noexcept;
 
 //! Converts one DuckDB value into a bind for a specific Oracle column. The
@@ -575,5 +578,9 @@ std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const 
 
 unique_ptr<LogicalOperator> MakeOracleMergePlan(TableCatalogEntry &table, TableIndex table_index, OracleWriteTarget target,
     std::string sql, std::vector<OracleColumn> columns, idx_t key_count, unique_ptr<LogicalOperator> source);
+
+PhysicalOperator &PlanOracleCreateAs(ClientContext &context, PhysicalPlanGenerator &planner,
+    PhysicalOperator &source, vector<LogicalType> types, OracleWriteTarget target,
+    std::vector<OracleColumn> columns, std::function<bool(ClientContext &)> create);
 
 } // namespace duckdb

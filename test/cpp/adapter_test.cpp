@@ -150,6 +150,7 @@ struct FakeScript {
     std::vector<std::vector<OracleBind>> query_binds;
     std::vector<std::string> plain_executes;
     std::vector<std::string> admin_executes;
+    std::function<void(const std::string &)> admin_action;
     std::vector<std::string> counted_executes;
     std::vector<std::vector<OracleBind>> counted_execute_binds;
     std::vector<std::vector<OracleBind>> batch_rows;
@@ -182,6 +183,7 @@ struct FakeScript {
     std::string fetch_failure_message;
     bool batch_should_fail = false;
     bool execute_should_fail = false;
+    bool honor_connect_cancelled = false;
     bool commit_should_fail = false;
     // The transaction pool: whether a session reports itself ReadyForReuse
     // (until it fails or closes), and a rollback that fails.
@@ -387,6 +389,7 @@ public:
     void ExecuteAdmin(const std::string &sql) override {
         std::lock_guard<std::mutex> guard(script->record_lock);
         script->admin_executes.push_back(sql);
+        if (script->admin_action) { script->admin_action(sql); }
     }
 
     uint64_t ExecuteWithRowCount(const std::string &sql, const std::vector<OracleBind> &binds) override {
@@ -552,6 +555,9 @@ private:
 
 ScopedOracleSessionFactory InstallFake(const std::shared_ptr<FakeScript> &script) {
     return ScopedOracleSessionFactory([script](const ConnectionConfig &config, const std::string &) {
+        if (script->honor_connect_cancelled && config.connect_cancelled && config.connect_cancelled()) {
+            throw oracle_scanner::ProtocolError(oracle_scanner::ProtocolErrorKind::INVALID_STATE, "fake Oracle connect was cancelled");
+        }
         return std::unique_ptr<OracleSession>(new FakeSession(script, config.user, config.io_deadline));
     });
 }
@@ -3163,6 +3169,170 @@ void TestCallableArgumentsOfTheNewTypes() {
     std::cout << "callable arguments cover national text, BOOLEAN, intervals and local-zone timestamps" << std::endl;
 }
 
+void TestAttachedDdlRefreshesAndCompensates() {
+    auto script = std::make_shared<FakeScript>();
+    script->honor_connect_cancelled = true;
+    script->affected_rows = 1;
+    std::map<std::string, std::string> identities;
+    int next_id = 1;
+    auto refresh = [&] {
+        script->routes.clear();
+        script->routes.push_back({"SELECT USER FROM DUAL", {{Column("USER",1)}, {{Text("APP")}}}});
+        FakeResponse tables {{Column("TABLE_NAME",1)}, {}};
+        FakeResponse dictionary {{Column("TABLE_NAME",1),Column("COLUMN_NAME",1),Column("DATA_TYPE",1),
+            Column("DATA_LENGTH",2),Column("DATA_PRECISION",2),Column("DATA_SCALE",2),Column("NULLABLE",1)}, {}};
+        for (const auto &table : script->tables) {
+            tables.rows.push_back({Text(table.first)});
+            for (const auto &column : table.second.columns) {
+                dictionary.rows.push_back({Text(table.first),Text(column.name),Text(column.oracle_type==2 ? "NUMBER" : "VARCHAR2"),
+                    Number(column.oracle_type==2 ? "22" : "4000"),column.oracle_type==2 ? Number(std::to_string(column.precision)) : WireValue(),
+                    column.oracle_type==2 ? Number(std::to_string(column.scale)) : WireValue(),Text("Y")});
+            }
+            script->routes.push_back({"object_name='"+table.first+"'", {{Column("OBJECT_ID",1)},{{Text(identities[table.first])}}}});
+        }
+        script->routes.push_back({"FROM user_tables", std::move(tables)});
+        script->routes.push_back({"FROM user_views", {{Column("VIEW_NAME",1)}, {}}});
+        script->routes.push_back({"FROM user_tab_columns", std::move(dictionary)});
+        script->routes.push_back({"FROM user_constraints", {{Column("TABLE_NAME",1),Column("COLUMN_NAME",1)}, {}}});
+    };
+    refresh();
+    script->admin_action = [&](const std::string &sql) {
+        if (sql == "ALTER SESSION SET DDL_LOCK_TIMEOUT=0") { return; }
+        const auto start = sql.find('"');
+        CHECK(start != std::string::npos);
+        const auto end = sql.find('"', start+1);
+        const auto name = sql.substr(start+1,end-start-1);
+        if (sql.find("CREATE TABLE ")==0) {
+            CHECK(script->tables.count(name)==0);
+            script->tables[name] = {{Column("ID",2,10,0)}, {}};
+            if (sql.find("\"V\"") != std::string::npos) { script->tables[name].columns.push_back(Column("V",1)); }
+            identities[name] = std::to_string(next_id++);
+        } else if (sql.find("DROP TABLE ")==0) {
+            script->tables.erase(name); identities.erase(name);
+        } else if (sql.find(" ADD (") != std::string::npos) {
+            script->tables[name].columns.push_back(Column("X",2,10,0));
+        } else if (sql.find("RENAME COLUMN") != std::string::npos) {
+            script->tables[name].columns.back().name="Y";
+        } else if (sql.find("DROP COLUMN") != std::string::npos) {
+            script->tables[name].columns.pop_back();
+        } else if (sql.find("RENAME TO") != std::string::npos) {
+            const std::string renamed = "RV_RENAMED";
+            script->tables[renamed]=std::move(script->tables[name]); script->tables.erase(name);
+            identities[renamed]=identities[name]; identities.erase(name);
+        } else { CHECK(false && "unexpected DDL"); }
+        refresh();
+    };
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS o(TYPE oracle_scanner);");
+    database.Run("EXPLAIN CREATE TABLE o.RV_DDL(ID INTEGER,V VARCHAR DEFAULT 'v');");
+    CHECK(script->admin_executes.empty());
+    database.Run("CREATE TABLE o.RV_DDL(ID INTEGER,V VARCHAR DEFAULT 'v');");
+    CHECK(script->tables.count("RV_DDL")==1);
+    CHECK(script->admin_executes[1].find("NUMBER(10,0)") != std::string::npos);
+    CHECK(script->admin_executes[1].find("VARCHAR2(4000 BYTE) DEFAULT 'v'") != std::string::npos);
+    CHECK(database.Query("DESCRIBE o.RV_DDL;")->RowCount()==2);
+    database.Run("PREPARE rv_read AS SELECT * FROM o.RV_DDL;");
+    script->call_should_fail = true;
+    CHECK(database.Query("ALTER TABLE o.RV_DDL ADD COLUMN X INTEGER DEFAULT 7;")->HasError());
+    CHECK(script->tables.at("RV_DDL").columns.size()==2);
+    CHECK(script->calls.back().block.find("LOCK TABLE \"RV_DDL\" IN EXCLUSIVE MODE NOWAIT")!=std::string::npos);
+    script->call_should_fail = false;
+    database.Run("ALTER TABLE o.RV_DDL ADD COLUMN X INTEGER DEFAULT 7;");
+    CHECK(database.Query("EXECUTE rv_read;")->ColumnCount()==3);
+    database.Run("ALTER TABLE o.RV_DDL RENAME COLUMN X TO Y;");
+    CHECK(!database.Query("SELECT Y FROM o.RV_DDL;")->HasError());
+    CHECK(database.Query("SELECT X FROM o.RV_DDL;")->HasError());
+    database.Run("ALTER TABLE o.RV_DDL DROP COLUMN Y;");
+    CHECK(database.Query("DESCRIBE o.RV_DDL;")->RowCount()==2);
+    database.Run("BEGIN;");
+    database.Run("ALTER TABLE o.RV_DDL RENAME TO RV_RENAMED;");
+    database.Run("ROLLBACK;");
+    CHECK(!database.Query("SELECT * FROM o.RV_RENAMED;")->HasError());
+    CHECK(database.Query("SELECT * FROM o.RV_DDL;")->HasError());
+    database.Run("BEGIN;");
+    database.Run("DROP TABLE o.RV_RENAMED;");
+    database.Run("ROLLBACK;");
+    CHECK(script->tables.empty());
+    CHECK(database.Query("SELECT * FROM o.RV_RENAMED;")->HasError());
+    const auto before_explain=script->admin_executes.size();
+    database.Run("EXPLAIN CREATE TABLE o.RV_CTAS AS SELECT i::INTEGER ID FROM range(3) t(i);");
+    CHECK(script->admin_executes.size()==before_explain);
+    database.Run("CREATE TABLE o.RV_CTAS AS SELECT i::INTEGER ID FROM range(3) t(i);");
+    CHECK(script->batch_rows.size()==3);
+    CHECK(script->tables.count("RV_CTAS")==1);
+    database.Run("DROP TABLE o.RV_CTAS;");
+    database.Run("BEGIN;");
+    database.Run("CREATE TABLE o.RV_DDL(ID INTEGER);");
+    database.Run("ALTER TABLE o.RV_DDL RENAME TO RV_RENAMED;");
+    database.Run("ROLLBACK;");
+    CHECK(script->tables.empty());
+    database.Run("BEGIN;");
+    database.Run("CREATE TABLE o.RV_CTAS AS SELECT 1::INTEGER ID;");
+    database.Run("ROLLBACK;");
+    CHECK(script->tables.empty());
+    CHECK(database.Query("CREATE TABLE o.RV_BAD_FLOAT AS SELECT 'nan'::DOUBLE ID;")->HasError());
+    CHECK(script->tables.empty());
+    CHECK(database.Query("CREATE TABLE o.RV_BAD_CAST AS SELECT CASE WHEN i=2 THEN CAST('bad'||i AS INTEGER) ELSE i END ID FROM range(3)t(i);")->HasError());
+    CHECK(script->tables.empty());
+    script->batch_should_fail=true;
+    CHECK(database.Query("CREATE TABLE o.RV_FAILED AS SELECT 1::INTEGER ID;")->HasError());
+    CHECK(script->tables.empty());
+    script->batch_should_fail=false;
+    database.Run("BEGIN;");
+    database.Run("CREATE TABLE o.RV_IDENTITY(ID INTEGER);");
+    identities["RV_IDENTITY"]="replacement";
+    refresh();
+    auto identity_failure=database.Query("ROLLBACK;");
+    CHECK(identity_failure->HasError() && identity_failure->GetError().find("identity changed") != std::string::npos);
+    CHECK(script->tables.count("RV_IDENTITY")==1);
+    CHECK(!database.Query("SELECT 42;")->HasError());
+    database.Run("DROP TABLE o.RV_IDENTITY;");
+    database.Run("CREATE TABLE o.RV_KEEP(ID INTEGER);");
+    database.Run("CREATE TABLE IF NOT EXISTS o.RV_KEEP(ID INTEGER);");
+    CHECK(script->tables.count("RV_KEEP")==1);
+    database.Run("BEGIN;");
+    database.Run("CREATE TABLE IF NOT EXISTS o.RV_KEEP(ID INTEGER);");
+    database.Run("ROLLBACK;");
+    CHECK(script->tables.count("RV_KEEP")==1);
+    database.Run("DROP TABLE o.RV_KEEP;");
+    database.Run("BEGIN;");
+    database.Run("CREATE TABLE o.RV_UNKNOWN(ID INTEGER);");
+    database.Run("INSERT INTO o.RV_UNKNOWN VALUES (1);");
+    script->commit_should_fail = true;
+    CHECK(database.Query("COMMIT;")->HasError());
+    script->commit_should_fail = false;
+    CHECK(script->tables.count("RV_UNKNOWN")==1);
+    database.Run("DROP TABLE o.RV_UNKNOWN;");
+    for (const auto *unit : {"TIMESTAMP_S", "TIMESTAMP_MS"}) {
+        script->batch_rows.clear();
+        database.Run(std::string("CREATE TABLE o.RV_TS AS SELECT CAST(TIMESTAMP '2026-01-02 03:04:05.123' AS ")+unit+") ID;");
+        CHECK(script->batch_rows.size()==1);
+        const auto timestamp=oracle_scanner::DecodeOracleTimestamp(*script->batch_rows[0][0].value);
+        CHECK(timestamp.second==5);
+        CHECK(timestamp.nanosecond==(std::string(unit)=="TIMESTAMP_MS" ? 123000000 : 0));
+        database.Run("DROP TABLE o.RV_TS;");
+    }
+    const auto before=script->admin_executes.size();
+    CHECK(database.Query("CREATE TABLE o.RV_BAD(ID INTEGER DEFAULT random());")->HasError());
+    CHECK(database.Query("CREATE TABLE o.RV_BAD(ID INTEGER DEFAULT '1');")->HasError());
+    CHECK(database.Query("CREATE TABLE o.RV_BAD(ID INTEGER[]);")->HasError());
+    CHECK(script->admin_executes.size()==before);
+    database.Run("DETACH o;");
+    database.Run("ATTACH 'ora' AS o(TYPE oracle_scanner, READ_ONLY);");
+    CHECK(database.Query("CREATE TABLE o.RV_READONLY(ID INTEGER);")->HasError());
+    CHECK(script->admin_executes.size()==before);
+    {
+        TestDatabase disconnected;
+        disconnected.Run("ATTACH 'ora' AS o(TYPE oracle_scanner);");
+        disconnected.Run("BEGIN;");
+        disconnected.Run("CREATE TABLE o.RV_CLOSE(ID INTEGER);");
+        disconnected.Run("CREATE TABLE o.RV_CLOSE_CTAS AS SELECT CAST(i AS INTEGER) ID FROM range(2) r(i);");
+    }
+    CHECK(script->tables.empty());
+    std::cout << "attached DDL refreshes metadata and compensates CREATE rollback" << std::endl;
+}
+
 void TestAttachedUpsertsUseOracleMerge() {
     const auto text_columns = [](std::initializer_list<const char *> names) {
         std::vector<OracleColumn> result;
@@ -3314,18 +3484,13 @@ void TestAttachedWritesAgainstAFakeSession() {
     // DDL through the catalog is refused with the way to run it, and leaves the
     // database usable: ALTER used to reach DuckDB's base entry, whose internal
     // error invalidated the whole database.
-    for (const auto *ddl : {"ALTER TABLE ora.main.ITEMS ADD COLUMN EXTRA INTEGER;",
-                            "ALTER TABLE ora.main.ITEMS RENAME TO OTHER;", "DROP TABLE ora.main.ITEMS;",
-                            "CREATE TABLE ora.main.MORE (ID INTEGER);",
+    for (const auto *ddl : {"ALTER TABLE ora.main.ITEMS ALTER COLUMN LABEL TYPE INTEGER;",
+                            "CREATE TABLE ora.main.MORE (ID INTEGER[]);",
                             "MERGE INTO ora.main.ITEMS t USING (SELECT 1 AS ID) s ON t.ID=s.ID "
                             "WHEN MATCHED THEN UPDATE SET LABEL='RV';"}) {
         auto refused = database.Query(ddl);
         CHECK(refused->HasError());
-        if (std::string(ddl).find("MERGE INTO") == 0) {
-            CHECK(refused->GetError().find("use oracle_execute") != std::string::npos);
-        } else {
-            CHECK(refused->GetError().find("oracle_execute_admin") != std::string::npos);
-        }
+        CHECK(refused->GetError().find("INTERNAL") == std::string::npos);
         CHECK(!database.Query("SELECT count(*) FROM ora.main.ITEMS;")->HasError());
     }
 
@@ -5164,6 +5329,7 @@ int main() {
     TestScanReleasesItsSession();
     TestReadSessionsArePooledPerConnection();
     TestAttachedCatalogAgainstAFakeSession();
+    TestAttachedDdlRefreshesAndCompensates();
     TestAttachedUpsertsUseOracleMerge();
     TestAttachedWritesAgainstAFakeSession();
     TestAttachedCatalogNamesTheNewTypes();

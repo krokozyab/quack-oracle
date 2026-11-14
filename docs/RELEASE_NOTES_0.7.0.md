@@ -7,6 +7,18 @@
 
 ## Behaviour changes
 
+- Attached CREATE/CTAS, DROP and ALTER (ADD/DROP/RENAME COLUMN, RENAME TO)
+  now execute Oracle DDL on separate sessions and refresh the local catalog.
+  ALTER/DROP commit immediately and survive DuckDB rollback. Conflicting locks
+  are checked with LOCK TABLE NOWAIT; caller DML is not committed by DDL.
+- CREATE/CTAS rollback attempts a compensating DROP after identity verification,
+  including statement failures and connection close. This is not atomic DDL;
+  failed cleanup or lost acknowledgements can require manual reconciliation.
+  Unknown COMMIT outcomes preserve tables. Existing IF NOT EXISTS targets are retained.
+- DuckDB-to-Oracle DDL types, literal defaults, supported constraints and limits
+  are documented in README. Read-back types follow Oracle metadata; BOOLEAN
+  becomes NUMBER(1,0), and TIMESTAMPTZ uses WITH LOCAL TIME ZONE.
+
 - Declared `NUMBER(19..38,0)` now reads as `DECIMAL(p,0)` instead of text.
   Negative-scale declarations with 19..38 effective digits use `DECIMAL(p-s,0)`.
   Unconstrained NUMBER and values exceeding 38 effective digits retain their mapping.
