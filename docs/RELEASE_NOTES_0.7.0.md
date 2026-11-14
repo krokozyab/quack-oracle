@@ -2,6 +2,8 @@
 
 ## Fixes
 
+- Skipping protocol bytes checks bounds and advances without allocating or copying.
+
 - Attached MERGE rejects duplicate source keys after target-type conversion,
   before issuing remote writes, including duplicates across source batches.
 

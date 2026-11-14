@@ -169,6 +169,21 @@ static void ExpectConnectFailure(ConnectFailure failure, FUNCTION function) {
     }
 }
 
+static void TestByteReaderSkipBounds() {
+    const std::vector<uint8_t> bytes {1, 2, 3};
+    ByteReader reader(bytes);
+    reader.Skip(0);
+    CHECK(reader.Position() == 0);
+    reader.Skip(2);
+    CHECK(reader.Position() == 2 && reader.ReadByte() == 3);
+    ExpectError(ProtocolErrorKind::TRUNCATED, [&] { reader.Skip(1); });
+    CHECK(reader.Position() == 3);
+    reader.Skip(0);
+    ByteReader empty(nullptr, 0);
+    empty.Skip(0);
+    CHECK(empty.Position() == 0);
+}
+
 static void TestUniversalIntegers() {
     ByteWriter writer;
     writer.WriteUB4(0).WriteUB4(255).WriteUB4(256).WriteUB4(0x12345678).WriteUB8(UINT64_C(0x123456789abcdef0));
@@ -8814,6 +8829,7 @@ static void TestVectorBindsMatchPython() {
 
 int main() {
 
+    TestByteReaderSkipBounds();
     TestUniversalIntegers();
     TestWalletArchive();
     TestLengthPrefixedValues();

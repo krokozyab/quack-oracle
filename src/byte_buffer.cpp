@@ -50,7 +50,10 @@ std::vector<uint8_t> ByteReader::ReadRaw(size_t count) {
 }
 
 void ByteReader::Skip(size_t count) {
-    (void)ReadRaw(count);
+    if (count > Remaining()) {
+        throw Truncated(count, Remaining());
+    }
+    position += count;
 }
 
 uint16_t ByteReader::ReadUInt16BE() {
