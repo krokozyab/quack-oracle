@@ -1470,21 +1470,31 @@ void RunAttachedDdl(optional_ptr<ClientContext> context, const shared_ptr<Oracle
     auto config = state->config;
     config.io_deadline = DdlDeadline(context, cleanup);
     if (cleanup) { config.connect_cancelled = nullptr; }
-    TranslatingOracleErrors("Oracle DDL failed", [&] {
-        auto session = oracle_scanner::OpenOracleSession(config, state->password);
-        session->ExecuteAdmin("ALTER SESSION SET DDL_LOCK_TIMEOUT=0");
-        // Some ALTER paths wait on TX even with DDL_LOCK_TIMEOUT=0. Check
-        // existing DML locks explicitly before Oracle's implicit DDL commit.
-        if (!lock_table.empty()) {
-            oracle_scanner::OracleCallRequest request;
-            request.kind = oracle_scanner::OracleCallableKind::ANONYMOUS_BLOCK;
-            request.block = "BEGIN EXECUTE IMMEDIATE " + OracleAttachedState::Literal(
-                "LOCK TABLE " + lock_table + " IN EXCLUSIVE MODE NOWAIT") + "; END;";
-            session->Call(request);
+    try {
+        TranslatingOracleErrors("Oracle DDL failed", [&] {
+            auto session = oracle_scanner::OpenOracleSession(config, state->password);
+            session->ExecuteAdmin("ALTER SESSION SET DDL_LOCK_TIMEOUT=0");
+            // Some ALTER paths wait on TX even with DDL_LOCK_TIMEOUT=0. Check
+            // existing DML locks explicitly before Oracle's implicit DDL commit.
+            if (!lock_table.empty()) {
+                oracle_scanner::OracleCallRequest request;
+                request.kind = oracle_scanner::OracleCallableKind::ANONYMOUS_BLOCK;
+                request.block = "BEGIN EXECUTE IMMEDIATE " + OracleAttachedState::Literal(
+                    "LOCK TABLE " + lock_table + " IN EXCLUSIVE MODE NOWAIT") + "; END;";
+                session->Call(request);
+            }
+            session->ExecuteAdmin(sql);
+            session->Close();
+        });
+    } catch (const std::exception &error) {
+        auto info = OracleErrorInfo(error);
+        const auto code = info.find("oracle_error_code");
+        if (code != info.end() && code->second == "54") {
+            throw IOException(info, "Oracle DDL is blocked by an active transaction, possibly this connection; "
+                                   "COMMIT or ROLLBACK that transaction before retrying");
         }
-        session->ExecuteAdmin(sql);
-        session->Close();
-    });
+        throw;
+    }
     state->InvalidateMetadata();
 }
 

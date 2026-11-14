@@ -2,6 +2,9 @@
 
 ## Fixes
 
+- DDL lock refusals explain that the caller may hold the lock and require
+  COMMIT or ROLLBACK, retaining Oracle error code 54.
+
 - CREATE compensation locks, verifies OBJECT_ID and drops in one server block,
   removing the gap between client sessions. Concurrent external DDL remains
   outside the compensation guarantee because Oracle DDL implicitly commits.

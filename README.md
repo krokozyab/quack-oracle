@@ -548,6 +548,8 @@ DROP TABLE o.ITEM_IDS;
 DDL does not commit the caller's INSERT/UPDATE/DELETE transaction, because it
 uses a different session. If that transaction holds a conflicting lock, DDL
 fails at a `LOCK TABLE … NOWAIT` preflight (`DDL_LOCK_TIMEOUT=0` is also set).
+The conflicting transaction may be this connection's own DML; COMMIT or ROLLBACK
+it before retrying.
 The preflight requires permission to lock the target table and does not prevent
 a new lock acquired concurrently after that check.
 

@@ -3682,6 +3682,17 @@ void TestAttachedDdlRefreshesAndCompensates() {
     CHECK(script->tables.at("RV_DDL").columns.size()==2);
     CHECK(script->calls.back().block.find("LOCK TABLE \"RV_DDL\" IN EXCLUSIVE MODE NOWAIT")!=std::string::npos);
     script->call_should_fail = false;
+    script->call_action = [](const OracleCallRequest &) {
+        throw oracle_scanner::ProtocolError(oracle_scanner::ProtocolErrorKind::INVALID_STATE,
+                                            "ORA-00054: resource busy", 54);
+    };
+    auto blocked = database.Query("ALTER TABLE o.RV_DDL ADD COLUMN X INTEGER;");
+    CHECK(blocked->HasError() && blocked->GetError().find("COMMIT or ROLLBACK") != std::string::npos);
+    CHECK(blocked->GetErrorObject().ExtraInfo().at("oracle_error_code") == "54");
+    script->call_action = [&](const OracleCallRequest &request) {
+        SimulateDdlCompensation(script, identities, request);
+    };
+
     database.Run("ALTER TABLE o.RV_DDL ADD COLUMN X INTEGER DEFAULT 7;");
     CHECK(database.Query("EXECUTE rv_read;")->ColumnCount()==3);
     database.Run("ALTER TABLE o.RV_DDL RENAME COLUMN X TO Y;");
