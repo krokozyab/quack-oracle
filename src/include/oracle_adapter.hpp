@@ -579,7 +579,7 @@ std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const 
                                                   const std::vector<column_t> &selected, idx_t sessions);
 
 unique_ptr<LogicalOperator> MakeOracleMergePlan(TableCatalogEntry &table, TableIndex table_index, OracleWriteTarget target,
-    std::string sql, std::vector<OracleColumn> columns, idx_t key_count, unique_ptr<LogicalOperator> source);
+    std::string sql, std::vector<OracleColumn> columns, idx_t key_count, std::vector<idx_t> key_groups, unique_ptr<LogicalOperator> source);
 
 PhysicalOperator &PlanOracleCreateAs(ClientContext &context, PhysicalPlanGenerator &planner,
     PhysicalOperator &source, vector<LogicalType> types, OracleWriteTarget target,

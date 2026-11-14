@@ -2,6 +2,9 @@
 
 ## Fixes
 
+- Attached MERGE rejects duplicate source keys after target-type conversion,
+  before issuing remote writes, including duplicates across source batches.
+
 - Updating an indexed column writes only explicitly assigned columns; unchanged
   values are not read back through potentially lossy mappings or rewritten.
 

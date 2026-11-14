@@ -1659,3 +1659,8 @@ DuckDB Labs.
 
 Oracle UPDATE sends only explicitly assigned columns, including when changing
 a key or using RETURNING. Oracle enforces constraints and maintains indexes.
+
+Attached MERGE validates the complete source before remote writes. Repeated
+conflict keys after conversion to target types are rejected, including across
+input batches. Source rows are buffered with DuckDB's buffer manager; the
+validation key sets also require memory proportional to distinct source keys.

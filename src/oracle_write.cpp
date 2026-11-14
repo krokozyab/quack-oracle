@@ -1079,6 +1079,8 @@ class OracleInsertGlobalState final : public GlobalSinkState {
 public:
     uint64_t inserted_rows = 0;
     bool skip = false;
+    unique_ptr<ColumnDataCollection> merge_source;
+    std::vector<std::unordered_set<std::string>> merge_keys_seen;
     // Filled only for RETURNING: the table rows as Oracle made them, which is
     // the whole point — a DEFAULT, a sequence or a trigger is exactly what the
     // caller could not have known before the insert.
@@ -1098,10 +1100,10 @@ class OracleInsertOperator final : public PhysicalOperator {
 public:
     OracleInsertOperator(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
                          OracleWriteTarget target_p, std::string sql_p, std::vector<idx_t> source_indexes_p,
-                         std::vector<OracleColumn> bound_columns_p, std::vector<OracleColumn> returned_columns_p, idx_t merge_keys_p = 0, std::function<bool(ClientContext &)> create_p = nullptr)
+                         std::vector<OracleColumn> bound_columns_p, std::vector<OracleColumn> returned_columns_p, idx_t merge_keys_p = 0, std::function<bool(ClientContext &)> create_p = nullptr, std::vector<idx_t> key_groups_p = {})
         : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
           target(std::move(target_p)), sql(std::move(sql_p)), source_indexes(std::move(source_indexes_p)),
-          bound_columns(std::move(bound_columns_p)), returned_columns(std::move(returned_columns_p)), merge_keys(merge_keys_p), create(std::move(create_p)) {
+          bound_columns(std::move(bound_columns_p)), returned_columns(std::move(returned_columns_p)), merge_keys(merge_keys_p), create(std::move(create_p)), key_groups(std::move(key_groups_p)) {
     }
 
     string GetName() const override {
@@ -1119,6 +1121,10 @@ public:
     unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override {
         auto state = make_uniq<OracleInsertGlobalState>();
         state->skip = create && !create(context);
+        if (merge_keys) {
+            state->merge_source = make_uniq<ColumnDataCollection>(context, children[0].get().GetTypes());
+            state->merge_keys_seen.resize(key_groups.size());
+        }
         if (!returned_columns.empty()) {
             state->returned = make_uniq<ColumnDataCollection>(context, types);
         }
@@ -1140,12 +1146,29 @@ public:
         }
         std::vector<std::vector<OracleBind>> rows;
         AppendChunkBinds(chunk, source_indexes, bound_columns, rows);
-        for (const auto &row : rows) {
-            for (idx_t key = 0; key < merge_keys; key++) {
-                if (!row[key].value) {
-                    throw NotImplementedException("Oracle attached MERGE/upsert requires non-NULL source conflict keys; use oracle_execute with Oracle MERGE SQL for NULL keys");
+        if (merge_keys) {
+            for (const auto &row : rows) {
+                idx_t offset = 0;
+                for (idx_t group = 0; group < key_groups.size(); group++) {
+                    std::string key;
+                    for (idx_t i = 0; i < key_groups[group]; i++, offset++) {
+                        const auto &value = row[offset].value;
+                        if (!value) {
+                            throw NotImplementedException("Oracle attached MERGE/upsert requires non-NULL source conflict keys; use oracle_execute with Oracle MERGE SQL for NULL keys");
+                        }
+                        // Length framing separates composite keys; bytes are
+                        // encoded after the source was cast to the target type.
+                        const uint64_t length = value->size();
+                        key.append(reinterpret_cast<const char *>(&length), sizeof(length));
+                        key.append(value->begin(), value->end());
+                    }
+                    if (!global_state.merge_keys_seen[group].insert(std::move(key)).second) {
+                        throw ConstraintException("Oracle attached MERGE source has a duplicate key after conversion to the target type");
+                    }
                 }
             }
+            global_state.merge_source->Append(chunk);
+            return SinkResultType::NEED_MORE_INPUT;
         }
         // A failed write leaves this session in a state we cannot classify from
         // here: an ORA- error and a transport failure reach the adapter as the
@@ -1160,6 +1183,38 @@ public:
             throw;
         }
         return SinkResultType::NEED_MORE_INPUT;
+    }
+
+    SinkFinalizeType Finalize(Pipeline &, Event &, ClientContext &context,
+                              OperatorSinkFinalizeInput &input) const override {
+        auto &state = input.global_state.Cast<OracleInsertGlobalState>();
+        if (!state.merge_source) {
+            return SinkFinalizeType::READY;
+        }
+        // Validate the entire source before any remote write, including keys
+        // repeated in different input chunks. The source uses DuckDB buffers.
+        ColumnDataScanState scan;
+        state.merge_source->InitializeScan(scan);
+        DataChunk chunk;
+        chunk.Initialize(Allocator::DefaultAllocator(), state.merge_source->Types());
+        while (true) {
+            state.merge_source->Scan(scan, chunk);
+            if (chunk.size() == 0) {
+                break;
+            }
+            std::vector<std::vector<OracleBind>> rows;
+            AppendChunkBinds(chunk, source_indexes, bound_columns, rows);
+            try {
+                auto &session = TransactionSession(context, target);
+                state.inserted_rows += TranslatingOracleErrors("Oracle could not merge", [&] {
+                    return session.ExecuteBatch(sql, rows);
+                });
+            } catch (...) {
+                PoisonTransactionSession(context, target.catalog_name);
+                throw;
+            }
+        }
+        return SinkFinalizeType::READY;
     }
 
     SourceResultType GetDataInternal(ExecutionContext &, DataChunk &chunk, OperatorSourceInput &input) const override {
@@ -1245,6 +1300,7 @@ private:
     std::vector<OracleColumn> returned_columns;
     idx_t merge_keys = 0;
     std::function<bool(ClientContext &)> create;
+    std::vector<idx_t> key_groups;
 };
 
 // UPDATE and DELETE share everything but how a row's binds are built: both send
@@ -1471,8 +1527,8 @@ namespace {
 class OracleMergePlan final : public LogicalExtensionOperator {
 public:
     OracleMergePlan(TableCatalogEntry &table_p, TableIndex index, OracleWriteTarget target_p, std::string sql_p,
-                    std::vector<OracleColumn> columns_p, idx_t key_count_p, unique_ptr<LogicalOperator> source)
-        : table(table_p), index(index), target(std::move(target_p)), sql(std::move(sql_p)), columns(std::move(columns_p)), key_count(key_count_p) {
+                    std::vector<OracleColumn> columns_p, idx_t key_count_p, std::vector<idx_t> key_groups_p, unique_ptr<LogicalOperator> source)
+        : table(table_p), index(index), target(std::move(target_p)), sql(std::move(sql_p)), columns(std::move(columns_p)), key_count(key_count_p), key_groups(std::move(key_groups_p)) {
         children.push_back(std::move(source));
     }
     vector<ColumnBinding> GetColumnBindings() override {
@@ -1487,7 +1543,7 @@ public:
         std::vector<idx_t> indexes;
         for (idx_t i = 0; i < columns.size(); i++) { indexes.push_back(i); }
         auto &sink = planner.Make<OracleInsertOperator>(types, estimated_cardinality, target, sql,
-            std::move(indexes), columns, std::vector<OracleColumn>(), key_count);
+            std::move(indexes), columns, std::vector<OracleColumn>(), key_count, nullptr, key_groups);
         sink.children.push_back(source);
         return sink;
     }
@@ -1498,12 +1554,13 @@ private:
     std::string sql;
     std::vector<OracleColumn> columns;
     idx_t key_count;
+    std::vector<idx_t> key_groups;
 };
 }
 
 unique_ptr<LogicalOperator> MakeOracleMergePlan(TableCatalogEntry &table, TableIndex table_index, OracleWriteTarget target,
-    std::string sql, std::vector<OracleColumn> columns, idx_t key_count, unique_ptr<LogicalOperator> source) {
-    return make_uniq<OracleMergePlan>(table, table_index, std::move(target), std::move(sql), std::move(columns), key_count, std::move(source));
+    std::string sql, std::vector<OracleColumn> columns, idx_t key_count, std::vector<idx_t> key_groups, unique_ptr<LogicalOperator> source) {
+    return make_uniq<OracleMergePlan>(table, table_index, std::move(target), std::move(sql), std::move(columns), key_count, std::move(key_groups), std::move(source));
 }
 
 PhysicalOperator &PlanOracleCreateAs(ClientContext &context, PhysicalPlanGenerator &planner,

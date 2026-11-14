@@ -827,6 +827,8 @@ void RewriteOracleMerges(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
         on += std::string(on.empty() ? "" : " OR ") + "(" + equal + ")";
     }
     const auto key_count = values.size();
+    std::vector<idx_t> key_groups;
+    for (const auto &branch : branches) { key_groups.push_back(branch.size()); }
     std::function<bool(const Expression &, LogicalOperator &)> is_default;
     is_default = [&](const Expression &expression, LogicalOperator &node) {
         const Expression *part = &expression;
@@ -883,7 +885,7 @@ void RewriteOracleMerges(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
     sql += " WHEN NOT MATCHED THEN INSERT (" + insert_columns + ") VALUES (" + insert_values + ")";
     auto projected = make_uniq<LogicalProjection>(input.optimizer.binder.GenerateTableIndex(), std::move(values));
     projected->children.push_back(std::move(source));
-    plan = MakeOracleMergePlan(merge.table, merge.table_index, std::move(target), std::move(sql), std::move(columns), key_count, std::move(projected));
+    plan = MakeOracleMergePlan(merge.table, merge.table_index, std::move(target), std::move(sql), std::move(columns), key_count, std::move(key_groups), std::move(projected));
 }
 
 // DuckDB 2.0 expands DISTINCT aggregates before the post-optimizer hook.

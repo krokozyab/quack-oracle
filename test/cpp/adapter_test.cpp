@@ -3766,6 +3766,22 @@ void TestAttachedUpsertsUseOracleMerge() {
         CHECK(script->counted_executes.size() == writes);
         CHECK(!database.Query("SELECT 42;")->HasError());
     }
+    for (const auto *source : {
+            "(VALUES (70,'a'),(70,'b'))",
+            "(VALUES ('1','a'),('01','b'))",
+            "(SELECT (i%4096)::BIGINT, 'v' FROM range(4097) r(i))"}) {
+        const auto writes = script->counted_executes.size();
+        auto duplicate = database.Query(std::string("MERGE INTO ora.main.ITEMS t USING ") + source +
+            " s(ID,LABEL) ON t.ID=s.ID WHEN MATCHED THEN UPDATE SET LABEL=s.LABEL "
+            "WHEN NOT MATCHED THEN INSERT(ID,LABEL) VALUES(s.ID,s.LABEL);");
+        CHECK(duplicate->HasError());
+        CHECK(duplicate->GetError().find("duplicate key") != std::string::npos);
+        CHECK(script->counted_executes.size() == writes);
+    }
+    database.Run("MERGE INTO ora.main.ITEMS t USING (VALUES (70,'a'),(71,'a')) s(ID,LABEL) "
+                 "ON t.ID=s.ID WHEN NOT MATCHED THEN INSERT(ID,LABEL) VALUES(s.ID,s.LABEL);");
+    database.Run("INSERT INTO ora.main.ITEMS VALUES (70,'a'),(70,'b') ON CONFLICT DO NOTHING;");
+
     database.Run("INSERT INTO ora.main.ITEMS(ID) VALUES (10) ON CONFLICT DO NOTHING;");
     CHECK(script->counted_executes.back().find("INSERT (\"ID\")") != std::string::npos);
     database.Run("INSERT INTO ora.main.ITEMS VALUES (11,NULL) ON CONFLICT DO NOTHING;");
