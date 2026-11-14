@@ -2,6 +2,8 @@
 
 ## Fixes
 
+- oracle_top_n_pushdown=false also disables unordered LIMIT pushdown.
+
 - Schema discovery truncates at 4,096 owners instead of failing ATTACH. Explicit
   SCHEMA skips discovery; missing named owners are cached until reattachment.
 

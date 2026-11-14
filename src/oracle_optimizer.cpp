@@ -138,7 +138,12 @@ void PushTopN(ClientContext &context, LogicalTopN &top) {
 }
 
 // Keep LIMIT in DuckDB as well: Oracle only bounds how many rows cross the wire.
-void PushLimit(LogicalLimit &limit) {
+void PushLimit(ClientContext &context, LogicalLimit &limit) {
+    Value enabled;
+    if (context.TryGetCurrentSetting("oracle_top_n_pushdown", enabled) && !enabled.IsNull() &&
+        !BooleanValue::Get(enabled)) {
+        return;
+    }
     if (limit.limit_val.Type() != LimitNodeType::CONSTANT_VALUE ||
         (limit.offset_val.Type() != LimitNodeType::UNSET && limit.offset_val.Type() != LimitNodeType::CONSTANT_VALUE)) {
         return;
@@ -655,7 +660,7 @@ void Walk(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &op, Colum
           bool aggregates, bool joins) {
 	auto &context = input.context;
 	if (op->type == LogicalOperatorType::LOGICAL_LIMIT) {
-        PushLimit(op->Cast<LogicalLimit>());
+        PushLimit(context, op->Cast<LogicalLimit>());
     }
 	if (op->type == LogicalOperatorType::LOGICAL_TOP_N) {
 		PushTopN(context, op->Cast<LogicalTopN>());

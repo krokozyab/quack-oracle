@@ -3067,6 +3067,10 @@ void TestJoinKeysReachOracle() {
     }
     CHECK(!database.Query("SELECT ID FROM o.main.FACTS LIMIT 5;")->HasError());
     CHECK(script->queries.back().find("FETCH FIRST 5 ROWS ONLY") != std::string::npos);
+    database.Run("SET oracle_top_n_pushdown=false;");
+    CHECK(!database.Query("SELECT ID FROM o.main.FACTS LIMIT 5;")->HasError());
+    CHECK(script->queries.back().find("FETCH FIRST") == std::string::npos);
+    database.Run("SET oracle_top_n_pushdown=true;");
     CHECK(!database.Query("SELECT ID FROM o.main.FACTS TABLESAMPLE SYSTEM (10%) LIMIT 5;")->HasError());
     CHECK(script->queries.back().find("FETCH FIRST") == std::string::npos);
     CHECK(!database.Query("SELECT ID FROM o.main.FACTS LIMIT 5 OFFSET 2;")->HasError());
