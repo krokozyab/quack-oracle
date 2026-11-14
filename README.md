@@ -645,12 +645,22 @@ without it on 19c and 23ai.
 `SELECT region, count(*), sum(amount), max(day) FROM o.SALES WHERE … GROUP BY region`
 is computed by Oracle (`SELECT "REGION", CAST(COUNT(*) …), …, MAX("DAY") FROM "SALES" WHERE … GROUP BY "REGION"`),
 so the groups travel, not the rows. Covered: `count(*)`, `count(col)`, `sum`, `min`, `max`, with
-or without `GROUP BY`, without `DISTINCT`, `FILTER`, `ORDER BY` or `GROUPING SETS`. `sum` is
+or without `GROUP BY`, without `FILTER`, `ORDER BY` or `GROUPING SETS`.
+`count(DISTINCT col)` is also computed entirely by Oracle for exact numbers,
+BINARY_FLOAT/BINARY_DOUBLE, DATE/TIMESTAMP without a time zone, and `VARCHAR2`
+columns with byte comparisons (`compared_as_bytes`). It returns BIGINT, ignores
+NULL, and returns zero for empty or all-NULL input. Floating-point DISTINCT uses
+equality, including NaN and signed zero; it does not perform floating-point sums.
+DuckDB 2.0 expands DISTINCT aggregates before the usual extension optimizer hook,
+so eligible counts are rewritten in a pre-optimizer pass using DuckDB's filter
+pushdown. CHAR, national/linguistically compared text, LOBs, expressions instead of
+columns and NUMBER mappings that round on read retain local DISTINCT counting.
+Other DISTINCT aggregates remain in DuckDB. `sum` is
 pushed for exact numbers only (integers arrive as text and are read as `HUGEINT`, fixed-scale
 decimals as `DECIMAL(38,s)`, the types DuckDB itself returns); `min`, `max` and group keys for
 numbers, dates and timestamps, and group keys also for `VARCHAR2` columns Oracle compares by
 bytes (grouping needs only equality; see the filters above). Other text keys, `min`/`max` of text,
-`avg`, and floating point are left to DuckDB (Oracle may compare text by a collation or
+`avg`, and floating-point aggregates other than COUNT DISTINCT are left to DuckDB (Oracle may compare text by a collation or
 blank-padding and orders it by `NLS_SORT`, and the order of addition changes a floating-point sum). Every filter must have gone to Oracle too, and the scan
 must have no sample and no join filter coming later; otherwise the plan is unchanged.
 `SET oracle_aggregate_pushdown = false` turns it off. 60 random aggregate queries (up to two
@@ -1318,7 +1328,7 @@ the `k` from a subset.
 | `oracle_unconstrained_number` | `'varchar'` | What a `NUMBER` with no declared precision becomes: `'varchar'`, `'double'` or `'decimal(38,9)'`-style. Set it before the query or the table's first use. See [section 9](#9-which-oracle-types-work). |
 | `oracle_filter_pushdown` | `true` | Send `WHERE` clauses on attached tables to Oracle, and narrow JSON path tests. See [Pushing filters down](#pushing-filters-down-to-oracle). |
 | `oracle_top_n_pushdown` | `true` | Let Oracle rank and cut an `ORDER BY … LIMIT` over a number, date or timestamp key. See [Top-N](#top-n). |
-| `oracle_aggregate_pushdown` | `true` | Let Oracle compute `count`, `sum`, `min`, `max` and `GROUP BY` over number, date and timestamp keys. See [Aggregates](#aggregates). |
+| `oracle_aggregate_pushdown` | `true` | Let Oracle compute `count` (including eligible `DISTINCT`), `sum`, `min`, `max` and `GROUP BY` over number, date and timestamp keys. See [Aggregates](#aggregates). |
 | `oracle_join_pushdown` | `true` | Let Oracle join two attached tables of one database (an inner join on number, date or timestamp columns). See [Joining two attached tables](#joining-two-attached-tables). |
 | `oracle_deferred_columns` | `true` | Read LOB, JSON, VECTOR and XML columns only for the rows that pass a filter DuckDB applies itself. See [Heavy columns after the filter](#heavy-columns-after-the-filter). |
 | `oracle_parallel_scan` | `-1` | How many sessions one scan of an attached table may read through at once: `-1` chooses (DuckDB's thread count, up to 8, for a table of 500,000 rows or more), `0` or `1` is one session. See [section 7](#7-read-a-big-table-faster). |

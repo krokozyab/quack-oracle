@@ -1,4 +1,4 @@
-// Plan rewrites for an attached Oracle table, run after DuckDB's own optimizers.
+// Plan rewrites for an attached Oracle table, before and after DuckDB optimizers.
 //
 // Top-N. `SELECT ... FROM o.T ORDER BY k LIMIT n` plans as a TOP_N over the
 // scan, and the scan reads the whole table. When every sort key is a column the
@@ -29,6 +29,7 @@
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/optimizer/filter_pushdown.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -166,7 +167,7 @@ void PushLimit(LogicalLimit &limit) {
 // and not the rows.
 //
 // What counts as "exactly as DuckDB does" is narrow on purpose:
-//  - COUNT(*), COUNT(column), SUM, MIN and MAX of a column, not DISTINCT, with no
+//  - COUNT(*), COUNT(column), COUNT(DISTINCT column), SUM, MIN and MAX, with no
 //    FILTER or ORDER BY; no GROUPING SETS or GROUPING();
 //  - SUM only of an exact number (integer or fixed-scale decimal), whose result
 //    type matches DuckDB's; MIN and MAX only of numbers, dates and timestamps,
@@ -175,7 +176,7 @@ void PushLimit(LogicalLimit &limit) {
 //    Other text is left out: Oracle may compare it by a collation (NLS_COMP, a
 //    column's COLLATE, blank-padded CHAR) where DuckDB compares bytes, and text
 //    order follows NLS_SORT; floating point is left out because the order of
-//    addition changes the result;
+//    addition changes the result (COUNT DISTINCT needs only equality);
 //  - every filter was translated into the WHERE clause, none is left for DuckDB
 //    to apply to the rows (it would then see groups instead of rows), and the
 //    scan has no sample and no filter a join will add later.
@@ -272,10 +273,13 @@ bool PlanPushedAggregate(ClientContext &context, LogicalAggregate &aggregate, Lo
 			return false;
 		}
 		const auto &call = expression->Cast<BoundAggregateExpression>();
-		if (call.IsDistinct() || call.GetFilter() || call.GetOrderBys() || call.GetChildren().size() > 1) {
+		if (call.GetFilter() || call.GetOrderBys() || call.GetChildren().size() > 1) {
 			return false;
 		}
 		const auto name = StringUtil::Lower(call.Function().GetName().GetIdentifierName());
+		if (call.IsDistinct() && name != "count") {
+			return false;
+		}
 		const auto &wanted = call.GetReturnType();
 		OracleColumn count_column;
 		count_column.oracle_type = 2;
@@ -293,7 +297,19 @@ bool PlanPushedAggregate(ClientContext &context, LogicalAggregate &aggregate, Lo
 		const auto &source = bind.columns[column];
 		const auto type = MappedType(source);
 		if (name == "count" && wanted == LogicalType::BIGINT) {
-			add("CAST(COUNT(" + Quoted(source) + ") AS NUMBER(18,0))", count_column, LogicalType::BIGINT, wanted);
+			if (call.IsDistinct()) {
+				const bool text_key = type.id() == LogicalTypeId::VARCHAR && source.oracle_type == 1 &&
+				                      source.character_set_form != 2 && !source.xml && source.compared_as_bytes;
+				// DISTINCT needs equality, not an ordering or floating-point addition.
+				// NUMBER rounded by a read mapping can merge distinct stored values.
+				const bool numeric_or_date = KeyType(type) || type.id() == LogicalTypeId::FLOAT ||
+				                             type.id() == LogicalTypeId::DOUBLE;
+				if ((!numeric_or_date && !text_key) || OracleColumnRoundsOnRead(source)) {
+					return false;
+				}
+			}
+			add("CAST(COUNT(" + std::string(call.IsDistinct() ? "DISTINCT " : "") + Quoted(source) +
+			    ") AS NUMBER(18,0))", count_column, LogicalType::BIGINT, wanted);
 		} else if ((name == "min" || name == "max") && KeyType(type) && wanted == type) {
 			add(name == "min" ? "MIN(" + Quoted(source) + ")" : "MAX(" + Quoted(source) + ")", source, type, type);
 		} else if (name == "sum" && source.oracle_type == 2 && source.precision >= 1 && source.scale >= 0 &&
@@ -372,6 +388,8 @@ void PushAggregate(ClientContext &context, unique_ptr<LogicalOperator> &op, Colu
 	function.cardinality = nullptr;
 	function.statistics = nullptr;
 	function.get_table_entry = nullptr;
+	function.get_bind_info = nullptr;
+	function.pushdown_expression = nullptr;
 	const auto get_index = get.table_index;
 	auto scan = make_uniq<LogicalGet>(get_index, std::move(function), std::move(scan_bind), pushed.types, names);
 	vector<ColumnIndex> ids;
@@ -868,6 +886,43 @@ void RewriteOracleMerges(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
     plan = MakeOracleMergePlan(merge.table, merge.table_index, std::move(target), std::move(sql), std::move(columns), key_count, std::move(projected));
 }
 
+// DuckDB 2.0 expands DISTINCT aggregates before the post-optimizer hook.
+// Resolve eligible original COUNTs first, using DuckDB's own filter pushdown
+// so every remaining local filter still prevents the aggregate rewrite.
+void PushDistinctCounts(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &op, ColumnBindingReplacer &replacer) {
+    for (auto &child : op->children) { PushDistinctCounts(input, child, replacer); }
+    if (op->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) { return; }
+    auto &aggregate = op->Cast<LogicalAggregate>();
+    bool distinct_count = false;
+    for (const auto &expression : aggregate.expressions) {
+        if (expression->GetExpressionClass() == ExpressionClass::BOUND_AGGREGATE) {
+            const auto &call = expression->Cast<BoundAggregateExpression>();
+            distinct_count |= call.IsDistinct() && StringUtil::CIEquals(call.Function().GetName().GetIdentifierName(), "count");
+        }
+    }
+    if (!distinct_count) { return; }
+    auto *node = aggregate.children[0].get();
+    while (node->type == LogicalOperatorType::LOGICAL_PROJECTION || node->type == LogicalOperatorType::LOGICAL_FILTER) {
+        node = node->children[0].get();
+    }
+    if (node->type != LogicalOperatorType::LOGICAL_GET) { return; }
+    auto &get = node->Cast<LogicalGet>();
+    const auto *bind = get.bind_data ? dynamic_cast<const OracleQueryBindData *>(get.bind_data.get()) : nullptr;
+    if (!bind || !bind->deferred_scan) { return; }
+    FilterPushdown pushdown(input.optimizer);
+    aggregate.children[0] = pushdown.Rewrite(std::move(aggregate.children[0]));
+    PushAggregate(input.context, op, replacer);
+}
+
+void PreOptimizeOraclePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+    RewriteOracleMerges(input, plan);
+    Value enabled;
+    if (input.context.TryGetCurrentSetting("oracle_aggregate_pushdown", enabled) && !enabled.IsNull() && !BooleanValue::Get(enabled)) { return; }
+    ColumnBindingReplacer replacer;
+    PushDistinctCounts(input, plan, replacer);
+    if (!replacer.replacement_bindings.empty()) { replacer.VisitOperator(*plan); }
+}
+
 void OptimizeOraclePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
 	if (!plan) {
 		return;
@@ -889,7 +944,7 @@ void OptimizeOraclePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperat
 void RegisterOracleOptimizer(DatabaseInstance &db) {
 	OptimizerExtension extension;
 	extension.optimize_function = OptimizeOraclePlan;
-    extension.pre_optimize_function = RewriteOracleMerges;
+    extension.pre_optimize_function = PreOptimizeOraclePlan;
 	OptimizerExtension::Register(DBConfig::GetConfig(db), std::move(extension));
 	DBConfig::GetConfig(db).AddExtensionOption(
 	    "oracle_top_n_pushdown",
@@ -898,7 +953,7 @@ void RegisterOracleOptimizer(DatabaseInstance &db) {
 	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	DBConfig::GetConfig(db).AddExtensionOption(
 	    "oracle_aggregate_pushdown",
-	    "Let Oracle compute COUNT, SUM, MIN, MAX and GROUP BY over an attached table (numbers, dates and timestamps) "
+	    "Let Oracle compute COUNT (including eligible DISTINCT), SUM, MIN, MAX and GROUP BY over an attached table "
 	    "so the groups travel and not the rows.",
 	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	DBConfig::GetConfig(db).AddExtensionOption(

@@ -30,6 +30,12 @@
 
 ## Additions
 
+- Eligible COUNT(DISTINCT column) is computed entirely in Oracle and returns
+  BIGINT. Supports exact numbers, BINARY_FLOAT/DOUBLE, DATE/TIMESTAMP without a
+  time zone and VARCHAR2 compared as bytes. NULL and empty-input semantics match
+  DuckDB. Rounded NUMBER mappings, unsafe text, local filters, samples, aggregate
+  FILTER/ORDER BY and expressions keep local execution. AVG remains local.
+
 - MERGE is accepted as DML by the raw execution APIs, with Oracle affected-row counts
   and the same transaction ownership as INSERT, UPDATE and DELETE.
 

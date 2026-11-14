@@ -3033,6 +3033,104 @@ void TestTextComparesByTheSessionCollation() {
     std::cout << "text equality and grouping go to Oracle only where it compares by bytes" << std::endl;
 }
 
+// DISTINCT counts need the equality of decoded values to match Oracle.
+void TestDistinctCountPushesOnlyEquivalentEquality() {
+    for (const auto *comparison : {"BINARY", "LINGUISTIC"}) {
+        auto script = std::make_shared<FakeScript>();
+        script->routes.push_back({"SELECT USER FROM DUAL", {{Column("USER",1)}, {{Text("APP")}}}});
+        script->routes.push_back({"nls_session_parameters", {{Column("VALUE",1)}, {{Text(comparison)}}}});
+        script->routes.push_back({"collation IS NOT NULL", {{Column("TABLE_NAME",1),Column("COLUMN_NAME",1),Column("COLLATION",1)},
+            {{Text("DCOUNT"),Text("CODE"),Text("BINARY_CI")}}}});
+        script->routes.push_back({"FROM user_tables", {{Column("TABLE_NAME",1)}, {{Text("DCOUNT")}}}});
+        script->routes.push_back({"FROM user_views", {{Column("VIEW_NAME",1)}, {}}});
+        const std::vector<std::pair<OracleColumn,std::string>> definitions = {
+            {Column("G",2,10,0),"NUMBER"}, {Column("N",2,25,0),"NUMBER"},
+            {Column("V",1),"VARCHAR2"}, {Column("CODE",1),"VARCHAR2"}, {Column("CH",96),"CHAR"},
+            {Column("D",12),"DATE"}, {Column("T",180,0,9),"TIMESTAMP(9)"},
+            {Column("F",100),"BINARY_FLOAT"}, {Column("B",101),"BINARY_DOUBLE"},
+            {Column("NAT",1),"NVARCHAR2"}, {Column("RAWCOL",23),"RAW"}};
+        FakeResponse dictionary {{Column("TABLE_NAME",1),Column("COLUMN_NAME",1),Column("DATA_TYPE",1),
+            Column("DATA_LENGTH",2),Column("DATA_PRECISION",2),Column("DATA_SCALE",2),Column("NULLABLE",1)}, {}};
+        FakeTable table;
+        for (const auto &definition : definitions) {
+            const auto &column = definition.first;
+            table.columns.push_back(column);
+            dictionary.rows.push_back({Text("DCOUNT"),Text(column.name),Text(definition.second),Number("40"),
+                column.precision ? Number(std::to_string(column.precision)) : WireValue(),
+                Number(std::to_string(column.scale)),Text("Y")});
+        }
+        oracle_scanner::OracleDateTime first {2026,1,1,0,0,0,123456789};
+        auto second = first; second.day = 2;
+        const auto nan = std::numeric_limits<double>::quiet_NaN();
+        WireRow row = {Number("1"),Number("1234567890123456789012345"),Text("a"),Text("a"),Text("a   "),
+            oracle_scanner::EncodeOracleDate(first),oracle_scanner::EncodeOracleTimestamp(first,false),
+            oracle_scanner::EncodeOracleBinaryFloat(static_cast<float>(nan)),oracle_scanner::EncodeOracleBinaryDouble(nan),
+            oracle_scanner::EncodeUtf8ToUtf16Be("a"),Text("a")};
+        table.rows = {row,row};
+        row = {Number("1"),Number("-1"),Text("A"),Text("A"),Text("A   "),
+            oracle_scanner::EncodeOracleDate(second),oracle_scanner::EncodeOracleTimestamp(second,false),
+            oracle_scanner::EncodeOracleBinaryFloat(0),oracle_scanner::EncodeOracleBinaryDouble(0),
+            oracle_scanner::EncodeUtf8ToUtf16Be("A"),Text("A")};
+        table.rows.push_back(row);
+        table.rows.push_back(WireRow(definitions.size())); table.rows.back()[0]=Number("2");
+        script->tables["DCOUNT"] = table;
+        script->routes.push_back({"FROM user_tab_columns",std::move(dictionary)});
+        script->routes.push_back({"FROM user_constraints", {{Column("TABLE_NAME",1),Column("COLUMN_NAME",1)}, {}}});
+        script->routes.push_back({"SELECT \"G\" \"C0\" FROM \"DCOUNT\" GROUP BY \"G\"", {{Column("C0",2,10,0)}, {{Number("1")},{Number("2")}}}});
+        script->routes.push_back({"COUNT(DISTINCT", {{Column("C0",2,18,0)}, {{Number("2")}}}});
+        auto factory = InstallFake(script);
+        TestDatabase database;
+        database.Run("ATTACH 'ora' AS o(TYPE oracle_scanner);");
+        database.Run("SET oracle_aggregate_pushdown=true;");
+        for (const auto *column : {"G","N","D","T","F","B","V","CODE","CH","NAT","RAWCOL"}) {
+            auto result = database.Query(std::string("SELECT count(DISTINCT ")+column+") FROM o.DCOUNT;");
+            CHECK(!result->HasError() && result->GetValue(0,0).ToString()=="2");
+            CHECK(result->GetValue(0,0).type()==duckdb::LogicalType::BIGINT);
+            const bool text = std::string(column)=="V";
+            const bool unsafe = std::string(column)=="CODE" || std::string(column)=="CH" ||
+                std::string(column)=="NAT" || std::string(column)=="RAWCOL" ||
+                (text && std::string(comparison)!="BINARY");
+            CHECK((script->queries.back().find("COUNT(DISTINCT")!=std::string::npos)==!unsafe);
+        }
+        for (const auto *sql : {
+            "SELECT count(DISTINCT N) FILTER (WHERE G=1) FROM o.DCOUNT;",
+            "SELECT count(DISTINCT N) FROM o.DCOUNT WHERE abs(N)>1;",
+            "SELECT count(DISTINCT N) FROM o.DCOUNT WHERE CODE='a';",
+            "SELECT count(DISTINCT N+1) FROM o.DCOUNT;",
+            "SELECT sum(DISTINCT G) FROM o.DCOUNT;",
+            "SELECT count(DISTINCT N) FROM o.DCOUNT TABLESAMPLE SYSTEM (10%) REPEATABLE (1);"}) {
+            auto checked = database.Query(sql);
+            if (checked->HasError()) { std::cerr << sql << "\n" << checked->GetError() << "\n" << script->queries.back() << std::endl; }
+            CHECK(!checked->HasError());
+            CHECK(script->queries.back().find("COUNT(DISTINCT")==std::string::npos);
+        }
+        auto filtered = database.Query("SELECT count(DISTINCT N) FROM o.DCOUNT WHERE G=1;");
+        CHECK(!filtered->HasError() && filtered->GetValue(0,0).ToString()=="2");
+        CHECK(script->queries.back().find("COUNT(DISTINCT \"N\")")!=std::string::npos);
+        CHECK(script->queries.back().find("WHERE \"G\" = 1")!=std::string::npos);
+        script->routes.insert(script->routes.begin(), {"GROUP BY \"G\"", {{Column("C0",2,10,0),Column("C1",2,18,0)},
+            {{Number("1"),Number("2")},{Number("2"),Number("0")}}}});
+        auto grouped = database.Query("SELECT G,count(DISTINCT N) FROM o.DCOUNT GROUP BY G ORDER BY G;");
+        CHECK(!grouped->HasError() && grouped->RowCount()==2 && grouped->GetValue(1,1).ToString()=="0");
+        CHECK(script->queries.back().find("COUNT(DISTINCT \"N\")")!=std::string::npos);
+        database.Run("SET oracle_aggregate_pushdown=false;");
+        auto local = database.Query("SELECT count(DISTINCT N) FROM o.DCOUNT;");
+        CHECK(!local->HasError() && local->GetValue(0,0).ToString()=="2");
+        CHECK(script->queries.back().find("COUNT(DISTINCT")==std::string::npos);
+        database.Run("SET oracle_aggregate_pushdown=true;");
+        script->routes.erase(script->routes.begin());
+        script->routes.back().second.rows = {{Number("0")}};
+        script->tables["DCOUNT"].rows = {WireRow(definitions.size())};
+        auto nulls = database.Query("SELECT count(DISTINCT N) FROM o.DCOUNT;");
+        CHECK(!nulls->HasError() && nulls->GetValue(0,0).ToString()=="0");
+        CHECK(script->queries.back().find("COUNT(DISTINCT \"N\")")!=std::string::npos);
+        script->tables["DCOUNT"].rows.clear();
+        auto empty = database.Query("SELECT count(DISTINCT N) FROM o.DCOUNT;");
+        CHECK(!empty->HasError() && empty->GetValue(0,0).ToString()=="0");
+    }
+    std::cout << "distinct COUNT uses Oracle only for equivalent column equality" << std::endl;
+}
+
 // With oracle_parallel_scan a big table is read as ROWID ranges cut at extent
 // boundaries, all at one SCN, and every ROWID belongs to exactly one range.
 void TestAttachedScanReadsInRowidRanges() {
@@ -4129,6 +4227,10 @@ void TestRoundedNumberIsComparedInDuckDb() {
     CHECK(!grouped->HasError() && grouped->RowCount() == 2);
     CHECK(grouped->GetValue(0, 0).ToString() == "1.2" && grouped->GetValue(1, 0).ToString() == "2");
     CHECK(script->queries.back().find("GROUP BY") == std::string::npos);
+
+    auto distinct = database.Query("SELECT count(DISTINCT X) FROM o.main.R;");
+    CHECK(!distinct->HasError() && distinct->GetValue(0,0).ToString()=="2");
+    CHECK(script->queries.back().find("COUNT(DISTINCT")==std::string::npos);
 
     auto filtered = database.Query("SELECT count(*) FROM o.main.R WHERE X > 1.2;");
     CHECK(!filtered->HasError() && filtered->GetValue(0, 0).ToString() == "1");
@@ -5346,6 +5448,7 @@ int main() {
     TestHeavyColumnsAreReadAfterTheFilter();
     TestAttachedScanReadsInRowidRanges();
     TestTextComparesByTheSessionCollation();
+    TestDistinctCountPushesOnlyEquivalentEquality();
     TestSelectiveFiltersReadThroughOneSession();
     TestCallableArgumentsOfTheNewTypes();
     TestVectorSearchArguments();
