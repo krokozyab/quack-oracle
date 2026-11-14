@@ -3601,6 +3601,7 @@ void TestAttachedDdlRefreshesAndCompensates() {
     std::map<std::string, std::string> identities;
     int next_id = 1;
     bool incomplete_dictionary = false;
+    bool truncated_dictionary = false;
     auto refresh = [&] {
         script->routes.clear();
         script->routes.push_back({"SELECT USER FROM DUAL", {{Column("USER",1)}, {{Text("APP")}}}});
@@ -3618,7 +3619,7 @@ void TestAttachedDdlRefreshesAndCompensates() {
         }
         script->routes.push_back({"FROM user_tables", std::move(tables)});
         script->routes.push_back({"FROM user_views", {{Column("VIEW_NAME",1)}, {}}});
-        if (incomplete_dictionary) {
+        if (incomplete_dictionary || truncated_dictionary) {
             const std::vector<OracleColumn> pointed_columns(dictionary.columns.begin() + 1, dictionary.columns.end());
             for (const auto &table : script->tables) {
                 FakeResponse pointed {pointed_columns, {}};
@@ -3630,7 +3631,19 @@ void TestAttachedDdlRefreshesAndCompensates() {
                 script->routes.push_back({"FROM user_tab_columns WHERE table_name = '" + table.first + "'", std::move(pointed)});
             }
             script->routes.push_back({"FROM user_tab_columns WHERE table_name =", {pointed_columns, {}}});
-            dictionary.rows.insert(dictionary.rows.begin(), {WireValue()});
+            if (incomplete_dictionary) {
+                dictionary.rows.insert(dictionary.rows.begin(), {WireValue()});
+            } else if (script->tables.count("RV_PAIR") && script->tables.count("RV_pair")) {
+                const auto upper = *std::find_if(dictionary.rows.begin(), dictionary.rows.end(),
+                    [&](const WireRow &row) { return row[0] == Text("RV_PAIR"); });
+                const auto lower = *std::find_if(dictionary.rows.begin(), dictionary.rows.end(),
+                    [&](const WireRow &row) { return row[0] == Text("RV_pair"); });
+                auto padding = upper;
+                padding[0] = Text("RV_ZZZ");
+                dictionary.rows.assign(1, upper);
+                dictionary.rows.insert(dictionary.rows.end(), 65535, padding);
+                dictionary.rows.push_back(lower);
+            }
         }
         script->routes.push_back({"FROM user_tab_columns", std::move(dictionary)});
         script->routes.push_back({"FROM user_constraints", {{Column("TABLE_NAME",1),Column("COLUMN_NAME",1)}, {}}});
@@ -3793,6 +3806,22 @@ void TestAttachedDdlRefreshesAndCompensates() {
     refresh();
     database.Run("DETACH o;");
     database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner);");
+    script->tables["RV_PAIR"] = {{Column("ID", 2, 10, 0)}, {}};
+    script->tables["RV_pair"] = {{Column("ID", 2, 10, 0)}, {}};
+    identities["RV_PAIR"] = std::to_string(next_id++);
+    identities["RV_pair"] = std::to_string(next_id++);
+    truncated_dictionary = true;
+    refresh();
+    database.Run("DETACH o;");
+    database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner);");
+    CHECK(database.Query("DROP TABLE o.Rv_Pair;")->HasError());
+    CHECK(script->tables.count("RV_PAIR") == 1 && script->tables.count("RV_pair") == 1);
+    database.Run("DROP TABLE o.\"RV_pair\";");
+    CHECK(script->tables.count("RV_PAIR") == 1 && script->tables.count("RV_pair") == 0);
+    truncated_dictionary = false;
+    refresh();
+    database.Run("DROP TABLE o.RV_PAIR;");
+
     database.Run("BEGIN;");
     database.Run("CREATE TABLE o.RV_PRECOMMIT(ID INTEGER);");
     database.Run("INSERT INTO o.RV_PRECOMMIT VALUES (1);");

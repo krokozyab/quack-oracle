@@ -2,6 +2,10 @@
 
 ## Fixes
 
+- With incomplete metadata, exact table spelling is checked before case-insensitive
+  fallback. Fallback verifies uniqueness against the object list, preventing DROP
+  from selecting another cached case variant.
+
 - Upserts reject explicit DEFAULT inside VALUES before writing, including mixed
   rows, DO NOTHING, DO UPDATE and REPLACE; omitted columns retain Oracle defaults.
 

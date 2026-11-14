@@ -532,6 +532,11 @@ cannot create, remove or change Oracle users. For external DDL, grants or owner
 changes, DETACH/ATTACH to refresh discovery and metadata. Separate attachments
 have independent caches.
 
+With an incomplete column dictionary, an exact per-table describe precedes
+case-insensitive fallback.
+Fallback checks the schema's object list for a unique match, so a cached case
+variant cannot redirect DROP to another table.
+
 ### Creating and changing Oracle tables through ATTACH
 
 `CREATE TABLE`, `CREATE TABLE ... AS SELECT`, `DROP TABLE`, and `ALTER TABLE`
@@ -942,7 +947,7 @@ For DDL beyond the supported attached-table operations, use
 Explicit DEFAULT in an attached INSERT or upsert is currently refused before writing,
 including mixed VALUES rows. Omit the column to apply its Oracle default, or use
 oracle_execute with Oracle INSERT SQL. Explicit NULL remains NULL. Attached
-MERGE/upsert applies Oracle defaults only for omitted INSERT columns.
+MERGE/upsert retains Oracle defaults for omitted INSERT columns.
 
 ### Raw SQL in the attached transaction
 

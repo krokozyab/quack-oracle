@@ -1061,31 +1061,37 @@ struct OracleAttachedState {
             if (exact != column_cache.end() && !exact->second.empty()) {
                 return requested;
             }
-            std::string found;
-            size_t matches = 0;
-            for (const auto &entry : column_cache) {
-                if (!entry.second.empty() && StringUtil::CIEquals(entry.first, requested)) {
-                    found = entry.first;
-                    matches++;
+            if (metadata_complete) {
+                std::string found;
+                size_t matches = 0;
+                for (const auto &entry : column_cache) {
+                    if (!entry.second.empty() && StringUtil::CIEquals(entry.first, requested)) {
+                        found = entry.first;
+                        matches++;
+                    }
                 }
-            }
-            if (matches == 1) {
-                return found;
-            }
-            if (matches > 1 || metadata_complete) {
+                if (matches == 1) {
+                    return found;
+                }
                 return std::string();
             }
         }
-        // An incomplete dictionary cannot prove existence. Describe the exact
-        // spelling first, then the spelling of an unquoted Oracle identifier.
+        // A partial cache cannot choose a case-insensitive match before the
+        // exact spelling has been checked against Oracle. It also cannot prove
+        // uniqueness: a second case variant may lie beyond the column cap.
         if (!TryDescribe(requested).empty()) {
             return requested;
         }
-        auto upper = StringUtil::Upper(requested);
-        if (upper != requested && !TryDescribe(upper).empty()) {
-            return upper;
+        std::string found;
+        for (const auto &name : ListObjects()) {
+            if (StringUtil::CIEquals(name, requested)) {
+                if (!found.empty()) {
+                    return std::string();
+                }
+                found = name;
+            }
         }
-        return std::string();
+        return found;
     }
 
     // Describes the table from the dictionary and leaves the Oracle statement
