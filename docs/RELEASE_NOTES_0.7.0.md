@@ -2,6 +2,9 @@
 
 ## Fixes
 
+- Updating an indexed column writes only explicitly assigned columns; unchanged
+  values are not read back through potentially lossy mappings or rewritten.
+
 - Renaming a table back to a previously cached name restores its catalog entry,
   including alias lookups and catalog inspection, without reattachment.
 

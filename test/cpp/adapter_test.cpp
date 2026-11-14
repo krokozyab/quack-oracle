@@ -3729,6 +3729,12 @@ void TestAttachedUpsertsUseOracleMerge() {
     TestDatabase database;
     database.Run("ATTACH 'ora' AS ora (TYPE oracle_scanner);");
 
+    database.Run("UPDATE ora.main.ITEMS SET ID=61 WHERE ID=1;");
+    CHECK(script->counted_executes.back().find("SET \"ID\" = :1 WHERE ROWID") != std::string::npos);
+    CHECK(script->counted_executes.back().find("\"LABEL\" =") == std::string::npos);
+    database.Run("UPDATE ora.main.ITEMS SET LABEL=LABEL WHERE ID=1;");
+    CHECK(script->counted_executes.back().find("SET \"LABEL\" = :1 WHERE ROWID") != std::string::npos);
+
     for (const auto *sql : {
             "INSERT INTO ora.main.ITEMS VALUES (7,'seven'),(8,'eight') ON CONFLICT DO NOTHING;",
             "INSERT INTO ora.main.ITEMS VALUES (7,'seven') ON CONFLICT(ID) DO UPDATE SET LABEL=excluded.LABEL;",
@@ -3934,7 +3940,7 @@ void TestAttachedWritesAgainstAFakeSession() {
     CHECK(updated->GetValue(1, 0).ToString() == "renamed");
     CHECK(script->returning_statements.size() == before_update + 2);
     CHECK(script->returning_statements.back() ==
-          "UPDATE \"ITEMS\" SET \"LABEL\" = :1, \"ID\" = :2 WHERE ROWID = CHARTOROWID(:3) RETURNING \"ID\", \"LABEL\" INTO :r1, :r2; "
+          "UPDATE \"ITEMS\" SET \"LABEL\" = :1 WHERE ROWID = CHARTOROWID(:2) RETURNING \"ID\", \"LABEL\" INTO :r1, :r2; "
           ":rc := SQL%ROWCOUNT");
     const auto before_delete = script->returning_statements.size();
     auto deleted = database.Query("DELETE FROM ora.main.ITEMS RETURNING ID, LABEL;");

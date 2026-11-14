@@ -1221,6 +1221,14 @@ public:
         return function;
     }
 
+    void BindUpdateConstraints(Binder &, LogicalGet &, LogicalProjection &, LogicalUpdate &update,
+                               ClientContext &) override {
+        // Oracle enforces its constraints and updates its own indexes. DuckDB's
+        // delete/insert emulation adds unchanged columns to SET, which would
+        // write lossy read mappings back and fire unrelated UPDATE OF triggers.
+        update.update_is_del_and_insert = false;
+    }
+
     TableStorageInfo GetStorageInfo(ClientContext &) override {
         TableStorageInfo result;
         for (const auto &constraint : GetConstraints()) {

@@ -1656,3 +1656,6 @@ This is an independent community project and is not affiliated with Oracle or
 DuckDB Labs.
 
 ---
+
+Oracle UPDATE sends only explicitly assigned columns, including when changing
+a key or using RETURNING. Oracle enforces constraints and maintains indexes.
