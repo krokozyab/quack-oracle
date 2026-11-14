@@ -268,18 +268,34 @@ TtcFetchResponseDecoder::TtcFetchResponseDecoder(const std::vector<OracleColumn>
         for (const auto framing : row_framing) {
             if (framing != TtcColumnFraming::SCALAR) { throw ProtocolError(ProtocolErrorKind::UNSUPPORTED, "packed fetch requires scalar framing"); }
         }
-        result.packed.emplace(columns.size());
-        result.packed->ReserveRows(reserve_rows);
-        if (preceding_row) {
-            if (preceding_row->size() != columns.size()) { throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC preceding row disagrees with cursor columns"); }
-            result.packed->AppendRow();
-            for (size_t i = 0; i < columns.size(); i++) {
-                if ((*preceding_row)[i]) {
-                    const auto &cell = *(*preceding_row)[i];
-                    result.packed->AppendCellBytes(i, cell.data(), cell.size());
+        try {
+            result.packed.emplace(columns.size());
+            result.packed->ReserveRows(reserve_rows);
+            if (preceding_row) {
+                if (preceding_row->size() != columns.size()) {
+                    throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC preceding row disagrees with cursor columns");
                 }
+                result.packed->AppendRow();
+                for (size_t i = 0; i < columns.size(); i++) {
+                    if ((*preceding_row)[i]) {
+                        const auto &cell = *(*preceding_row)[i];
+                        result.packed->AppendCellBytes(i, cell.data(), cell.size());
+                    }
+                }
+                packed_seed = true;
+                kept_rows = 1;
+                kept_bytes = result.packed->ByteCount();
             }
-            packed_seed = true; kept_rows = 1; kept_bytes = result.packed->ByteCount();
+        } catch (const ProtocolError &error) {
+            if (error.Kind() != ProtocolErrorKind::LIMIT_EXCEEDED ||
+                std::string(error.what()) != "Oracle packed batch exceeds its memory limit") {
+                throw;
+            }
+            // A compressed logical row can exceed the budget even though
+            // each response that contributed its values was bounded.
+            result.packed.reset();
+            packed_seed = false;
+            kept_rows = kept_bytes = 0;
         }
     }
 }

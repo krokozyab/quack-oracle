@@ -1431,6 +1431,24 @@ static void TestPackedFetchFallsBackWhenDescriptorsExceedBudget() {
     CHECK(packed.Take().packed->MaterializeRow(0) == ordinary.rows[0]);
 }
 
+static void TestPackedSeedFallsBackWhenLogicalRowExceedsBudget() {
+    constexpr size_t column_count = 4096;
+    std::vector<OracleColumn> columns(column_count, OracleColumn {"V", 23});
+    TtcRowData previous(column_count, std::vector<uint8_t>(17U << 10U, 'x'));
+    // Compressed fetches can grow a logical row beyond any one wire response.
+    TtcFetchResponseDecoder decoder(columns, 6, previous, true, 1);
+    ByteWriter repeat;
+    repeat.WriteByte(21).WriteUInt16LE(0).WriteRaw(std::vector<uint8_t>((column_count + 7) / 8, 0))
+          .WriteByte(TTC_MESSAGE_ROW_DATA).WriteByte(29);
+    CHECK(decoder.Decode(repeat.Data()));
+    auto result = decoder.Take();
+    CHECK(!result.packed && result.rows.size() == 1);
+    CHECK(result.rows[0].size() == column_count);
+    CHECK(result.rows[0][0]->size() == (17U << 10U));
+    CHECK(result.rows[0].back()->back() == 'x');
+    CHECK(result.last_row && result.last_row->back()->size() == (17U << 10U));
+}
+
 static void TestPackedBatchOwnsCellsAndBoundsMemory() {
     CHECK((!std::is_convertible<const std::vector<uint8_t> &, OracleByteView>::value));
     CHECK((std::is_constructible<OracleByteView, const std::vector<uint8_t> &>::value));
@@ -8920,6 +8938,7 @@ int main() {
     TestTtcErrorCarriesADmlRowId();
     TestTtcRowDataCodec();
     TestPackedFetchFallsBackWhenDescriptorsExceedBudget();
+    TestPackedSeedFallsBackWhenLogicalRowExceedsBudget();
     TestPackedBatchOwnsCellsAndBoundsMemory();
     TestExactScaledNumberCodec();
     TestPackedChunkedFetchAndPreviousRowOwnership();
