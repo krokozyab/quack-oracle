@@ -36,6 +36,10 @@
 
 ## Behaviour changes
 
+- Plain attached INSERT refuses explicit DEFAULT before writing instead of
+  silently inserting NULL. Omitted columns retain Oracle defaults; use the raw
+  Oracle INSERT API when explicit DEFAULT values are required.
+
 - SCHEMA selects the owner behind `main`; it no longer limits the attachment to
   one owner. Oracle grants still control access. Schema discovery lists visible
   non-Oracle-maintained owners. `main` is reserved; case-colliding owner aliases

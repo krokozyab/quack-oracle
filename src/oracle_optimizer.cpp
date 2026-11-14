@@ -23,6 +23,8 @@
 #include <functional>
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/planner/operator/logical_merge_into.hpp"
+#include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/logical_operator_visitor.hpp"
 
 #include "duckdb/main/config.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
@@ -921,7 +923,43 @@ void PushDistinctCounts(OptimizerExtensionInput &input, unique_ptr<LogicalOperat
     PushAggregate(input.context, op, replacer);
 }
 
+void RejectExplicitOracleInsertDefaults(LogicalOperator &plan) {
+    if (plan.type == LogicalOperatorType::LOGICAL_INSERT) {
+        auto &insert = plan.Cast<LogicalInsert>();
+        if (insert.table.catalog.GetCatalogType() == "oracle_scanner" && !insert.children.empty()) {
+            auto &source = *insert.children[0];
+            std::function<void(LogicalOperator &)> inspect;
+            inspect = [&](LogicalOperator &node) {
+                idx_t expression_index = 0;
+                LogicalOperatorVisitor::EnumerateExpressions(node, [&](unique_ptr<Expression> *expression) {
+                    const auto index = expression_index++;
+                    // Omitted columns are represented by defaults in the outer
+                    // projection. They are left out of the Oracle INSERT SQL.
+                    if (&node == &source && node.type == LogicalOperatorType::LOGICAL_PROJECTION &&
+                        index < insert.bound_defaults.size() && !insert.bound_defaults[index]) {
+                        return;
+                    }
+                    ExpressionIterator::EnumerateExpression(*expression, [&](unique_ptr<Expression> &part) {
+                        if (part->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
+                            part->Cast<BoundFunctionExpression>().Function().GetName() == Identifier("__oracle_scanner_default")) {
+                            throw NotImplementedException("Oracle INSERT does not support explicit DEFAULT values; omit the column or use oracle_execute with Oracle SQL");
+                        }
+                    });
+                });
+                for (auto &child : node.children) {
+                    inspect(*child);
+                }
+            };
+            inspect(source);
+        }
+    }
+    for (auto &child : plan.children) {
+        RejectExplicitOracleInsertDefaults(*child);
+    }
+}
+
 void PreOptimizeOraclePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+    RejectExplicitOracleInsertDefaults(*plan);
     RewriteOracleMerges(input, plan);
     Value enabled;
     if (input.context.TryGetCurrentSetting("oracle_aggregate_pushdown", enabled) && !enabled.IsNull() && !BooleanValue::Get(enabled)) { return; }

@@ -3890,6 +3890,18 @@ void TestAttachedUpsertsUseOracleMerge() {
                  "ON t.ID=s.ID WHEN NOT MATCHED THEN INSERT(ID,LABEL) VALUES(s.ID,s.LABEL);");
     database.Run("INSERT INTO ora.main.ITEMS VALUES (70,'a'),(70,'b') ON CONFLICT DO NOTHING;");
 
+    for (const auto *sql : {
+            "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT);",
+            "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT),(91,NULL);",
+            "INSERT INTO ora.main.ITEMS(ID,LABEL) VALUES (90,DEFAULT) RETURNING ID;"}) {
+        const auto writes = script->counted_executes.size();
+        auto result = database.Query(sql);
+        CHECK(result->HasError() && result->GetError().find("explicit DEFAULT") != std::string::npos);
+        CHECK(script->counted_executes.size() == writes);
+    }
+    database.Run("INSERT INTO ora.main.ITEMS(ID) VALUES (92);");
+    CHECK(script->counted_executes.back().find("INSERT INTO \"ITEMS\" (\"ID\")") == 0);
+    database.Run("INSERT INTO ora.main.ITEMS VALUES (93,NULL);");
     database.Run("INSERT INTO ora.main.ITEMS(ID) VALUES (10) ON CONFLICT DO NOTHING;");
     CHECK(script->counted_executes.back().find("INSERT (\"ID\")") != std::string::npos);
     database.Run("INSERT INTO ora.main.ITEMS VALUES (11,NULL) ON CONFLICT DO NOTHING;");
