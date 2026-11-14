@@ -2852,9 +2852,17 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
             }
         }
     }
+    if (bind.for_update) {
+        // The rows an UPDATE or DELETE changes are locked as they are read, by the
+        // session that changes them; read on any other, another session could
+        // commit a change to a row between the read and the write, and the write
+        // would undo it. Pinning the session here also keeps this scan to one
+        // stream, read as the table is now.
+        TransactionSession(context, ResolveOracleWriteTarget(context, bind.catalog_name));
+    }
     // A statement's scans read one moment when the user asked for that; set anew on
     // every run, since a prepared statement keeps its bind data.
-    const auto query_scn = OracleQuerySnapshot(context, bind);
+    const auto query_scn = bind.for_update ? std::string() : OracleQuerySnapshot(context, bind);
     bind.sample_clause = OracleSampleClause(input.sample_options.get(), bind.estimated_rows);
     // A sample reads at that moment too: the SQL puts SAMPLE ahead of AS OF.
     bind.flashback_scn = query_scn;

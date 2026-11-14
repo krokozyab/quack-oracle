@@ -35,6 +35,7 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <filesystem>
@@ -2961,6 +2962,40 @@ void TestAttachedWritesAgainstAFakeSession() {
     database.Run("DELETE FROM ora.main.ITEMS;");
     CHECK(script->counted_executes.back() == "DELETE FROM \"ITEMS\" WHERE ROWID = CHARTOROWID(:1)");
     CHECK(script->batch_rows[0].size() == 1);
+
+    // The scan that names the rows an UPDATE or DELETE changes locks them as it
+    // reads them, so no other session can commit a change in between; a plain
+    // read locks nothing, and neither does a scan of the table that reads no ROWID.
+    const auto scans_since = [&](size_t first) {
+        std::vector<std::string> scans;
+        for (size_t index = first; index < script->queries.size(); index++) {
+            if (script->queries[index].find("FROM \"ITEMS\"") != std::string::npos) {
+                scans.push_back(script->queries[index]);
+            }
+        }
+        return scans;
+    };
+    const auto ends_with_lock = [](const std::string &sql) {
+        const std::string lock = " FOR UPDATE";
+        return sql.size() >= lock.size() && sql.compare(sql.size() - lock.size(), lock.size(), lock) == 0;
+    };
+    auto first = script->queries.size();
+    database.Run("UPDATE ora.main.ITEMS SET LABEL = 'locked' WHERE ID = 1;");
+    auto scans = scans_since(first);
+    CHECK(scans.size() == 1 && ends_with_lock(scans[0]) && scans[0].find("ROWIDTOCHAR(ROWID)") != std::string::npos);
+    CHECK(scans.size() == 1 && scans[0].find(" WHERE ") != std::string::npos);
+    first = script->queries.size();
+    database.Run("DELETE FROM ora.main.ITEMS WHERE ID IN (SELECT ID FROM ora.main.ITEMS WHERE LABEL = 'first');");
+    scans = scans_since(first);
+    CHECK(scans.size() == 2);
+    CHECK(std::count_if(scans.begin(), scans.end(), ends_with_lock) == 1);
+    for (const auto &scan : scans) {
+        CHECK(ends_with_lock(scan) == (scan.find("ROWIDTOCHAR(ROWID)") != std::string::npos));
+    }
+    first = script->queries.size();
+    database.Run("SELECT * FROM ora.main.ITEMS;");
+    scans = scans_since(first);
+    CHECK(scans.size() == 1 && !ends_with_lock(scans[0]));
 
     // RETURNING asks Oracle for the row it actually stored. Echoing back what
     // was sent would be wrong for exactly the cases the clause exists for, so

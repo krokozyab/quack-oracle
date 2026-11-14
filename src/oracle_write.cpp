@@ -21,6 +21,7 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 
 #include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/client_context_state.hpp"
@@ -1552,9 +1553,31 @@ PhysicalOperator &PlanOracleInsert(ClientContext &, PhysicalPlanGenerator &plann
     return insert;
 }
 
+// Marks the scans under `op` that read `table`'s ROWIDs to read FOR UPDATE: those
+// name the rows the UPDATE or DELETE changes. A scan of the same table that does
+// not read ROWIDs, such as one in a subquery, names no row and locks none.
+static void LockRowsTheScansName(PhysicalOperator &op, const TableCatalogEntry &table) {
+    if (op.type == PhysicalOperatorType::TABLE_SCAN) {
+        auto &scan = op.Cast<PhysicalTableScan>();
+        auto *bind = scan.bind_data ? dynamic_cast<OracleQueryBindData *>(scan.bind_data.get()) : nullptr;
+        if (bind && bind->deferred_scan && bind->table_entry.get() == &table) {
+            for (const auto &column : scan.column_ids) {
+                if (column.GetPrimaryIndex() == COLUMN_IDENTIFIER_ROW_ID) {
+                    bind->for_update = true;
+                    break;
+                }
+            }
+        }
+    }
+    for (auto &child : op.children) {
+        LockRowsTheScansName(child.get(), table);
+    }
+}
+
 PhysicalOperator &PlanOracleDelete(ClientContext &, PhysicalPlanGenerator &planner, LogicalDelete &op,
                                    PhysicalOperator &plan, const std::vector<OracleColumn> &columns,
                                    OracleWriteTarget target) {
+    LockRowsTheScansName(plan, op.table);
     auto sql = "DELETE FROM " + OracleObjectReference(target.schema_name, target.object_name) + " WHERE ROWID = " +
                "CHARTOROWID(:1)";
     std::vector<OracleColumn> returned_columns;
@@ -1578,6 +1601,7 @@ PhysicalOperator &PlanOracleUpdate(ClientContext &, PhysicalPlanGenerator &plann
                                static_cast<uint64_t>(op.columns.size()),
                                static_cast<uint64_t>(op.expressions.size()));
     }
+    LockRowsTheScansName(plan, op.table);
     std::vector<idx_t> source_indexes;
     std::vector<OracleColumn> set_columns;
     std::string assignments;

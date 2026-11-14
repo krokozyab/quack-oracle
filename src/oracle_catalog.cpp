@@ -1478,8 +1478,8 @@ std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const 
                                                   const std::vector<column_t> &selected, idx_t sessions) {
     // Only a plain read of a table as it is now: a sample would be taken once per
     // chunk, and a transaction that has written already holds the one session that
-    // can see its rows. (A scan that feeds an UPDATE or DELETE is fine: it reads
-    // on a session of its own already, and the rows it names are committed ones.)
+    // can see its rows. A scan that feeds an UPDATE or DELETE has pinned that session
+    // already, to lock the rows it names, so it never reaches here in parallel.
     if (sessions < 2 || !bind.sample_clause.empty() || !bind.order_clause.empty() ||
         TryTransactionSession(context, bind.catalog_name)) {
         return {};
@@ -1625,6 +1625,10 @@ void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const 
             sql += " WHERE " + bind.where_clause;
         }
         sql += bind.order_clause;
+        // Oracle refuses FOR UPDATE beside FETCH FIRST (ORA-02014) and a sample.
+        if (bind.for_update && bind.order_clause.empty() && bind.sample_clause.empty()) {
+            sql += " FOR UPDATE";
+        }
     }
     try {
         session = AcquireOracleReadSession(context, bind.secret_name, bind.catalog_name, bind.config, bind.password);

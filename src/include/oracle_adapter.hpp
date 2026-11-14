@@ -260,6 +260,10 @@ struct OracleQueryBindData final : TableFunctionData {
     //! attached tables that Oracle computes. `columns` and `types` are its result
     //! columns as the plan expects them, declared rather than described.
     bool statement_scan = false;
+    //! The scan names the rows an UPDATE or DELETE of this table changes, so it
+    //! reads them FOR UPDATE on the transaction's session. Set at plan time by
+    //! PlanOracleUpdate and PlanOracleDelete.
+    bool for_update = false;
     //! A change number every statement of this scan reads at, or empty. Set when the
     //! scan reads in two steps (see OracleDeferredColumns).
     std::string flashback_scn;

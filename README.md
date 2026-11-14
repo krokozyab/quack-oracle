@@ -730,7 +730,11 @@ INSERT INTO o.ITEMS (label) VALUES ('eight') RETURNING id, label;
 
 Columns you do not name are left out of the statement, so Oracle's own
 `DEFAULT` still applies. `UPDATE` and `DELETE` find rows by Oracle's ROWID, so
-the table does not need a primary key.
+the table does not need a primary key. The scan that finds them reads them
+`FOR UPDATE` on the transaction's session, so they stay locked until it commits or
+rolls back: a change another session commits meanwhile is waited for and then read,
+not overwritten, and a row it changes so that it no longer matches is left alone.
+Rows DuckDB reads and then filters out itself stay locked too.
 
 `UPDATE ... RETURNING` gives the rows as Oracle stored them after the change, and
 `DELETE ... RETURNING` the rows as they were when it deleted them:
@@ -741,8 +745,7 @@ DELETE FROM o.ITEMS WHERE id > 100 RETURNING *;
 ```
 
 Like `INSERT`, each row is its own statement, so a large `RETURNING` costs a round
-trip a row. A row removed by someone else between the scan and the statement is
-left out of the result. A table with a LOB, JSON or VECTOR column cannot be
+trip a row. A table with a LOB, JSON or VECTOR column cannot be
 returned from.
 
 `ATTACH 'ora' AS o (TYPE oracle_scanner, READ_ONLY)` prevents writes through
