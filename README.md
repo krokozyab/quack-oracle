@@ -482,9 +482,21 @@ against `ALL_USERS`: as written, else the one user it matches ignoring case. Wri
 need the grants Oracle itself would ask for. One attachment is one schema; attach
 again, under another alias, for a second.
 
-**What `ATTACH` will not do:** create or drop tables, or create schemas. This extension issues no DDL at all. For those, use
-`oracle_query` with a fully qualified name, or see
-[the DDL note](#i-need-to-run-create-table-or-another-ddl-statement).
+**What `ATTACH` will not do: DDL.** `CREATE TABLE`, `CREATE TABLE ... AS`, `DROP TABLE`, `ALTER TABLE`
+and `CREATE`/`DROP SCHEMA` on an attached catalog are refused with an error that says what to do
+instead. The catalog never turns a DuckDB statement into Oracle DDL, because Oracle commits DDL at
+once and it could not be part of the DuckDB transaction the statement runs in. Run DDL as its own
+step with `oracle_execute_admin`, then `DETACH` and `ATTACH` again so the catalog sees the change:
+
+```sql
+SELECT * FROM oracle_execute_admin('ora', 'CREATE TABLE ITEMS_COPY (ID NUMBER(10), LABEL VARCHAR2(50))');
+DETACH o;
+ATTACH 'ora' AS o (TYPE oracle_scanner);
+INSERT INTO o.ITEMS_COPY SELECT id, label FROM 'items.parquet';   -- writes work as usual
+```
+
+To copy DuckDB data into a new Oracle table, create the table this way first and fill it with
+`INSERT ... SELECT`. [Section 5](#5-write-data) lists what `oracle_execute_admin` accepts.
 
 ### Pushing filters down to Oracle
 
@@ -1341,16 +1353,18 @@ statement, not a script.
 ### `oracle_execute accepts only INSERT, UPDATE, or DELETE`
 
 <a id="i-need-to-run-create-table-or-another-ddl-statement"></a>
-You are trying to run DDL. This extension issues no DDL, but you can ask Oracle
-to do it through a standard Oracle procedure:
+You are trying to run DDL. `oracle_execute`, `oracle_execute_transaction` and an attached
+catalog run DML only; DDL has a function of its own, which runs one statement on a session of its
+own, outside any DuckDB transaction (Oracle commits DDL at once):
 
 ```sql
-SELECT * FROM oracle_call_auto('ora', 'DBMS_UTILITY.EXEC_DDL_STATEMENT',
-    ['CREATE TABLE t (id NUMBER(10), label VARCHAR2(50))']);
+SELECT * FROM oracle_execute_admin('ora', 'CREATE TABLE t (id NUMBER(10), label VARCHAR2(50))');
 ```
 
-The same route runs anything that is a single procedure call. Anything longer
-is an anonymous block; see `oracle_plsql` in section 6.
+It takes `CREATE`, `ALTER`, `DROP`, `GRANT`, `REVOKE`, `COMMENT` and `TRUNCATE`, and refuses to run
+inside `BEGIN ... COMMIT`. An attached catalog sees the change after `DETACH` and `ATTACH`. A
+procedure that runs DDL (`DBMS_UTILITY.EXEC_DDL_STATEMENT`, or your own with `EXECUTE IMMEDIATE`)
+works through `oracle_call_auto` too.
 
 ### `ORA-20906: DML composite operation N affected row count mismatch`
 

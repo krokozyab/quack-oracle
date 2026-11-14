@@ -3179,6 +3179,17 @@ void TestAttachedWritesAgainstAFakeSession() {
     CHECK(script->counted_executes.back() == "DELETE FROM \"ITEMS\" WHERE ROWID = CHARTOROWID(:1)");
     CHECK(script->batch_rows[0].size() == 1);
 
+    // DDL through the catalog is refused with the way to run it, and leaves the
+    // database usable: ALTER used to reach DuckDB's base entry, whose internal
+    // error invalidated the whole database.
+    for (const auto *ddl : {"ALTER TABLE ora.main.ITEMS ADD COLUMN EXTRA INTEGER;",
+                            "ALTER TABLE ora.main.ITEMS RENAME TO OTHER;", "DROP TABLE ora.main.ITEMS;",
+                            "CREATE TABLE ora.main.MORE (ID INTEGER);"}) {
+        auto refused = database.Query(ddl);
+        CHECK(refused->HasError() && refused->GetError().find("oracle_execute_admin") != std::string::npos);
+        CHECK(!database.Query("SELECT count(*) FROM ora.main.ITEMS;")->HasError());
+    }
+
     // The scan that names the rows an UPDATE or DELETE changes locks them as it
     // reads them, so no other session can commit a change in between; a plain
     // read locks nothing, and neither does a scan of the table that reads no ROWID.

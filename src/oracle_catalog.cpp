@@ -44,6 +44,12 @@ using oracle_scanner::OpenOracleSession;
 
 namespace {
 
+// Where a refusal of DDL through ATTACH sends the user. The catalog never turns
+// a DuckDB statement into Oracle DDL: Oracle commits DDL at once, so it could not
+// belong to the DuckDB transaction the statement runs in.
+constexpr const char *ORACLE_DDL_ROUTE =
+    "Run the DDL with oracle_execute_admin('<secret>', '<statement>'), then DETACH and ATTACH again to see it";
+
 // A session for dictionary reads, outside any DuckDB transaction. With the
 // catalog's transaction pool it is leased from there, and given back only
 // after an acknowledged ROLLBACK ends whatever the reads may have begun; any
@@ -1151,9 +1157,20 @@ public:
 
     void OnDrop() override {
         // The entry lives in a DuckDB catalog set that would forget it happily
-        // while Oracle still has the table. DDL is outside this version.
-        throw NotImplementedException("Oracle table \"%s\" cannot be dropped: this extension does not issue DDL",
-                                      object_name);
+        // while Oracle still has the table.
+        throw NotImplementedException("Oracle table \"%s\" cannot be dropped through ATTACH. %s", object_name,
+                                      ORACLE_DDL_ROUTE);
+    }
+
+    // ALTER TABLE reaches the entry itself, and the base class answers with an
+    // InternalException, which invalidates the whole database.
+    unique_ptr<CatalogEntry> AlterEntry(ClientContext &, AlterInfo &) override {
+        throw NotImplementedException("Oracle table \"%s\" cannot be altered through ATTACH. %s", object_name,
+                                      ORACLE_DDL_ROUTE);
+    }
+    unique_ptr<CatalogEntry> AlterEntry(CatalogTransaction, AlterInfo &) override {
+        throw NotImplementedException("Oracle table \"%s\" cannot be altered through ATTACH. %s", object_name,
+                                      ORACLE_DDL_ROUTE);
     }
 
     // DuckDB reaches for local storage on paths that assume a table it owns —
@@ -1162,10 +1179,8 @@ public:
     // database; an Oracle table simply has no DuckDB-local storage, and saying
     // so leaves the connection usable.
     DataTable &GetStorage() override {
-        throw NotImplementedException(
-            "Oracle table \"%s\" has no DuckDB-local storage: this operation is not supported on an attached Oracle "
-            "table",
-            object_name);
+        throw NotImplementedException("Oracle table \"%s\" is not stored by DuckDB, which cannot drop or change it. %s",
+                                      object_name, ORACLE_DDL_ROUTE);
     }
 
     unique_ptr<BaseStatistics> GetStatistics(ClientContext &, column_t) override {
@@ -1272,7 +1287,7 @@ public:
 
     ErrorData SupportsCreateTable(BoundCreateTableInfo &) override {
         return ErrorData(ExceptionType::NOT_IMPLEMENTED,
-                         "Oracle ATTACH cannot create a table: this extension does not issue DDL");
+                         "Oracle ATTACH cannot create a table. " + std::string(ORACLE_DDL_ROUTE));
     }
 
     optional_ptr<CatalogEntry> CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) override {
@@ -1286,7 +1301,7 @@ public:
     }
 
     void DropSchema(ClientContext &, DropInfo &) override {
-        throw NotImplementedException("Oracle ATTACH cannot drop a schema: this extension does not issue DDL");
+        throw NotImplementedException("Oracle ATTACH cannot drop a schema. %s", ORACLE_DDL_ROUTE);
     }
 
     void Initialize(bool) override {
