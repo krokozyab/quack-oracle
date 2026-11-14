@@ -2822,6 +2822,76 @@ void TestVectorSearchArguments() {
     std::cout << "oracle_vector_search refuses what it cannot put in a statement safely" << std::endl;
 }
 
+// An automatic parallel scan is for reading much of a big table. When the filters
+// Oracle is sent leave few rows by the statistics (NUM_DISTINCT for an equality or
+// IN list, LOW_VALUE and HIGH_VALUE for a range), one session reads them, since
+// planning ranges and opening sessions would cost more than it saves.
+void TestSelectiveFiltersReadThroughOneSession() {
+    const auto text_columns = [](std::initializer_list<const char *> names) {
+        std::vector<OracleColumn> result;
+        for (const auto *name : names) {
+            result.push_back(Column(name, 1));
+        }
+        return result;
+    };
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {text_columns({"USER"}), {{Text("APP")}}}});
+    script->routes.push_back({"dbms_flashback", {{Column("SCN", 2)}, {{Number("424242")}}}});
+    script->routes.push_back({"iot_type", {text_columns({"IOT_TYPE", "TEMPORARY", "CLUSTER_NAME"}),
+                                           {{std::nullopt, Text("N"), std::nullopt}}}});
+    std::vector<WireRow> extents;
+    for (int index = 0; index < 10; index++) {
+        extents.push_back({Text("EXTENT" + std::to_string(index)), Number("1000")});
+    }
+    script->routes.push_back({"dba_extents", {{Column("LOW", 1), Column("BLOCKS", 2)}, extents}});
+    // Five million rows; ID unique from 1 to 5,000,000, KIND one of two values.
+    script->routes.push_back(
+        {"num_distinct IS NOT NULL",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("NUM_DISTINCT", 2), Column("LOW_VALUE", 23),
+           Column("HIGH_VALUE", 23)},
+          {{Text("FACTS"), Text("ID"), Number("5000000"), oracle_scanner::EncodeOracleNumber("1"),
+            oracle_scanner::EncodeOracleNumber("5000000")},
+           {Text("FACTS"), Text("KIND"), Number("2"), oracle_scanner::EncodeOracleNumber("1"),
+            oracle_scanner::EncodeOracleNumber("2")}}}});
+    script->routes.push_back({"num_rows IS NOT NULL",
+                              {{Column("TABLE_NAME", 1), Column("NUM_ROWS", 2)}, {{Text("FACTS"), Number("5000000")}}}});
+    script->routes.push_back({"FROM user_tables", {text_columns({"TABLE_NAME"}), {{Text("FACTS")}}}});
+    script->routes.push_back({"FROM user_views", {text_columns({"VIEW_NAME"}), {}}});
+    script->routes.push_back(
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {{Text("FACTS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("N")},
+           {Text("FACTS"), Text("KIND"), Text("NUMBER"), Number("22"), Number("1"), Number("0"), Text("N")}}}});
+    script->routes.push_back({"FROM user_constraints", {text_columns({"TABLE_NAME", "COLUMN_NAME"}), {}}});
+    script->tables["FACTS"] = {{Column("ID", 2, 10, 0), Column("KIND", 2, 1, 0)}, {{Number("7"), Number("1")}}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("SET threads = 4;");
+    database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner);");
+    const auto read_in_ranges = [&](const std::string &where) {
+        script->queries.clear();
+        auto result = database.Query("SELECT ID, KIND FROM o.main.FACTS WHERE " + where + ";");
+        CHECK(!result->HasError());
+        for (const auto &query : script->queries) {
+            if (query.find("WHERE ROWID") != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    };
+    CHECK(!read_in_ranges("ID = 7"));                       // one row of five million
+    CHECK(!read_in_ranges("ID IN (7, 8, 9)"));              // three
+    CHECK(!read_in_ranges("ID BETWEEN 1000 AND 50000"));    // about 1%
+    CHECK(!read_in_ranges("KIND = 1 AND ID < 20000"));      // the most selective column decides
+    CHECK(read_in_ranges("ID > 1000"));                     // nearly all of them
+    CHECK(read_in_ranges("KIND = 1"));                      // half
+    // A number of sessions set by hand is used as set.
+    database.Run("SET oracle_parallel_scan = 4;");
+    CHECK(read_in_ranges("ID = 7"));
+    std::cout << "a selective filter reads through one session" << std::endl;
+}
+
 // Oracle compares text by bytes only under NLS_COMP = BINARY and for a column that
 // declares no collation of its own (or BINARY). Elsewhere 'beta' = 'BETA' can hold,
 // so equality and grouping on such a column stay in DuckDB, and the answer is
@@ -4938,6 +5008,7 @@ int main() {
     TestHeavyColumnsAreReadAfterTheFilter();
     TestAttachedScanReadsInRowidRanges();
     TestTextComparesByTheSessionCollation();
+    TestSelectiveFiltersReadThroughOneSession();
     TestCallableArgumentsOfTheNewTypes();
     TestVectorSearchArguments();
     TestParallelScanShardsOneSnapshot();

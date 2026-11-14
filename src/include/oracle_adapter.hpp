@@ -243,6 +243,10 @@ struct OracleQueryBindData final : TableFunctionData {
     std::optional<uint64_t> estimated_rows;
     //! NUM_DISTINCT per column of the table, in column order, where the statistics have one.
     std::vector<std::optional<uint64_t>> distinct_counts;
+    //! LOW_VALUE and HIGH_VALUE per NUMBER, DATE or TIMESTAMP column, as numbers or
+    //! seconds since 1970, where the statistics have them. Only for estimates: they
+    //! may be stale, so nothing is skipped or decided by them.
+    std::vector<std::optional<std::pair<double, double>>> value_bounds;
     // Predicates translated from the pushed-down filter set, empty when nothing
     // was pushed. Built at init, where the filters and the read columns are
     // both known.
@@ -382,9 +386,21 @@ void RequireReadableColumn(const OracleColumn &column);
 //! back as an expression over the scan's output chunk, for the scan to apply to
 //! the rows Oracle returns, because DuckDB has already dropped it from its plan.
 //! `scanned_columns` maps a filter's index to a described column.
+//! One predicate sent to Oracle, for estimating the rows it keeps: an equality
+//! (values 1) or IN list (values k), or a range with its bounds as numbers, a
+//! date or timestamp as seconds since 1970.
+struct OracleFilterEstimate {
+    column_t column = 0;
+    idx_t values = 0;
+    std::optional<double> lower;
+    std::optional<double> upper;
+};
 struct OracleFilterSplit {
     std::string where;
     vector<unique_ptr<Expression>> local;
+    //! The predicates that went into `where`, as far as estimating how many rows
+    //! Oracle returns needs them.
+    std::vector<OracleFilterEstimate> estimates;
 };
 bool OraclePushdownExpression(ClientContext &context, const LogicalGet &get, Expression &expression);
 OracleFilterSplit SplitOracleFilters(const TableFilterSet &filters, const std::vector<OracleColumn> &columns,

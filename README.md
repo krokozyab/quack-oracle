@@ -1136,7 +1136,12 @@ order is where the rows lie in the data files, which is usually, but not always,
 session reads them in (that follows the order the extents were allocated); without `ORDER BY`,
 Oracle promises neither.
 
-It reads one stream instead, and says nothing, when: the setting is 0 or 1; the user cannot
+It reads one stream instead, and says nothing, when: the setting is 0 or 1; the setting is left
+automatic and the filters Oracle is sent are estimated from its statistics to leave fewer than
+100,000 rows (`NUM_DISTINCT` for `=` and `IN`, `LOW_VALUE`/`HIGH_VALUE` for a range on a number, date
+or timestamp; one customer's 50 orders of a million then take 0.02 s instead of 0.18 s, an estimate
+thrown off by skewed data only picks the slower of the two ways to read, never another result);
+the user cannot
 read `DBA_EXTENTS` (the extents give the cut points, and without them a table cannot be
 divided evenly — a sample of its blocks came back in a few clumps and cut a test table 99 to
 1); the table is under 2,048 blocks, index-organized, clustered or temporary; the database

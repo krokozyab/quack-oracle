@@ -1,6 +1,7 @@
 #include "oracle_io_deadline.hpp"
 #include <algorithm>
 #include <chrono>
+#include <map>
 #include <set>
 #include <unordered_map>
 #include <condition_variable>
@@ -2690,6 +2691,73 @@ std::string OracleSampleClause(optional_ptr<SampleOptions> options, const std::o
 // plan costs a few dictionary queries and a connection of its own.
 constexpr uint64_t AUTOMATIC_PARALLEL_MINIMUM_ROWS = 500000;
 
+// An automatic parallel scan is not tried either when the filters Oracle was sent
+// are estimated to leave fewer rows than this: planning the ranges and opening the
+// sessions costs about as much as reading this many rows through one (50 rows of a
+// million took 0.18 s through eight sessions and 0.02 s through one; a month of it,
+// 85,000 rows, 0.21 s and 0.09 s). An estimate can be low, NUM_DISTINCT knows
+// nothing of skew, so the bar sits well under the table threshold.
+constexpr uint64_t AUTOMATIC_PARALLEL_FILTERED_ROWS = 100000;
+
+// The rows Oracle is expected to return once the filters it was sent apply, from
+// the optimizer statistics. A column with d distinct values keeps about 1/d of the
+// rows for an equality and k/d for an IN list of k; a range keeps its share of
+// [LOW_VALUE, HIGH_VALUE], plus one value for its ends. The most selective column
+// alone is taken, since columns are seldom independent. A column without
+// statistics estimates nothing.
+static uint64_t EstimatedRowsAfterFilters(const OracleQueryBindData &bind,
+                                          const std::vector<OracleFilterEstimate> &estimates) {
+    if (!bind.estimated_rows) {
+        return 0;
+    }
+    const auto rows = static_cast<double>(*bind.estimated_rows);
+    struct ColumnShare {
+        idx_t values = 0;
+        std::optional<double> lower;
+        std::optional<double> upper;
+    };
+    std::map<column_t, ColumnShare> by_column;
+    for (const auto &estimate : estimates) {
+        auto &share = by_column[estimate.column];
+        if (estimate.values > 0) {
+            share.values = share.values == 0 ? estimate.values : MinValue(share.values, estimate.values);
+        }
+        if (estimate.lower) {
+            share.lower = share.lower ? MaxValue(*share.lower, *estimate.lower) : *estimate.lower;
+        }
+        if (estimate.upper) {
+            share.upper = share.upper ? MinValue(*share.upper, *estimate.upper) : *estimate.upper;
+        }
+    }
+    double kept = 1.0;
+    for (const auto &entry : by_column) {
+        const auto column = entry.first;
+        const auto &share = entry.second;
+        const auto distinct = column < bind.distinct_counts.size() && bind.distinct_counts[column] &&
+                                      *bind.distinct_counts[column] > 0
+                                  ? std::optional<double>(static_cast<double>(*bind.distinct_counts[column]))
+                                  : std::nullopt;
+        if (share.values > 0 && distinct) {
+            kept = MinValue(kept, MinValue(1.0, static_cast<double>(share.values) / *distinct));
+            continue;
+        }
+        if ((share.lower || share.upper) && column < bind.value_bounds.size() && bind.value_bounds[column]) {
+            const auto low = bind.value_bounds[column]->first;
+            const auto high = bind.value_bounds[column]->second;
+            if (high <= low) {
+                continue;
+            }
+            const auto from = share.lower ? MaxValue(low, *share.lower) : low;
+            const auto to = share.upper ? MinValue(high, *share.upper) : high;
+            auto fraction = MaxValue(0.0, to - from) / (high - low);
+            if (distinct) {
+                fraction += 1.0 / *distinct;
+            }
+            kept = MinValue(kept, MinValue(1.0, fraction));
+        }
+    }
+    return static_cast<uint64_t>(rows * kept);
+}
 static bool DeferrableColumn(const OracleColumn &column);
 
 // Runs the statement an AGGREGATE was replaced with. The result columns are
@@ -2831,6 +2899,7 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
     // Counting rows needs no column values, but Oracle needs a select list, so
     // one column is fetched and none is emitted.
     unique_ptr<Expression> local_filter;
+    std::vector<OracleFilterEstimate> filter_estimates;
     auto selected = input.column_ids;
     const auto chunk_columns = selected.size();
     if (selected.empty()) {
@@ -2842,6 +2911,7 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
         // applied here to the rows that come back.
         auto split = SplitOracleFilters(*input.filters, bind.columns, selected);
         bind.where_clause = std::move(split.where);
+        filter_estimates = std::move(split.estimates);
         if (split.local.size() == 1) {
             local_filter = std::move(split.local[0]);
         } else if (!split.local.empty()) {
@@ -2880,11 +2950,14 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
         const auto requested = parallel_setting.GetValue<int64_t>();
         if (requested >= 0) {
             sessions = static_cast<idx_t>(MinValue<int64_t>(64, requested));
-        } else if (bind.estimated_rows && *bind.estimated_rows >= AUTOMATIC_PARALLEL_MINIMUM_ROWS) {
+        } else if (bind.estimated_rows && *bind.estimated_rows >= AUTOMATIC_PARALLEL_MINIMUM_ROWS &&
+                   EstimatedRowsAfterFilters(bind, filter_estimates) >= AUTOMATIC_PARALLEL_FILTERED_ROWS) {
             // Automatic: a table Oracle's statistics say is big gets as many
-            // sessions as DuckDB has threads, up to eight. The planner still reads
-            // one stream when the extents, the change number or a flashback read
-            // are not to be had.
+            // sessions as DuckDB has threads, up to eight, unless the filters Oracle
+            // was sent are estimated to leave few of its rows (see
+            // AUTOMATIC_PARALLEL_FILTERED_ROWS). The planner still
+            // reads one stream when the extents, the change number or a flashback
+            // read are not to be had.
             sessions = MinValue<idx_t>(8, static_cast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads()));
         }
     }

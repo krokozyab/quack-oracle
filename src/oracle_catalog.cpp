@@ -167,6 +167,11 @@ struct OracleAttachedState {
     mutable std::unordered_map<std::string, uint64_t> row_estimates;
     // NUM_DISTINCT per table and column, from the same statistics.
     mutable std::unordered_map<std::string, std::unordered_map<std::string, uint64_t>> distinct_estimates;
+    // LOW_VALUE and HIGH_VALUE, as the dictionary stores them (the column's own
+    // encoding), from the same statistics. Only ever used for estimates.
+    mutable std::unordered_map<std::string,
+                               std::unordered_map<std::string, std::pair<std::vector<uint8_t>, std::vector<uint8_t>>>>
+        value_bounds;
     // Whether the session compares text by bytes (NLS_COMP = BINARY), read once at
     // ATTACH. False when it could not be read: equality on text then stays in DuckDB.
     bool nls_comp_binary = false;
@@ -785,8 +790,11 @@ struct OracleAttachedState {
                 // optimizer needs to size a join or a GROUP BY. Only the count: a
                 // statistic can be stale, and a stale minimum, maximum or null count
                 // would let DuckDB skip rows, where a stale count only misjudges a plan.
+                // The low and high values come too, but only for this extension's own
+                // estimate of how many rows a filter keeps (EstimatedRowsAfterFilters);
+                // DuckDB never sees them.
                 auto distinct = TranslatingOracleErrors("Oracle ATTACH could not read column statistics", [&] {
-                    return session->Query("SELECT table_name, column_name, num_distinct FROM " +
+                    return session->Query("SELECT table_name, column_name, num_distinct, low_value, high_value FROM " +
                                               View("tab_col_statistics") + " WHERE num_distinct IS NOT NULL" +
                                               OwnerCondition("owner", "AND"),
                                           {});
@@ -802,6 +810,10 @@ struct OracleAttachedState {
                             distinct_estimates[std::string(row[0]->begin(), row[0]->end())]
                                               [std::string(row[1]->begin(), row[1]->end())] =
                                 std::stoull(oracle_scanner::DecodeOracleNumber(*row[2]));
+                            if (row.size() >= 5 && row[3] && row[4]) {
+                                value_bounds[std::string(row[0]->begin(), row[0]->end())]
+                                            [std::string(row[1]->begin(), row[1]->end())] = {*row[3], *row[4]};
+                            }
                         } catch (const std::exception &) {
                             continue;
                         }
@@ -815,6 +827,7 @@ struct OracleAttachedState {
             } catch (const std::exception &) {
                 row_estimates.clear();
                 distinct_estimates.clear();
+                value_bounds.clear();
             }
         }
         const auto found = row_estimates.find(object_name);
@@ -839,6 +852,48 @@ struct OracleAttachedState {
             const auto found = table->second.find(columns[index].name);
             if (found != table->second.end()) {
                 result[index] = found->second;
+            }
+        }
+        return result;
+    }
+
+    // LOW_VALUE and HIGH_VALUE of each NUMBER, DATE and TIMESTAMP column, in order,
+    // as numbers or seconds since 1970, where the statistics have them.
+    std::vector<std::optional<std::pair<double, double>>> ValueBounds(const std::string &object_name,
+                                                                      const std::vector<OracleColumn> &columns) const {
+        (void)RowEstimate(object_name); // loads the statistics
+        std::lock_guard<std::mutex> lock(metadata_lock);
+        std::vector<std::optional<std::pair<double, double>>> result(columns.size());
+        const auto table = value_bounds.find(object_name);
+        if (table == value_bounds.end()) {
+            return result;
+        }
+        const auto point = [](const OracleColumn &column, const std::vector<uint8_t> &raw) -> std::optional<double> {
+            if (column.oracle_type == 2) {
+                return std::stod(oracle_scanner::DecodeOracleNumber(raw));
+            }
+            if (column.oracle_type == 12 || column.oracle_type == 180) {
+                const auto value = column.oracle_type == 12 ? oracle_scanner::DecodeOracleDate(raw)
+                                                            : oracle_scanner::DecodeOracleTimestamp(raw);
+                const auto day = Date::FromDate(value.year, value.month, value.day);
+                return static_cast<double>(day.days) * 86400.0 + value.hour * 3600.0 + value.minute * 60.0 +
+                       value.second + value.nanosecond / 1e9;
+            }
+            return std::nullopt;
+        };
+        for (size_t index = 0; index < columns.size(); index++) {
+            const auto found = table->second.find(columns[index].name);
+            if (found == table->second.end()) {
+                continue;
+            }
+            try {
+                const auto low = point(columns[index], found->second.first);
+                const auto high = point(columns[index], found->second.second);
+                if (low && high && *high >= *low) {
+                    result[index] = std::make_pair(*low, *high);
+                }
+            } catch (const std::exception &) {
+                // An encoding this does not read leaves the column without bounds.
             }
         }
         return result;
@@ -937,6 +992,7 @@ struct OracleAttachedState {
         result->object_name = object_name;
         result->estimated_rows = RowEstimate(object_name);
         result->distinct_counts = DistinctCounts(object_name, entry_columns);
+        result->value_bounds = ValueBounds(object_name, entry_columns);
         result->schema_name = owner;
         result->secret_name = secret_name;
         // The table entry's own columns: they carry the number mapping chosen when

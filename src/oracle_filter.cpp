@@ -780,6 +780,78 @@ unique_ptr<Expression> LocalExpression(const ExpressionFilter &filter, const Exp
     return expression;
 }
 
+// A constant as a point on the line a column's statistics describe: a number as
+// itself, a date or timestamp as seconds since 1970. Empty for anything else.
+std::optional<double> EstimatePoint(const Value &value) {
+    if (value.IsNull()) {
+        return std::nullopt;
+    }
+    switch (value.type().id()) {
+    case LogicalTypeId::TINYINT:
+    case LogicalTypeId::SMALLINT:
+    case LogicalTypeId::INTEGER:
+    case LogicalTypeId::BIGINT:
+    case LogicalTypeId::HUGEINT:
+    case LogicalTypeId::UTINYINT:
+    case LogicalTypeId::USMALLINT:
+    case LogicalTypeId::UINTEGER:
+    case LogicalTypeId::UBIGINT:
+    case LogicalTypeId::DECIMAL:
+    case LogicalTypeId::FLOAT:
+    case LogicalTypeId::DOUBLE:
+        return value.GetValue<double>();
+    case LogicalTypeId::DATE:
+        return static_cast<double>(value.GetValue<date_t>().days) * 86400.0;
+    case LogicalTypeId::TIMESTAMP:
+    case LogicalTypeId::TIMESTAMP_SEC:
+    case LogicalTypeId::TIMESTAMP_MS:
+    case LogicalTypeId::TIMESTAMP_NS:
+        return static_cast<double>(value.DefaultCastAs(LogicalType::TIMESTAMP).GetValue<timestamp_t>().value) / 1e6;
+    default:
+        return std::nullopt;
+    }
+}
+
+// What a predicate that went to Oracle says about the rows it keeps: an equality
+// or IN list keeps a few values, a comparison with a constant one side of it.
+std::optional<OracleFilterEstimate> EstimateOf(const Expression &shape, column_t column) {
+    OracleFilterEstimate estimate;
+    estimate.column = column;
+    if (shape.GetExpressionClass() == ExpressionClass::BOUND_OPERATOR &&
+        shape.GetExpressionType() == ExpressionType::COMPARE_IN) {
+        estimate.values = shape.Cast<BoundOperatorExpression>().GetChildren().size() - 1;
+        return estimate;
+    }
+    if (!BoundComparisonExpression::IsComparison(shape)) {
+        return std::nullopt;
+    }
+    const auto &comparison = shape.Cast<BoundFunctionExpression>();
+    if (comparison.GetExpressionType() == ExpressionType::COMPARE_EQUAL) {
+        estimate.values = 1;
+        return estimate;
+    }
+    const auto &right = BoundComparisonExpression::Right(comparison);
+    if (right.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+        return std::nullopt;
+    }
+    const auto point = EstimatePoint(right.Cast<BoundConstantExpression>().GetValue());
+    if (!point) {
+        return std::nullopt;
+    }
+    switch (comparison.GetExpressionType()) {
+    case ExpressionType::COMPARE_GREATERTHAN:
+    case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+        estimate.lower = point;
+        return estimate;
+    case ExpressionType::COMPARE_LESSTHAN:
+    case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+        estimate.upper = point;
+        return estimate;
+    default:
+        return std::nullopt;
+    }
+}
+
 } // namespace
 
 // Whether DuckDB may hand the scan this expression as a filter on one column. Only
@@ -881,6 +953,12 @@ OracleFilterSplit SplitOracleFilters(const TableFilterSet &filters, const std::v
                 result.where += " AND ";
             }
             result.where += *translated;
+            const auto *shape = IsOptionalWrapper(*piece) ? OptionalChild(*piece) : piece;
+            if (shape) {
+                if (auto estimate = EstimateOf(*shape, column_index)) {
+                    result.estimates.push_back(*estimate);
+                }
+            }
         }
     }
     return result;
