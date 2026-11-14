@@ -12,3 +12,8 @@
   Unconstrained NUMBER and values exceeding 38 effective digits retain their mapping.
 - Eligible constant LIMIT/OFFSET scans now bound the Oracle result and avoid
   parallel range planning. Local filters, samples and locked scans retain local limits.
+
+## Additions
+
+- MERGE is accepted as DML by the raw execution APIs, with Oracle affected-row counts
+  and the same transaction ownership as INSERT, UPDATE and DELETE.

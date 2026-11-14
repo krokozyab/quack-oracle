@@ -315,7 +315,7 @@ Binder Error: oracle_execute_many rows must be a non-empty LIST of STRUCT or LIS
 statement error
 SELECT * FROM oracle_execute_many('oracle_test', 'SELECT :1 FROM dual', [[1]]);
 ----
-Binder Error: oracle_execute_many row 1 is invalid: oracle_execute accepts only INSERT, UPDATE, or DELETE
+Binder Error: oracle_execute_many row 1 is invalid: oracle_execute accepts only INSERT, UPDATE, DELETE, or MERGE
 
 # The streaming table-function surface is registered. A missing secret must
 # fail during binding, before any network connection is attempted.

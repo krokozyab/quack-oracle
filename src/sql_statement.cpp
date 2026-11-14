@@ -117,7 +117,7 @@ OracleSqlKind ClassifyOracleSql(const std::string &sql) {
     if (keyword == "SELECT" || keyword == "WITH") {
         return OracleSqlKind::QUERY;
     }
-    if (keyword == "INSERT" || keyword == "UPDATE" || keyword == "DELETE") {
+    if (keyword == "INSERT" || keyword == "UPDATE" || keyword == "DELETE" || keyword == "MERGE") {
         return OracleSqlKind::DML;
     }
     if (keyword == "BEGIN" || keyword == "DECLARE" || keyword == "CALL") {
@@ -137,7 +137,7 @@ void ValidateOracleQuery(const std::string &sql, const std::vector<OracleBind> &
 void ValidateOracleDml(const std::string &sql, const std::vector<OracleBind> &binds) {
     RejectStatementTerminators(sql);
     if (ClassifyOracleSql(sql) != OracleSqlKind::DML) {
-        throw ProtocolError(ProtocolErrorKind::MALFORMED, "oracle_execute accepts only INSERT, UPDATE, or DELETE");
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "oracle_execute accepts only INSERT, UPDATE, DELETE, or MERGE");
     }
     ValidateOracleStatementBinds(sql, binds, OracleBindUse::DML);
 }

@@ -1109,6 +1109,12 @@ void TestExecuteUsesTheCountedOperation() {
     CHECK(script->counted_executes.size() == 1);
     CHECK(script->plain_executes.empty());
     CHECK(script->counted_execute_binds[0].size() == 2);
+    auto merged = database.Query("SELECT * FROM oracle_execute('ora', "
+                                 "'MERGE INTO app.items t USING dual ON (t.id=:id) WHEN MATCHED THEN UPDATE SET label=:label', "
+                                 "{id: 1, label: 'x'})");
+    CHECK(!merged->HasError() && merged->GetValue(0, 0).ToString() == "3");
+    CHECK(script->counted_executes.back().find("MERGE INTO") == 0);
+
 }
 
 // An explicit DuckDB transaction cannot give the isolated Oracle transaction
@@ -1136,7 +1142,7 @@ void TestValidationRunsBeforeAnySession() {
 
     auto second = std::make_shared<FakeScript>();
     const auto query_as_dml = ErrorOf("SELECT * FROM oracle_execute('ora', 'SELECT 1 FROM dual')", second);
-    CHECK(query_as_dml.find("INSERT, UPDATE, or DELETE") != std::string::npos);
+    CHECK(query_as_dml.find("INSERT, UPDATE, DELETE, or MERGE") != std::string::npos);
     CHECK(second->sessions_opened == 0);
 }
 
@@ -4987,9 +4993,9 @@ void TestCompositeTransactionDml() {
         CHECK(refused->HasError() && refused->GetError().find(expected) != std::string::npos);
         CHECK(script->sessions_opened == before_sessions && script->calls.size() == before_calls);
     };
-    refused_at_bind("'tx', ['CREATE TABLE T2 (ID NUMBER)'], [], [0]", "only INSERT, UPDATE, or DELETE");
+    refused_at_bind("'tx', ['CREATE TABLE T2 (ID NUMBER)'], [], [0]", "only INSERT, UPDATE, DELETE, or MERGE");
     refused_at_bind("'tx', ['BEGIN NULL; END;'], [], [0]", "statement terminators");
-    refused_at_bind("'tx', ['COMMIT'], [], [0]", "only INSERT, UPDATE, or DELETE");
+    refused_at_bind("'tx', ['COMMIT'], [], [0]", "only INSERT, UPDATE, DELETE, or MERGE");
     refused_at_bind("'tx', ['DELETE FROM ITEMS; COMMIT'], [], [0]", "statement terminators");
     refused_at_bind("'tx', ['DELETE FROM ITEMS WHERE ID = :id'], [], [0]", "has a placeholder with no bind");
     refused_at_bind("'tx', ['DELETE FROM ITEMS'], {id: 1}, [0]", "do not match");

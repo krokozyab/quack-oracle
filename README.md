@@ -791,7 +791,7 @@ SELECT * FROM oracle_execute_transaction('o', 'UPDATE ITEMS SET label = :1 WHERE
 ROLLBACK;
 ```
 
-`oracle_execute_transaction` accepts INSERT, UPDATE and DELETE and returns the
+`oracle_execute_transaction` accepts INSERT, UPDATE, DELETE and MERGE and returns the
 affected row count. Physical DDL is rejected. A statement or fetch failure
 invalidates the remote transaction: issue ROLLBACK before starting another.
 COMMIT failures report an unknown outcome; reconcile the database before replay
@@ -941,7 +941,8 @@ SELECT * FROM oracle_execute('ora',
     'UPDATE app.items SET label = :1 WHERE id = :2', ['x', 7]);
 ```
 
-Returns `affected_rows`. Accepts `INSERT`, `UPDATE` and `DELETE` only.
+Returns `affected_rows`. Accepts `INSERT`, `UPDATE`, `DELETE` and `MERGE`. Oracle MERGE runs as ordinary DML;
+transactional variants do not commit it independently.
 
 ### Many rows at once
 
@@ -1358,7 +1359,7 @@ statement, not a script.
 
 `oracle_query` reads. Use `oracle_execute` for `INSERT`/`UPDATE`/`DELETE`.
 
-### `oracle_execute accepts only INSERT, UPDATE, or DELETE`
+### `oracle_execute accepts only INSERT, UPDATE, DELETE, or MERGE`
 
 <a id="i-need-to-run-create-table-or-another-ddl-statement"></a>
 You are trying to run DDL. `oracle_execute`, `oracle_execute_transaction` and an attached

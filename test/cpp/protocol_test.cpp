@@ -2270,10 +2270,10 @@ static void TestDmlCompositeBlock() {
         ExpectError(kind, [&] { BuildOracleCallBlock(bad); });
     };
     // Not one plain DML statement: transaction control, DDL, PL/SQL, a query,
-    // a second statement after a terminator, MERGE.
+    // a second statement after a terminator, DDL.
     for (const auto *sql : {"COMMIT", "ROLLBACK", "SAVEPOINT s", "CREATE TABLE T2 (ID NUMBER)", "BEGIN NULL; END;",
                             "SELECT * FROM T", "UPDATE T SET V = :a; COMMIT", "UPDATE T SET V = :a;",
-                            "MERGE INTO T USING DUAL ON (1 = 1) WHEN MATCHED THEN UPDATE SET V = :a",
+                            "TRUNCATE TABLE T",
                             "UPDATE T SET V = :a /* unterminated", "UPDATE T SET V = 'unterminated"}) {
         refused(ProtocolErrorKind::MALFORMED, [&](OracleCallRequest &bad) { bad.dml_operations[0].sql = sql; });
     }
@@ -2379,7 +2379,8 @@ static void TestSqlStatementValidation() {
     ExpectError(ProtocolErrorKind::MALFORMED, [] { ValidateOracleAdmin("CREATE TABLE x(id NUMBER); DROP TABLE y"); });
     ExpectError(ProtocolErrorKind::MALFORMED, [] { ValidateOracleAdmin("CREATE TABLE x AS SELECT :1 FROM dual"); });
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { ValidateOracleQuery("delete from invoices where id = :id", binds); });
-    ExpectError(ProtocolErrorKind::MALFORMED, [&] { ValidateOracleDml("merge into invoices x using dual on (1=1)", {}); });
+    CHECK(ClassifyOracleSql("merge into invoices x using dual on (1=1)") == OracleSqlKind::DML);
+    ValidateOracleDml("merge into invoices x using dual on (x.id = :id)", binds);
     ExpectError(ProtocolErrorKind::MALFORMED, [] { ValidateOracleQuery("select 1; delete from x", {}); });
 }
 
