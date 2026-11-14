@@ -14,6 +14,15 @@
 // bytes in DuckDB, so a text key is left alone.
 
 #include "oracle_adapter.hpp"
+#include "duckdb/planner/operator/logical_any_join.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/storage/table_storage_info.hpp"
+#include <functional>
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/planner/operator/logical_merge_into.hpp"
 
 #include "duckdb/main/config.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
@@ -644,6 +653,221 @@ void Walk(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &op, Colum
 	}
 }
 
+[[noreturn]] void RefuseOracleMerge() {
+    throw NotImplementedException("Oracle MERGE/upsert supports equality on enforced keys, one INSERT and optional UPDATE of source columns or constants. Conditions, old-row expressions, key changes and RETURNING are not supported; use oracle_execute with Oracle MERGE SQL");
+}
+
+void RewriteOracleMerges(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+    if (plan->type != LogicalOperatorType::LOGICAL_MERGE_INTO ||
+        plan->Cast<LogicalMergeInto>().table.catalog.GetCatalogType() != "oracle_scanner") {
+        for (auto &child : plan->children) { RewriteOracleMerges(input, child); }
+        return;
+    }
+    auto &merge = plan->Cast<LogicalMergeInto>();
+    if (merge.return_chunk || merge.children.size() != 1 ||
+        merge.children[0]->type != LogicalOperatorType::LOGICAL_PROJECTION) { RefuseOracleMerge(); }
+    auto &projection = merge.children[0]->Cast<LogicalProjection>();
+    auto &root = *projection.children[0];
+    if (root.children.size() != 2) { RefuseOracleMerge(); }
+    idx_t target_side = 2;
+    OracleQueryBindData *bind = nullptr;
+    LogicalGet *get = nullptr;
+    for (idx_t i = 0; i < 2; i++) {
+        if (root.children[i]->type != LogicalOperatorType::LOGICAL_GET) { continue; }
+        auto &candidate = root.children[i]->Cast<LogicalGet>();
+        auto *data = candidate.bind_data ? dynamic_cast<OracleQueryBindData *>(candidate.bind_data.get()) : nullptr;
+        if (data && data->table_entry == &merge.table) { target_side = i; bind = data; get = &candidate; }
+    }
+    if (!bind || target_side == 2) { RefuseOracleMerge(); }
+    auto &source = root.children[1 - target_side];
+    const auto source_bindings = source->GetColumnBindings();
+    const auto is_source = [&](const Expression &expression) {
+        bool valid = true;
+        auto copy = expression.Copy();
+        ExpressionIterator::EnumerateExpression(copy, [&](unique_ptr<Expression> &part) {
+            if (part->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+                const auto binding = part->Cast<BoundColumnRefExpression>().Binding();
+                if (std::find(source_bindings.begin(), source_bindings.end(), binding) == source_bindings.end()) { valid = false; }
+            }
+            if (part->HasSubquery() || part->IsVolatile()) { valid = false; }
+        });
+        return valid;
+    };
+    const auto expanded = [&](const Expression &expression) {
+        auto result = expression.Copy();
+        ExpressionIterator::EnumerateExpression(result, [&](unique_ptr<Expression> &part) {
+            if (part->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+                const auto &ref = part->Cast<BoundColumnRefExpression>();
+                if (ref.Binding().table_index == projection.table_index) {
+                    part = projection.GetExpression(ref.Binding()).Copy();
+                }
+            }
+        });
+        if (!is_source(*result)) { RefuseOracleMerge(); }
+        return result;
+    };
+    struct Key { column_t column; unique_ptr<Expression> value; };
+    using Keys = vector<Key>;
+    using Branches = vector<Keys>;
+    const auto target_column = [&](const Expression &expression) -> optional_idx {
+        const Expression *part = &expression;
+        // A cast of the target can change equality, so leave it unsupported.
+        if (part->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) { return optional_idx(); }
+        const auto binding = part->Cast<BoundColumnRefExpression>().Binding();
+        if (binding.table_index != get->table_index) { return optional_idx(); }
+        return get->GetColumnIndex(binding).GetPrimaryIndex();
+    };
+    std::function<Branches(const Expression &)> parse;
+    parse = [&](const Expression &expression) -> Branches {
+        if (expression.GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION) {
+            const auto &conjunction = expression.Cast<BoundConjunctionExpression>();
+            Branches result;
+            for (const auto &child : conjunction.GetChildren()) {
+                auto next = parse(*child);
+                if (result.empty()) { result = std::move(next); continue; }
+                if (expression.GetExpressionType() == ExpressionType::CONJUNCTION_OR) {
+                    for (auto &branch : next) { result.push_back(std::move(branch)); }
+                } else {
+                    Branches combined;
+                    for (const auto &a : result) {
+                        for (const auto &b : next) {
+                            Keys keys;
+                            for (const auto &key : a) { keys.push_back({key.column, key.value->Copy()}); }
+                            for (const auto &key : b) { keys.push_back({key.column, key.value->Copy()}); }
+                            combined.push_back(std::move(keys));
+                        }
+                    }
+                    result = std::move(combined);
+                }
+                if (result.size() > 64) { RefuseOracleMerge(); }
+            }
+            return result;
+        }
+        if (!BoundComparisonExpression::IsComparison(expression) || expression.GetExpressionType() != ExpressionType::COMPARE_EQUAL) { RefuseOracleMerge(); }
+        const auto &comparison = expression.Cast<BoundFunctionExpression>();
+        const Expression *a = &BoundComparisonExpression::Left(comparison);
+        const Expression *b = &BoundComparisonExpression::Right(comparison);
+        auto column = target_column(*a);
+        if (!column.IsValid()) { std::swap(a, b); column = target_column(*a); }
+        if (!column.IsValid() || column.GetIndex() >= bind->columns.size() || !is_source(*b)) { RefuseOracleMerge(); }
+        Branches result;
+        Keys keys;
+        keys.push_back({column.GetIndex(), b->Copy()});
+        result.push_back(std::move(keys));
+        return result;
+    };
+    Branches branches;
+    if (root.type == LogicalOperatorType::LOGICAL_ANY_JOIN) {
+        branches = parse(*root.Cast<LogicalAnyJoin>().condition);
+    } else if (root.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+        Keys keys;
+        for (const auto &condition : root.Cast<LogicalComparisonJoin>().conditions) {
+            if (!condition.IsComparison() || condition.GetComparisonType() != ExpressionType::COMPARE_EQUAL) { RefuseOracleMerge(); }
+            auto expression = BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, condition.GetLHS().Copy(), condition.GetRHS().Copy());
+            auto parsed = parse(*expression);
+            for (auto &key : parsed[0]) { keys.push_back(std::move(key)); }
+        }
+        branches.push_back(std::move(keys));
+    } else { RefuseOracleMerge(); }
+    const auto storage = merge.table.GetStorageInfo(input.context);
+    for (const auto &branch : branches) {
+        unordered_set<column_t> columns;
+        for (const auto &key : branch) { columns.insert(key.column); }
+        bool enforced = false;
+        for (const auto &index : storage.index_info) { enforced |= index.is_unique && columns == index.column_set; }
+        if (!enforced) { RefuseOracleMerge(); }
+    }
+    BoundMergeIntoAction *insert = nullptr, *update = nullptr;
+    for (auto &entry : merge.actions) {
+        for (auto &action : entry.second) {
+            if (action->condition) { RefuseOracleMerge(); }
+            if (entry.first == MergeActionCondition::WHEN_NOT_MATCHED_BY_TARGET && action->action_type == MergeActionType::MERGE_INSERT && !insert) { insert = action.get(); }
+            else if (entry.first == MergeActionCondition::WHEN_MATCHED && action->action_type == MergeActionType::MERGE_UPDATE && !update) { update = action.get(); }
+            else if (!(entry.first == MergeActionCondition::WHEN_MATCHED && action->action_type == MergeActionType::MERGE_DO_NOTHING)) { RefuseOracleMerge(); }
+        }
+    }
+    if (!insert || insert->expressions.size() != bind->columns.size()) { RefuseOracleMerge(); }
+    vector<unique_ptr<Expression>> values;
+    std::vector<OracleColumn> columns;
+    std::string select_list;
+    const auto add = [&](unique_ptr<Expression> value, column_t column) {
+        const auto alias = "C" + std::to_string(values.size());
+        const auto &declared = bind->columns[column];
+        select_list += (select_list.empty() ? "" : ", ") + OracleBindExpression(declared, values.size()+1) + " " + alias;
+        values.push_back(BoundCastExpression::AddCastToType(input.context, std::move(value), MappedType(declared)));
+        columns.push_back(declared);
+        return "s." + alias;
+    };
+    std::string on;
+    for (const auto &branch : branches) {
+        std::string equal;
+        for (const auto &key : branch) {
+            auto rhs = add(key.value->Copy(), key.column);
+            auto lhs = "t." + Quoted(bind->columns[key.column]);
+            equal += std::string(equal.empty() ? "" : " AND ") + lhs + "=" + rhs;
+        }
+        on += std::string(on.empty() ? "" : " OR ") + "(" + equal + ")";
+    }
+    const auto key_count = values.size();
+    std::function<bool(const Expression &, LogicalOperator &)> is_default;
+    is_default = [&](const Expression &expression, LogicalOperator &node) {
+        const Expression *part = &expression;
+        while (BoundCastExpression::IsCast(*part)) { part = &BoundCastExpression::Child(part->Cast<BoundFunctionExpression>()); }
+        if (part->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
+            part->Cast<BoundFunctionExpression>().Function().GetName() == Identifier("__oracle_scanner_default")) { return true; }
+        if (part->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) { return false; }
+        auto binding = part->Cast<BoundColumnRefExpression>().Binding();
+        if (node.type == LogicalOperatorType::LOGICAL_PROJECTION) {
+            auto &proj = node.Cast<LogicalProjection>();
+            if (binding.table_index == proj.table_index) { return is_default(proj.GetExpression(binding), *proj.children[0]); }
+        }
+        for (auto &child : node.children) { if (is_default(*part, *child)) { return true; } }
+        return false;
+    };
+    std::string insert_columns, insert_values, assignments;
+    for (idx_t i = 0; i < insert->expressions.size(); i++) {
+        const auto &expr = *insert->expressions[i];
+        // Missing columns have a direct NULL default; an explicit NULL is a reference to the source projection.
+        if (expr.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT && expr.Cast<BoundConstantExpression>().GetValue().IsNull()) { continue; }
+        if (is_default(expr, projection)) { continue; }
+        auto value = expanded(expr);
+        if (is_default(*value, *source)) { continue; }
+        insert_values += (insert_values.empty() ? "" : ", ") + add(std::move(value), i);
+        insert_columns += (insert_columns.empty() ? "" : ", ") + Quoted(bind->columns[i]);
+    }
+    if (insert_columns.empty()) { RefuseOracleMerge(); }
+    if (update) {
+        for (idx_t i = 0; i < update->columns.size(); i++) {
+            const auto column = update->columns[i].index;
+            if (is_default(*update->expressions[i], projection)) { RefuseOracleMerge(); }
+            auto value = expanded(*update->expressions[i]);
+            const Expression *plain = value.get();
+            while (BoundCastExpression::IsCast(*plain)) { plain = &BoundCastExpression::Child(plain->Cast<BoundFunctionExpression>()); }
+            if (plain->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF && plain->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) { RefuseOracleMerge(); }
+            bool key_column = false;
+            for (const auto &branch : branches) {
+                for (const auto &key : branch) {
+                    if (key.column == column) {
+                        if (!Expression::Equals(*value, *key.value)) { RefuseOracleMerge(); }
+                        key_column = true;
+                    }
+                }
+            }
+            if (key_column) { continue; }
+            assignments += std::string(assignments.empty() ? "" : ", ") + "t." + Quoted(bind->columns[column]) + "=" + add(std::move(value), column);
+        }
+    }
+    auto target = ResolveOracleWriteTarget(input.context, bind->catalog_name);
+    target.schema_name = bind->schema_name;
+    target.object_name = bind->object_name;
+    auto sql = "MERGE INTO " + OracleObjectReference(bind->schema_name, bind->object_name) + " t USING (SELECT " + select_list + " FROM dual) s ON (" + on + ")";
+    if (!assignments.empty()) { sql += " WHEN MATCHED THEN UPDATE SET " + assignments; }
+    sql += " WHEN NOT MATCHED THEN INSERT (" + insert_columns + ") VALUES (" + insert_values + ")";
+    auto projected = make_uniq<LogicalProjection>(input.optimizer.binder.GenerateTableIndex(), std::move(values));
+    projected->children.push_back(std::move(source));
+    plan = MakeOracleMergePlan(merge.table, merge.table_index, std::move(target), std::move(sql), std::move(columns), key_count, std::move(projected));
+}
+
 void OptimizeOraclePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
 	if (!plan) {
 		return;
@@ -665,6 +889,7 @@ void OptimizeOraclePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperat
 void RegisterOracleOptimizer(DatabaseInstance &db) {
 	OptimizerExtension extension;
 	extension.optimize_function = OptimizeOraclePlan;
+    extension.pre_optimize_function = RewriteOracleMerges;
 	OptimizerExtension::Register(DBConfig::GetConfig(db), std::move(extension));
 	DBConfig::GetConfig(db).AddExtensionOption(
 	    "oracle_top_n_pushdown",

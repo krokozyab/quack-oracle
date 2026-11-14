@@ -3163,6 +3163,98 @@ void TestCallableArgumentsOfTheNewTypes() {
     std::cout << "callable arguments cover national text, BOOLEAN, intervals and local-zone timestamps" << std::endl;
 }
 
+void TestAttachedUpsertsUseOracleMerge() {
+    const auto text_columns = [](std::initializer_list<const char *> names) {
+        std::vector<OracleColumn> result;
+        for (const auto *name : names) {
+            result.push_back(Column(name, 1));
+        }
+        return result;
+    };
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {text_columns({"USER"}), {{Text("APP")}}}});
+    script->routes.push_back({"FROM user_tables", {text_columns({"TABLE_NAME"}), {{Text("ITEMS")}}}});
+    script->routes.push_back({"FROM user_views", {text_columns({"VIEW_NAME"}), {}}});
+    script->routes.push_back(
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {{Text("ITEMS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("N")},
+           {Text("ITEMS"), Text("LABEL"), Text("VARCHAR2"), Number("20"), WireValue(), WireValue(), Text("Y")}}}});
+    script->routes.push_back({"FROM user_constraints", {text_columns({"TABLE_NAME", "COLUMN_NAME"}), {{Text("ITEMS"), Text("ID")}}}});
+    script->tables["ITEMS"] = {{Column("ID", 2, 10, 0), Column("LABEL", 1)},
+                               {{Number("1"), Text("first")}, {Number("2"), Text("second")}}};
+    script->affected_rows = 1;
+
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS ora (TYPE oracle_scanner);");
+
+    for (const auto *sql : {
+            "INSERT INTO ora.main.ITEMS VALUES (7,'seven'),(8,'eight') ON CONFLICT DO NOTHING;",
+            "INSERT INTO ora.main.ITEMS VALUES (7,'seven') ON CONFLICT(ID) DO UPDATE SET LABEL=excluded.LABEL;",
+            "INSERT INTO ora.main.ITEMS VALUES (7,'seven') ON CONFLICT(ID) DO UPDATE SET LABEL='constant';",
+            "INSERT OR REPLACE INTO ora.main.ITEMS VALUES (7,'replacement');",
+            "MERGE INTO ora.main.ITEMS t USING (SELECT 7 AS ID, 'merged' AS LABEL) s ON t.ID=s.ID "
+            "WHEN MATCHED THEN UPDATE SET LABEL=s.LABEL WHEN NOT MATCHED THEN INSERT (ID,LABEL) VALUES (s.ID,s.LABEL);"}) {
+        const auto first = script->queries.size();
+        database.Run(sql);
+        CHECK(script->counted_executes.back().find("MERGE INTO \"ITEMS\" t USING (SELECT") == 0);
+        CHECK(script->counted_executes.back().find("WHEN NOT MATCHED THEN INSERT") != std::string::npos);
+        if (std::string(sql).find("DO UPDATE") != std::string::npos || std::string(sql).find("REPLACE") != std::string::npos) {
+            CHECK(script->counted_executes.back().find("WHEN MATCHED THEN UPDATE SET") != std::string::npos);
+        }
+        CHECK(!script->batch_rows.empty());
+        for (size_t i = first; i < script->queries.size(); i++) {
+            CHECK(script->queries[i].find("FROM \"ITEMS\"") == std::string::npos);
+        }
+    }
+    for (const auto *sql : {
+            "INSERT INTO ora.main.ITEMS VALUES (7,'x') ON CONFLICT(ID) DO UPDATE SET LABEL=ITEMS.LABEL || excluded.LABEL;",
+            "INSERT INTO ora.main.ITEMS VALUES (7,'x') ON CONFLICT(ID) DO UPDATE SET LABEL=excluded.LABEL WHERE ITEMS.ID>0;",
+            "INSERT INTO ora.main.ITEMS VALUES (7,'x') ON CONFLICT DO NOTHING RETURNING *;",
+            "INSERT INTO ora.main.ITEMS VALUES (NULL,'x') ON CONFLICT DO NOTHING;",
+            "MERGE INTO ora.main.ITEMS t USING (SELECT 7 AS ID) s ON t.ID=s.ID WHEN MATCHED THEN DELETE;"}) {
+        const auto writes = script->counted_executes.size();
+        auto result = database.Query(sql);
+        CHECK(result->HasError());
+        CHECK(script->counted_executes.size() == writes);
+        CHECK(!database.Query("SELECT 42;")->HasError());
+    }
+    database.Run("INSERT INTO ora.main.ITEMS(ID) VALUES (10) ON CONFLICT DO NOTHING;");
+    CHECK(script->counted_executes.back().find("INSERT (\"ID\")") != std::string::npos);
+    database.Run("INSERT INTO ora.main.ITEMS VALUES (11,NULL) ON CONFLICT DO NOTHING;");
+    CHECK(script->counted_executes.back().find("INSERT (\"ID\", \"LABEL\")") != std::string::npos);
+    database.Run("BEGIN;");
+    database.Run("INSERT INTO ora.main.ITEMS VALUES (9,'rollback') ON CONFLICT DO NOTHING;");
+    auto raw = database.Query("FROM oracle_execute_transaction('ora', 'MERGE INTO ITEMS t USING dual ON (t.ID=9) WHEN MATCHED THEN UPDATE SET LABEL=''raw''');");
+    CHECK(!raw->HasError() && raw->GetValue(0,0).ToString() == "1");
+    const auto rollbacks = script->rollbacks;
+    database.Run("ROLLBACK;");
+    CHECK(script->rollbacks > rollbacks);
+    auto many = database.Query("FROM oracle_execute_many('ora', 'MERGE INTO ITEMS t USING (SELECT :1 ID FROM dual) s ON (t.ID=s.ID) WHEN NOT MATCHED THEN INSERT (ID) VALUES (s.ID)', [[9],[10]]);");
+    CHECK(!many->HasError() && script->batch_rows.size() == 2);
+    database.Run("PREPARE rv_up AS INSERT INTO ora.main.ITEMS VALUES ($1,$2) ON CONFLICT(ID) DO UPDATE SET LABEL=excluded.LABEL;");
+    database.Run("EXECUTE rv_up(13,'prepared');");
+    database.Run("EXECUTE rv_up(14,'again');");
+    database.Run("DETACH ora;");
+    database.Run("ATTACH 'ora' AS ora (TYPE oracle_scanner, READ_ONLY);");
+    const auto writes_before_readonly = script->counted_executes.size();
+    CHECK(database.Query("EXECUTE rv_up(15,'readonly');")->HasError());
+    CHECK(script->counted_executes.size() == writes_before_readonly);
+    database.Run("DETACH ora;");
+    // A UNIQUE constraint must be exposed too, even without a primary key.
+    for (auto &route : script->routes) {
+        if (route.first == "FROM user_constraints") { route.second.rows.clear(); }
+    }
+    script->routes.insert(script->routes.begin(), {"c.constraint_type='U'",
+        {{Column("CONSTRAINT_NAME",1),Column("COLUMN_NAME",1),Column("CONSTRAINT_TYPE",1)},
+         {{Text("RV_UNIQUE"),Text("ID"),Text("U")}}}});
+    database.Run("ATTACH 'ora' AS ora (TYPE oracle_scanner);");
+    database.Run("INSERT INTO ora.main.ITEMS VALUES (12,'unique') ON CONFLICT(ID) DO NOTHING;");
+    CHECK(script->counted_executes.back().find("MERGE INTO") == 0);
+}
+
 void TestAttachedWritesAgainstAFakeSession() {
     const auto text_columns = [](std::initializer_list<const char *> names) {
         std::vector<OracleColumn> result;
@@ -3228,9 +3320,11 @@ void TestAttachedWritesAgainstAFakeSession() {
                             "MERGE INTO ora.main.ITEMS t USING (SELECT 1 AS ID) s ON t.ID=s.ID "
                             "WHEN MATCHED THEN UPDATE SET LABEL='RV';"}) {
         auto refused = database.Query(ddl);
-        CHECK(refused->HasError() && refused->GetError().find("oracle_execute_admin") != std::string::npos);
+        CHECK(refused->HasError());
         if (std::string(ddl).find("MERGE INTO") == 0) {
-            CHECK(refused->GetError().find("MERGE INTO and ON CONFLICT through ATTACH are not supported yet") != std::string::npos);
+            CHECK(refused->GetError().find("use oracle_execute") != std::string::npos);
+        } else {
+            CHECK(refused->GetError().find("oracle_execute_admin") != std::string::npos);
         }
         CHECK(!database.Query("SELECT count(*) FROM ora.main.ITEMS;")->HasError());
     }
@@ -5070,6 +5164,7 @@ int main() {
     TestScanReleasesItsSession();
     TestReadSessionsArePooledPerConnection();
     TestAttachedCatalogAgainstAFakeSession();
+    TestAttachedUpsertsUseOracleMerge();
     TestAttachedWritesAgainstAFakeSession();
     TestAttachedCatalogNamesTheNewTypes();
     TestInsertBindsMatchTheValuePath();

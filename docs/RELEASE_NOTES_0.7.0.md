@@ -17,3 +17,12 @@
 
 - MERGE is accepted as DML by the raw execution APIs, with Oracle affected-row counts
   and the same transaction ownership as INSERT, UPDATE and DELETE.
+
+- Attached tables expose enforced PRIMARY KEY and UNIQUE keys to DuckDB's conflict binder.
+- ON CONFLICT DO NOTHING, restricted DO UPDATE and INSERT OR REPLACE with one
+  unique key use native Oracle MERGE array DML. Missing columns keep Oracle defaults.
+- The attached MERGE operator supports equality on enforced keys, one INSERT
+  and optional source-column/constant UPDATE. Conditional actions, old-row
+  expressions, key changes, RETURNING and NULL source keys are refused.
+- Concurrent merges of the same new key can fail with ORA-00001; no automatic
+  replay is added. Source deduplication follows DuckDB's conflict binder.

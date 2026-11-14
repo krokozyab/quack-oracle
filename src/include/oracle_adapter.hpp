@@ -573,4 +573,7 @@ void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const 
 std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const OracleQueryBindData &bind,
                                                   const std::vector<column_t> &selected, idx_t sessions);
 
+unique_ptr<LogicalOperator> MakeOracleMergePlan(TableCatalogEntry &table, TableIndex table_index, OracleWriteTarget target,
+    std::string sql, std::vector<OracleColumn> columns, idx_t key_count, unique_ptr<LogicalOperator> source);
+
 } // namespace duckdb

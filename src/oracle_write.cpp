@@ -12,6 +12,7 @@
 // not negotiate.
 
 #include "oracle_adapter.hpp"
+#include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "oracle_scanner/temp_lob.hpp"
 #include "duckdb/catalog/catalog.hpp"
 
@@ -1091,14 +1092,14 @@ class OracleInsertOperator final : public PhysicalOperator {
 public:
     OracleInsertOperator(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
                          OracleWriteTarget target_p, std::string sql_p, std::vector<idx_t> source_indexes_p,
-                         std::vector<OracleColumn> bound_columns_p, std::vector<OracleColumn> returned_columns_p)
+                         std::vector<OracleColumn> bound_columns_p, std::vector<OracleColumn> returned_columns_p, idx_t merge_keys_p = 0)
         : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
           target(std::move(target_p)), sql(std::move(sql_p)), source_indexes(std::move(source_indexes_p)),
-          bound_columns(std::move(bound_columns_p)), returned_columns(std::move(returned_columns_p)) {
+          bound_columns(std::move(bound_columns_p)), returned_columns(std::move(returned_columns_p)), merge_keys(merge_keys_p) {
     }
 
     string GetName() const override {
-        return "ORACLE_INSERT";
+        return merge_keys ? "ORACLE_MERGE" : "ORACLE_INSERT";
     }
 
     bool IsSink() const override {
@@ -1132,6 +1133,13 @@ public:
         }
         std::vector<std::vector<OracleBind>> rows;
         AppendChunkBinds(chunk, source_indexes, bound_columns, rows);
+        for (const auto &row : rows) {
+            for (idx_t key = 0; key < merge_keys; key++) {
+                if (!row[key].value) {
+                    throw NotImplementedException("Oracle attached MERGE/upsert requires non-NULL source conflict keys; use oracle_execute with Oracle MERGE SQL for NULL keys");
+                }
+            }
+        }
         // A failed write leaves this session in a state we cannot classify from
         // here: an ORA- error and a transport failure reach the adapter as the
         // same exception. Discarding the session is the conservative reading of
@@ -1139,7 +1147,7 @@ public:
         try {
             auto &session = TransactionSession(context.client, target);
             global_state.inserted_rows += TranslatingOracleErrors(
-                "Oracle could not insert", [&] { return session.ExecuteBatch(sql, rows); });
+                merge_keys ? "Oracle could not merge" : "Oracle could not insert", [&] { return session.ExecuteBatch(sql, rows); });
         } catch (...) {
             PoisonTransactionSession(context.client, target.catalog_name);
             throw;
@@ -1228,6 +1236,7 @@ private:
     //! Empty unless the statement has RETURNING; then the table's columns, in
     //! order, which is the shape DuckDB evaluates the RETURNING list over.
     std::vector<OracleColumn> returned_columns;
+    idx_t merge_keys = 0;
 };
 
 // UPDATE and DELETE share everything but how a row's binds are built: both send
@@ -1444,6 +1453,45 @@ private:
 };
 
 } // namespace
+
+namespace {
+class OracleMergePlan final : public LogicalExtensionOperator {
+public:
+    OracleMergePlan(TableCatalogEntry &table_p, TableIndex index, OracleWriteTarget target_p, std::string sql_p,
+                    std::vector<OracleColumn> columns_p, idx_t key_count_p, unique_ptr<LogicalOperator> source)
+        : table(table_p), index(index), target(std::move(target_p)), sql(std::move(sql_p)), columns(std::move(columns_p)), key_count(key_count_p) {
+        children.push_back(std::move(source));
+    }
+    vector<ColumnBinding> GetColumnBindings() override {
+        return {ColumnBinding(index, ProjectionIndex(0))};
+    }
+    string GetExtensionName() const override { return "oracle_scanner"; }
+    string GetName() const override { return "ORACLE_MERGE"; }
+    void ResolveTypes() override { types = {LogicalType::BIGINT}; }
+    PhysicalOperator &CreatePlan(ClientContext &, PhysicalPlanGenerator &planner) override {
+        planner.dependencies.AddDependency(table);
+        auto &source = planner.CreatePlan(*children[0]);
+        std::vector<idx_t> indexes;
+        for (idx_t i = 0; i < columns.size(); i++) { indexes.push_back(i); }
+        auto &sink = planner.Make<OracleInsertOperator>(types, estimated_cardinality, target, sql,
+            std::move(indexes), columns, std::vector<OracleColumn>(), key_count);
+        sink.children.push_back(source);
+        return sink;
+    }
+private:
+    TableCatalogEntry &table;
+    TableIndex index;
+    OracleWriteTarget target;
+    std::string sql;
+    std::vector<OracleColumn> columns;
+    idx_t key_count;
+};
+}
+
+unique_ptr<LogicalOperator> MakeOracleMergePlan(TableCatalogEntry &table, TableIndex table_index, OracleWriteTarget target,
+    std::string sql, std::vector<OracleColumn> columns, idx_t key_count, unique_ptr<LogicalOperator> source) {
+    return make_uniq<OracleMergePlan>(table, table_index, std::move(target), std::move(sql), std::move(columns), key_count, std::move(source));
+}
 
 PhysicalOperator &PlanOracleInsert(ClientContext &, PhysicalPlanGenerator &planner, LogicalInsert &op,
                                    optional_ptr<PhysicalOperator> plan, const std::vector<OracleColumn> &columns,

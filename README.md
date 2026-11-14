@@ -776,7 +776,42 @@ writable internally because DuckDB cannot open an in-memory database read-only;
 the attached Oracle catalog retains its read-only access flag.
 
 
-`MERGE INTO` and `ON CONFLICT` through an attached Oracle table are not supported yet.
+#### Upserts and MERGE
+
+```sql
+INSERT INTO o.ITEMS (ID, LABEL) VALUES (7, 'seven') ON CONFLICT (ID) DO NOTHING;
+INSERT INTO o.ITEMS (ID, LABEL) VALUES (7, 'VII')
+    ON CONFLICT (ID) DO UPDATE SET LABEL = excluded.LABEL;
+INSERT OR REPLACE INTO o.ITEMS VALUES (7, 'replacement');
+```
+
+The conflict target must be an enabled, validated, non-deferrable PRIMARY KEY or
+UNIQUE constraint. The statement sends Oracle MERGE as array DML; it does not
+read the destination to decide whether to insert or update. `DO UPDATE` supports
+source column references (`excluded.col`) and constants. Conditions, expressions
+using the old row, key changes, and RETURNING are refused. Missing insert columns
+keep Oracle's defaults; an explicit NULL remains NULL. Updating a column from an
+omitted/default source column is refused. Source conflict keys must be non-NULL
+(including Oracle's empty strings); use raw Oracle MERGE for nullable keys.
+DuckDB's source duplicate elimination applies before the MERGE; use the raw API
+when every duplicate input row must be processed separately.
+
+With more than one unique key, specify the conflict target for `DO UPDATE`.
+DuckDB rejects `INSERT OR REPLACE` on those tables because that syntax has no
+explicit conflict target. `DO NOTHING` can omit the target.
+
+**Concurrent upserts can fail.** Two sessions merging the same new key can both
+choose INSERT. The second waits for the first transaction, then can fail with
+ORA-00001 after the first commits. There is no automatic replay. This was checked
+with two sessions against Free 23ai. DuckDB COMMIT/ROLLBACK retain ownership of
+the Oracle transaction as for ordinary inserts.
+
+The DuckDB `MERGE INTO o.ITEMS ...` operator supports the same subset: equality
+on an enforced key, one unconditional INSERT action and an optional unconditional
+UPDATE of source columns or constants. It sends the same native Oracle MERGE array
+DML; DELETE, conditional actions and RETURNING are refused. For complete Oracle MERGE SQL,
+use `oracle_execute`, `oracle_execute_transaction`, or `oracle_execute_many`.
+
 For `DROP` and `ALTER`, use `oracle_execute_admin` and reattach the catalog.
 
 ### Raw SQL in the attached transaction

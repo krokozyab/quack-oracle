@@ -4,6 +4,9 @@
 // the table functions through oracle_adapter.hpp.
 
 #include "oracle_adapter.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/function/scalar_function.hpp"
+#include "duckdb/planner/operator/logical_merge_into.hpp"
 
 #include "duckdb/transaction/meta_transaction.hpp"
 
@@ -696,7 +699,7 @@ struct OracleAttachedState {
                                       "k.table_name = c.table_name" +
                                       (owner.empty() ? std::string() : " AND k.owner = c.owner") +
                                       " WHERE c.constraint_type = 'P'" + OwnerCondition("c.owner", "AND") + " AND "
-                                      "c.status = 'ENABLED' AND c.validated = 'VALIDATED' ORDER BY c.table_name, "
+                                      "c.status = 'ENABLED' AND c.validated = 'VALIDATED' AND c.deferrable = 'NOT DEFERRABLE' ORDER BY c.table_name, "
                                       "k.position",
                                       {});
             });
@@ -917,6 +920,36 @@ struct OracleAttachedState {
         return entry->second;
     }
 
+    std::vector<std::vector<std::string>> UniqueKeys(const std::string &object_name) const {
+        std::lock_guard<std::mutex> lock(metadata_lock);
+        std::vector<std::vector<std::string>> result;
+        try {
+            OracleMetadataLease session(transaction_pool, config, password);
+            auto cursor = session->Query("SELECT c.constraint_name, k.column_name, c.constraint_type FROM " + View("constraints") +
+                " c JOIN " + View("cons_columns") + " k ON k.constraint_name=c.constraint_name AND k.table_name=c.table_name" +
+                (owner.empty() ? std::string() : " AND k.owner=c.owner") +
+                " WHERE c.constraint_type='U' AND c.status='ENABLED' AND c.validated='VALIDATED'" +
+                " AND c.deferrable='NOT DEFERRABLE' AND c.table_name=" + KeywordHelper::WriteQuotedAndEscaped(object_name, '\'') +
+                OwnerCondition("c.owner", "AND") + " ORDER BY c.constraint_name,k.position", {});
+            std::string previous;
+            for (;;) {
+                const auto batch = cursor->Fetch(STANDARD_VECTOR_SIZE);
+                for (const auto &row : batch.rows) {
+                    if (row.size() != 3 || !row[0] || !row[1] || !row[2] || std::string(row[2]->begin(), row[2]->end()) != "U") {
+                        throw IOException("Oracle UNIQUE metadata is incomplete");
+                    }
+                    std::string name(row[0]->begin(), row[0]->end());
+                    if (name != previous || result.empty()) { result.emplace_back(); previous = name; }
+                    result.back().emplace_back(row[1]->begin(), row[1]->end());
+                }
+                if (batch.exhausted) { break; }
+            }
+            cursor->Close();
+            session.Finish();
+        } catch (const std::exception &) { result.clear(); }
+        return result;
+    }
+
     // Looks one object up, which is a different question from enumerating the
     // schema: the name may simply not be an Oracle object. An empty result says
     // exactly that and is not an error — DuckDB asks its catalogs about names
@@ -1093,7 +1126,9 @@ public:
         for (idx_t index = 0; index < oracle_columns.size(); index++) {
             auto output_name = OutputName(oracle_columns[index], index, used_names);
             output_names.emplace(oracle_columns[index].name, output_name);
-            info->columns.AddColumn(ColumnDefinition(Identifier(output_name), MappedType(oracle_columns[index])));
+            ColumnDefinition definition(Identifier(output_name), MappedType(oracle_columns[index]));
+            definition.SetDefaultValue(make_uniq<FunctionExpression>(Identifier("__oracle_scanner_default"), vector<unique_ptr<ParsedExpression>>()));
+            info->columns.AddColumn(std::move(definition));
             if (!oracle_columns[index].nullable) {
                 // USER_TAB_COLUMNS already carries this, so it costs no query.
                 info->constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(index)));
@@ -1113,6 +1148,15 @@ public:
         }
         if (!key_names.empty()) {
             info->constraints.push_back(make_uniq<UniqueConstraint>(std::move(key_names), true));
+        }
+        for (const auto &key : state->UniqueKeys(object_name)) {
+            duckdb::vector<Identifier> names;
+            for (const auto &column : key) {
+                const auto found = output_names.find(column);
+                if (found == output_names.end()) { names.clear(); break; }
+                names.emplace_back(found->second);
+            }
+            if (!names.empty()) { info->constraints.push_back(make_uniq<UniqueConstraint>(std::move(names), false)); }
         }
         info->on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
         return make_uniq<OracleAttachedTableEntry>(catalog, schema, std::move(info), std::move(state), object_name,
@@ -1144,7 +1188,20 @@ public:
     }
 
     TableStorageInfo GetStorageInfo(ClientContext &) override {
-        return {};
+        TableStorageInfo result;
+        for (const auto &constraint : GetConstraints()) {
+            if (constraint->type != ConstraintType::UNIQUE) { continue; }
+            const auto &unique = constraint->Cast<UniqueConstraint>();
+            IndexInfo index;
+            index.is_unique = true;
+            index.is_primary = unique.IsPrimaryKey();
+            index.is_foreign = false;
+            for (const auto &logical : unique.GetLogicalIndexes(columns)) {
+                index.column_set.insert(columns.GetColumn(logical).Physical().index);
+            }
+            result.index_info.push_back(std::move(index));
+        }
+        return result;
     }
 
     const std::vector<OracleColumn> &OracleColumns() const {
@@ -1179,7 +1236,7 @@ public:
     // database; an Oracle table simply has no DuckDB-local storage, and saying
     // so leaves the connection usable.
     DataTable &GetStorage() override {
-        throw NotImplementedException("Oracle table \"%s\" has no DuckDB-local storage. MERGE INTO and ON CONFLICT through ATTACH are not supported yet. For DROP or ALTER: %s",
+        throw NotImplementedException("Oracle table \"%s\" has no DuckDB-local storage. For DROP or ALTER: %s",
                                       object_name, ORACLE_DDL_ROUTE);
     }
 
@@ -1270,6 +1327,10 @@ public:
         auto &table = op.table.Cast<OracleAttachedTableEntry>();
         return PlanOracleInsert(context, planner, op, plan, table.OracleColumns(),
                                 table.WriteTarget(static_cast<const std::string &>(GetAttached().GetName())));
+    }
+
+    PhysicalOperator &PlanMergeInto(ClientContext &, PhysicalPlanGenerator &, LogicalMergeInto &, PhysicalOperator &) override {
+        throw NotImplementedException("Oracle MERGE/upsert requires the Oracle optimizer rewrite; use oracle_execute with Oracle MERGE SQL");
     }
 
     PhysicalOperator &PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
@@ -1866,6 +1927,12 @@ void ApplyUnconstrainedNumberSetting(ClientContext &context, std::vector<OracleC
 }
 
 void RegisterOracleAttachedCatalog(ExtensionLoader &loader) {
+    ScalarFunction default_marker(Identifier("__oracle_scanner_default"), vector<LogicalType>(), LogicalType::SQLNULL,
+        [](DataChunk &, ExpressionState &, Vector &result) {
+            result.SetVectorType(VectorType::CONSTANT_VECTOR);
+            ConstantVector::SetNull(result, true);
+        }, nullptr, nullptr, nullptr, LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
+    loader.RegisterFunction(default_marker);
     RegisterOracleOptimizer(loader.GetDatabaseInstance());
     // On by default. Once a filter is handed to a scan DuckDB removes it from
     // the plan, so the scan must apply it exactly: the filters this translator
