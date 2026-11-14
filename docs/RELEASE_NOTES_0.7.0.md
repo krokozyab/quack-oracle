@@ -54,8 +54,9 @@ is covered by tests.
   `BINARY_FLOAT`/`BINARY_DOUBLE`, `DATE` and `TIMESTAMP` without a time zone, and
   text Oracle compares byte by byte, so one row comes back instead of every
   distinct value. `avg` still runs in DuckDB.
-- **`MERGE` in `oracle_execute`**, `oracle_execute_transaction` and
-  `oracle_execute_many`, with Oracle's affected-row count.
+- **`MERGE` in `oracle_execute`**, `oracle_execute_transaction`,
+  `oracle_execute_many` and `oracle_execute_composite_transaction`, with
+  Oracle's affected-row count.
 
 ## Faster
 

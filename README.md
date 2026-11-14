@@ -467,7 +467,8 @@ The thing in quotes is the **secret name**, not a connection string.
 
 You get the tables and views of the user you connected as — the same set
 `USER_TABLES` and `USER_VIEWS` would give you, resolved lazily as you name them
-rather than all at once. Names come back as Oracle stores them, which is upper
+rather than all at once. Other schemas you have grants on are there too, as
+`o.HR.EMPLOYEES` (see [Several Oracle schemas](#several-oracle-schemas-in-one-attach)). Names come back as Oracle stores them, which is upper
 case unless they were created quoted. A name typed in another case finds the one
 object that matches ignoring case (`o.items` reads `ITEMS`); if a schema holds both
 `"items"` and `ITEMS`, write the exact spelling. `DESCRIBE`
@@ -485,7 +486,9 @@ can stay in one SQL dialect:
 | `SELECT * FROM user_constraints` | `SELECT * FROM duckdb_constraints()` |
 | `SELECT * FROM all_arguments` | `SELECT * FROM oracle_arguments('ora', 'APP.PROC')` |
 
-You can also `INSERT`, `UPDATE` and `DELETE` here — see the next section.
+You can also `INSERT`, `UPDATE`, `DELETE` and upsert here — see
+[Write data](#5-write-data) — and create, change and drop tables, see
+[below](#creating-and-changing-oracle-tables-through-attach).
 
 ### Several Oracle schemas in one ATTACH
 
@@ -1028,7 +1031,8 @@ invalidates the transaction.
 The declarable types are the ones that table maps Oracle columns to: `VARCHAR`,
 `BIGINT`, `DECIMAL(p,s)`, `DOUBLE`, `FLOAT`, `BLOB`, `TIMESTAMP` and
 `TIMESTAMP_NS`. Declare what the mapping gives, not the type you want: a
-`NUMBER(19)` or an unconstrained `NUMBER` is `VARCHAR`, a `DATE` is `TIMESTAMP`.
+`NUMBER(19)` is `DECIMAL(19,0)`, an unconstrained `NUMBER` is `VARCHAR`, a `DATE`
+is `TIMESTAMP`.
 Cast around the function in DuckDB for anything else.
 
 ### Batches and procedure calls in the attached transaction
@@ -1080,8 +1084,8 @@ SELECT * FROM oracle_execute_composite_transaction('o',
 COMMIT;
 ```
 
-`oracle_execute_composite_transaction` takes up to 16 `INSERT`, `UPDATE` or
-`DELETE` statements, each validated the way `oracle_execute_transaction`
+`oracle_execute_composite_transaction` takes up to 16 `INSERT`, `UPDATE`,
+`DELETE` or `MERGE` statements, each validated the way `oracle_execute_transaction`
 validates one, and sends them as one anonymous block that the extension builds
 itself. After each statement Oracle compares its row count with the count at the
 same position in the fourth argument, and the first mismatch fails the call with
@@ -1094,7 +1098,7 @@ the statements together: a name that several statements use is bound once, with
 one value. Every placeholder needs a bind and every bind must be used. The
 limits are 16 statements, 256 binds, 64 KiB of SQL in total, 8 MiB of bind
 values, and 0 to 1,000,000 expected rows per statement. DDL, PL/SQL, `COMMIT`,
-`ROLLBACK`, `MERGE`, a `;`, and a missing or unused bind are refused at bind,
+`ROLLBACK`, a `;`, and a missing or unused bind are refused at bind,
 before any session is opened.
 
 It never commits or rolls back. When it fails — a count check, a constraint, an
