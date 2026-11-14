@@ -810,6 +810,8 @@ UPDATE o.ITEMS SET label = upper(label) WHERE id < 3 RETURNING id, label;
 DELETE FROM o.ITEMS WHERE id > 100 RETURNING *;
 ```
 
+`DELETE ... RETURNING rowid` returns the scanned Oracle row identity as text.
+
 Like `INSERT`, each row is its own statement, so a large `RETURNING` costs a round
 trip a row. A table with a LOB, JSON or VECTOR column cannot be
 returned from.

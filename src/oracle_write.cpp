@@ -1383,6 +1383,11 @@ protected:
                                        return ValueFor(returned_columns[column_index], values[column_index].value);
                                    }));
             }
+            // DuckDB 2.0 DELETE also carries the virtual row identity in RETURNING's
+            // chunk, even when a parent projection does not select it.
+            if (types.size() == returned_columns.size() + 1) {
+                row_chunk.data.back().SetValue(row, rowid);
+            }
             row_chunk.SetChildCardinality(row + 1);
             global_state.inserted_rows++;
             if (row_chunk.size() == STANDARD_VECTOR_SIZE) {

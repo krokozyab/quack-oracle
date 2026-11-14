@@ -2,6 +2,9 @@
 
 ## Fixes
 
+- DELETE RETURNING initializes DuckDB 2.0's virtual ROWID output, preventing
+  empty identities and uninitialized string data in returned chunks.
+
 - Unsupported operations requiring DuckDB-local storage now distinguish unsupported
   MERGE/upsert from the administrative SQL route for DROP and ALTER.
 

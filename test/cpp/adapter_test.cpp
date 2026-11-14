@@ -3574,6 +3574,10 @@ void TestAttachedWritesAgainstAFakeSession() {
     CHECK(script->returning_statements.back() ==
           "DELETE FROM \"ITEMS\" WHERE ROWID = CHARTOROWID(:1) RETURNING \"ID\", \"LABEL\" INTO :r1, :r2; "
           ":rc := SQL%ROWCOUNT");
+    auto deleted_rowids = database.Query("DELETE FROM ora.main.ITEMS RETURNING rowid, ID;");
+    CHECK(!deleted_rowids->HasError() && deleted_rowids->RowCount()==2);
+    CHECK(deleted_rowids->GetValue(0,0).ToString()=="AAAROW0");
+    CHECK(deleted_rowids->GetValue(0,1).ToString()=="AAAROW1");
     // A row that is gone by the time its statement runs is not reported.
     script->returning_values["rc"] = Number("0");
     auto gone = database.Query("DELETE FROM ora.main.ITEMS RETURNING ID;");
