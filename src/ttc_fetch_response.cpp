@@ -93,7 +93,9 @@ TtcRowContinuationPrefix DecodeRowContinuationPrefix(const uint8_t *data, size_t
         if (present_count > column_count) {
             return std::nullopt;
         }
-        const auto bitmap = source.ReadRaw(bitmap_size);
+        const auto bitmap_at = source.Position();
+        source.Skip(bitmap_size);
+        const auto *bitmap = data + bitmap_at;
         std::vector<size_t> present_columns;
         present_columns.reserve(present_count);
         for (size_t column = 0; column < column_count; column++) {
@@ -403,7 +405,9 @@ bool TtcFetchResponseDecoder::DecodeInternal(const std::vector<uint8_t> &message
             std::vector<TtcColumnFraming> selected_framing;
             if (row_header_present_columns) {
                 selected_columns = WireCarryingColumns(columns, row_header_present_columns);
-                selected_framing = ColumnFraming(columns, selected_columns);
+                if (!result.packed) {
+                    selected_framing = ColumnFraming(columns, selected_columns);
+                }
             }
             const auto &wire_columns = row_header_present_columns ? selected_columns : row_columns;
             const auto &framing = row_header_present_columns ? selected_framing : row_framing;
