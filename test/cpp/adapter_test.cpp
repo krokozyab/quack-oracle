@@ -3851,9 +3851,22 @@ void TestNestedOracleJoinsAndAggregates() {
         {"FROM user_tab_columns",
          {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
            Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
-          {{Text("LINKS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("Y")}}}});
+          {{Text("LINKS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("Y")},
+           {Text("LINKS"), Text("V"), Text("NUMBER"), Number("22"), Number("4"), Number("2"), Text("Y")}}}});
     script->routes.push_back({"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}});
-    script->tables["LINKS"] = {{Column("ID", 2, 10, 0)}, {{Number("1")}, {Number("1")}, {Number("2")}, {WireValue()}}};
+    script->tables["LINKS"] = {{Column("ID", 2, 10, 0), Column("V", 2, 4, 2)},
+        {{Number("1"), Number("1")}, {Number("1"), Number("2")},
+         {Number("2"), Number("3")}, {WireValue(), WireValue()}}};
+    script->tables["LINKS_B"] = script->tables["LINKS"];
+    script->routes.push_back({"FROM all_users", {{Column("USERNAME", 1)}, {{Text("EXTRA")}}}});
+    script->routes.push_back({"FROM all_tables", {{Column("TABLE_NAME", 1)}, {{Text("LINKS_B")}}}});
+    script->routes.push_back({"FROM all_views", {{Column("VIEW_NAME", 1)}, {}}});
+    auto other_dictionary = script->routes[3].second;
+    for (auto &row : other_dictionary.rows) {
+        row[0] = Text("LINKS_B");
+    }
+    script->routes.push_back({"FROM all_tab_columns", std::move(other_dictionary)});
+    script->routes.push_back({"FROM all_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}});
     script->routes.push_back({"COUNT(*)", {{Column("C0", 2, 10, 0), Column("C1", 2, 18, 0)}, {}}});
     auto factory = InstallFake(script);
     TestDatabase database;
@@ -3861,7 +3874,8 @@ void TestNestedOracleJoinsAndAggregates() {
     for (int tables = 2; tables <= 4; tables++) {
         std::string sql = "SELECT a.ID,count(*) FROM o.LINKS a";
         for (int i = 1; i < tables; i++) {
-            sql += " JOIN o.LINKS t" + std::to_string(i) + " ON a.ID=t" + std::to_string(i) + ".ID";
+            sql += std::string(" JOIN ") + (i == 1 ? "o.EXTRA.LINKS_B" : "o.LINKS") +
+                   " t" + std::to_string(i) + " ON a.ID=t" + std::to_string(i) + ".ID";
         }
         sql += " GROUP BY a.ID ORDER BY a.ID;";
         database.Run("SET oracle_join_pushdown=false; SET oracle_aggregate_pushdown=false;");
@@ -3883,12 +3897,40 @@ void TestNestedOracleJoinsAndAggregates() {
         CHECK(script->queries.size() == size_t(tables + 1));
         const auto &sent = script->queries.back();
         CHECK(sent.find("GROUP BY") != std::string::npos);
+        CHECK(sent.find("\"EXTRA\".\"LINKS_B\"") != std::string::npos);
         size_t joins = 0;
         for (auto pos = sent.find(" JOIN "); pos != std::string::npos; pos = sent.find(" JOIN ", pos + 1)) {
             joins++;
         }
         CHECK(joins == size_t(tables - 1));
     }
+    script->routes.push_back({"CAST(SUM(",
+        {{Column("C0", 2, 38, 2), Column("C1", 2, 18, 0)}, {{Number("8"), Number("4")}}}});
+    const std::string average = "SELECT avg(a.V) FROM o.LINKS a JOIN o.EXTRA.LINKS_B b ON a.ID=b.ID "
+                                "JOIN o.LINKS c ON a.ID=c.ID WHERE a.V>1 AND b.V<3";
+    database.Run("SET oracle_session_pool_size=0");
+    const auto compare_average = [&](double expected) {
+        database.Run("SET oracle_join_pushdown=false; SET oracle_aggregate_pushdown=false; SET oracle_filter_pushdown=false");
+        auto local = database.Query(average);
+        CHECK(!local->HasError() && local->GetValue(0, 0).GetValue<double>() == expected);
+        const auto opened = script->sessions_opened;
+        database.Run("SET oracle_join_pushdown=true; SET oracle_aggregate_pushdown=true; SET oracle_filter_pushdown=true");
+        auto remote = database.Query(average);
+        if (remote->HasError()) { std::cerr << remote->GetError() << "\n" << script->queries.back() << std::endl; }
+        CHECK(!remote->HasError() && remote->GetValue(0, 0) == local->GetValue(0, 0));
+        CHECK(script->queries.back().find("\"EXTRA\".\"LINKS_B\"") != std::string::npos);
+        CHECK(script->queries.back().find("WHERE") != std::string::npos);
+        return opened;
+    };
+    compare_average(2.0);
+    script->affected_rows = 1;
+    database.Run("BEGIN; INSERT INTO o.LINKS(ID,V) VALUES (1,4.00)");
+    // The fake transport records writes; supply the pinned session's visible row.
+    script->tables["LINKS"].rows.push_back({Number("1"), Number("4")});
+    script->routes.back().second.rows = {{Number("36"), Number("12")}};
+    const auto opened = compare_average(3.0);
+    CHECK(script->sessions_opened == opened);
+    database.Run("ROLLBACK");
 }
 
 void TestExactAveragePartialPushdown() {
