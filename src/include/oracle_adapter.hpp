@@ -330,7 +330,7 @@ struct OracleQueryBindData final : TableFunctionData {
 
 void AddOracleSourceSchemaChecks(OracleQueryBindData &target, const OracleQueryBindData &source,
                                  const std::vector<column_t> &selected);
-void ValidateOracleSourceSchemas(const OracleQueryBindData &bind, OracleSession &session);
+OracleIoStats ValidateOracleSourceSchemas(const OracleQueryBindData &bind, OracleSession &session);
 
 //! Counters a scan keeps for EXPLAIN ANALYZE. Atomic, because the threads of a
 //! parallel scan add to them together.
@@ -393,6 +393,8 @@ struct OracleQueryGlobalState final : GlobalTableFunctionState {
 
     //! What the scan did, for EXPLAIN ANALYZE (see OracleScanMetrics).
     OracleScanMetrics metrics;
+    OracleIoStats schema_check_io;
+    bool schema_checked = false;
     std::mutex profile_lock;
     InsertionOrderPreservingMap<string> profile_info;
     //! The statement(s) the scan sent, and the filters it applied itself.

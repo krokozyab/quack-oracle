@@ -2767,11 +2767,6 @@ static bool DeferrableColumn(const OracleColumn &column);
 // supplies the wire representation and has to map to the same types.
 unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context, OracleQueryBindData &bind,
                                                          TableFunctionInitInput &input) {
-    if (!bind.source_schema_checks.empty()) {
-        auto schema_session = AcquireOracleReadSession(context, bind.secret_name, bind.catalog_name,
-                                                       bind.config, bind.password);
-        ValidateOracleSourceSchemas(bind, schema_session.Get());
-    }
     if (bind.count_source) {
         auto &source = *bind.count_source;
         Value enabled, requested;
@@ -2791,6 +2786,16 @@ unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context,
         if (!chunks.empty()) {
             auto state = make_uniq<OracleQueryGlobalState>(OracleSessionHandle(), nullptr, bind.columns, bind.types,
                                                            std::move(input.column_ids), bind.columns.size());
+            state->session = AcquireOracleReadSession(context, bind.secret_name, bind.catalog_name,
+                                                       bind.config, bind.password);
+            try {
+                state->schema_check_io = ValidateOracleSourceSchemas(bind, state->session.Get());
+            } catch (...) {
+                state->session.Poison();
+                throw;
+            }
+            state->schema_checked = !bind.source_schema_checks.empty();
+            state->metrics.Add(state->schema_check_io);
             state->parallel = true;
             state->scalar_count = true;
             state->thread_count = MinValue<idx_t>(sessions, chunks.size());
@@ -2812,9 +2817,11 @@ unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context,
     OracleSessionHandle session;
     std::unique_ptr<OracleCursor> cursor;
     OracleScanOpening opened;
+    OracleIoStats schema_check_io;
     try {
         session = AcquireOracleReadSession(context, bind.secret_name, bind.catalog_name, bind.config, bind.password);
         const auto before = session->IoStats();
+        schema_check_io = ValidateOracleSourceSchemas(bind, session.Get());
         // The marker the optimizer left after each table name becomes the statement's snapshot.
         auto sql = bind.statement_sql;
         const auto scn = OracleQuerySnapshot(context, bind);
@@ -2862,6 +2869,8 @@ unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context,
                                                    bind.types, std::move(input.column_ids), chunk_columns);
     state->catalog_name = bind.catalog_name;
     state->scalar_count = bool(bind.count_source);
+    state->schema_check_io = schema_check_io;
+    state->schema_checked = !bind.source_schema_checks.empty();
     state->sent_sql = opened.sql;
     state->metrics.Add(opened.io);
     state->metrics.query_nanoseconds += opened.query_nanoseconds;
@@ -3627,6 +3636,11 @@ void OracleQueryMetrics(TableFunctionGetMetricsInput &input) {
 		metrics.AddExtraInfo("Oracle ROWID ranges", std::to_string(counters.chunks_read.load()) + " read of " +
 		                                                std::to_string(state->chunk_sql.size()));
     }
+    if (state->schema_checked) {
+        const auto trips = state->schema_check_io.round_trips;
+        metrics.AddExtraInfo("Oracle schema check", std::to_string(trips) +
+                             (trips == 1 ? " round trip" : " round trips") + " (included in Oracle network)");
+    }
     if (!state->top_n_execution.empty()) {
         metrics.AddExtraInfo("Oracle Top-N execution", state->top_n_execution);
     }
@@ -3809,8 +3823,18 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
             try {
                 if (!local->session) {
                     const auto acquiring = state.top_n_feedback ? TopNClock() : 0;
-                    local->session = AcquireOracleReadSession(context, state.secret_name, std::string(), state.config,
-                                                              state.password);
+                    // One partial COUNT reader inherits the session that checked
+                    // the sources; no extra connection is held just for checks.
+                    {
+                        std::lock_guard<std::mutex> guard(state.profile_lock);
+                        if (state.session) {
+                            local->session = std::move(state.session);
+                        }
+                    }
+                    if (!local->session) {
+                        local->session = AcquireOracleReadSession(context, state.secret_name, std::string(), state.config,
+                                                                  state.password);
+                    }
                     if (state.top_n_feedback) {
                         TopNMaximum(state.top_n_feedback->maximum_acquire_nanoseconds, TopNClock() - acquiring);
                     }

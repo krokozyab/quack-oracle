@@ -147,6 +147,7 @@ struct FakeScript {
     std::function<void(const std::string &)> query_hook;
     std::chrono::milliseconds query_delay {0};
     bool top_n_cost_model = false;
+    bool track_query_io = false;
     std::chrono::milliseconds top_n_network_delay {0};
     std::chrono::milliseconds top_n_serial_work {0};
     std::chrono::milliseconds top_n_range_work {0};
@@ -171,6 +172,8 @@ struct FakeScript {
     std::map<std::string, FakeTable> tables;
 
     std::vector<std::string> queries;
+    std::vector<std::pair<std::string, size_t>> query_sessions;
+    std::vector<size_t> write_sessions;
     std::vector<std::vector<OracleBind>> query_binds;
     std::vector<bool> statement_cache_settings;
     std::vector<std::string> plain_executes;
@@ -239,6 +242,22 @@ struct FakeScript {
 // Only what the attached scan emits is understood: quoted column names and the
 // ROWID expression, comma-separated.
 static bool ProjectScriptedTable(const FakeScript &script, const std::string &sql, FakeResponse &result) {
+    if (sql.find("SELECT /* oracle_scanner_schema_check */ ") == 0) {
+        size_t from = 0;
+        while ((from = sql.find("(SELECT ", from)) != std::string::npos) {
+            const auto end = sql.find(" WHERE 1 = 0) s", from);
+            if (end == std::string::npos) { return false; }
+            FakeResponse source;
+            if (!ProjectScriptedTable(script, sql.substr(from + 1, end + 11 - from), source)) { return false; }
+            for (auto column : source.columns) {
+                column.name = "SC" + std::to_string(result.columns.size());
+                result.columns.push_back(std::move(column));
+            }
+            from = end + 1;
+        }
+        return !result.columns.empty();
+    }
+
     const auto select_at = sql.find("SELECT ");
     const auto from_at = sql.find(" FROM \"");
     if (select_at != 0 || from_at == std::string::npos) {
@@ -448,7 +467,7 @@ public:
                          std::shared_ptr<oracle_scanner::OracleIoDeadline> deadline_p = nullptr)
         : script(std::move(script_p)), user(std::move(user_p)), deadline(std::move(deadline_p)) {
         std::lock_guard<std::mutex> guard(script->record_lock);
-        script->sessions_opened++;
+        session_id = ++script->sessions_opened;
         script->session_users.push_back(user);
     }
 
@@ -479,6 +498,7 @@ public:
         {
             std::lock_guard<std::mutex> guard(script->record_lock);
             script->queries.push_back(sql);
+            script->query_sessions.emplace_back(sql, session_id);
             script->query_binds.push_back(binds);
         }
         if (!script->query_failure_fragment.empty() && sql.find(script->query_failure_fragment) != std::string::npos) {
@@ -489,7 +509,7 @@ public:
     }
 
     oracle_scanner::OracleIoStats IoStats() const override {
-        return {0, 0, script->top_n_cost_model ? io_queries.load() : 0};
+        return {0, 0, (script->top_n_cost_model || script->track_query_io) ? io_queries.load() : 0};
     }
 
     std::unique_ptr<OracleCursor> QueryWithInitialFetch(const std::string &sql,
@@ -518,6 +538,7 @@ public:
         WaitIfBlocked(sql);
         std::lock_guard<std::mutex> guard(script->record_lock);
         script->counted_executes.push_back(sql);
+        script->write_sessions.push_back(session_id);
         script->counted_execute_binds.push_back(binds);
         script->execute_users.push_back(user);
         if (script->execute_should_fail) {
@@ -532,6 +553,7 @@ public:
         WaitIfBlocked(sql);
         std::lock_guard<std::mutex> guard(script->record_lock);
         script->counted_executes.push_back(sql);
+        script->write_sessions.push_back(session_id);
         script->batch_rows = rows;
         if (script->batch_should_fail) {
             throw oracle_scanner::ProtocolError(*script->fetch_failure, script->fetch_failure_message);
@@ -643,6 +665,7 @@ public:
 
     // Outside the record lock: the wait must not stop anything else.
     std::atomic<uint64_t> io_queries {0};
+    size_t session_id = 0;
     void WaitIfBlocked(const std::string &sql) {
         std::shared_ptr<oracle_scanner::OracleIoDeadline> source;
         {
@@ -3844,6 +3867,7 @@ void TestLargeScalarFetchKeepsRowsAndLocalFilters() {
 
 void TestNestedOracleJoinsAndAggregates() {
     auto script = std::make_shared<FakeScript>();
+    script->track_query_io = true;
     script->routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
     script->routes.push_back({"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("LINKS")}}}});
     script->routes.push_back({"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}});
@@ -3858,12 +3882,18 @@ void TestNestedOracleJoinsAndAggregates() {
         {{Number("1"), Number("1")}, {Number("1"), Number("2")},
          {Number("2"), Number("3")}, {WireValue(), WireValue()}}};
     script->tables["LINKS_B"] = script->tables["LINKS"];
+    script->tables["LINKS_C"] = script->tables["LINKS"];
     script->routes.push_back({"FROM all_users", {{Column("USERNAME", 1)}, {{Text("EXTRA")}}}});
-    script->routes.push_back({"FROM all_tables", {{Column("TABLE_NAME", 1)}, {{Text("LINKS_B")}}}});
+    script->routes.push_back({"FROM all_tables", {{Column("TABLE_NAME", 1)}, {{Text("LINKS_B")}, {Text("LINKS_C")}}}});
     script->routes.push_back({"FROM all_views", {{Column("VIEW_NAME", 1)}, {}}});
     auto other_dictionary = script->routes[3].second;
     for (auto &row : other_dictionary.rows) {
         row[0] = Text("LINKS_B");
+    }
+    const auto b_rows = other_dictionary.rows;
+    for (auto row : b_rows) {
+        row[0] = Text("LINKS_C");
+        other_dictionary.rows.push_back(std::move(row));
     }
     script->routes.push_back({"FROM all_tab_columns", std::move(other_dictionary)});
     script->routes.push_back({"FROM all_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}});
@@ -3894,7 +3924,8 @@ void TestNestedOracleJoinsAndAggregates() {
             CHECK(remote->GetValue(0, row) == local->GetValue(0, row));
             CHECK(remote->GetValue(1, row) == local->GetValue(1, row));
         }
-        CHECK(script->queries.size() == size_t(tables + 1));
+        CHECK(script->queries.size() == 2);
+        CHECK(script->queries.front().find("oracle_scanner_schema_check") != std::string::npos);
         const auto &sent = script->queries.back();
         CHECK(sent.find("GROUP BY") != std::string::npos);
         CHECK(sent.find("\"EXTRA\".\"LINKS_B\"") != std::string::npos);
@@ -3907,7 +3938,7 @@ void TestNestedOracleJoinsAndAggregates() {
     script->routes.push_back({"CAST(SUM(",
         {{Column("C0", 2, 38, 2), Column("C1", 2, 18, 0)}, {{Number("8"), Number("4")}}}});
     const std::string average = "SELECT avg(a.V) FROM o.LINKS a JOIN o.EXTRA.LINKS_B b ON a.ID=b.ID "
-                                "JOIN o.LINKS c ON a.ID=c.ID WHERE a.V>1 AND b.V<3";
+                                "JOIN o.EXTRA.LINKS_C c ON a.ID=c.ID WHERE a.V>1 AND b.V<3 AND c.V>0";
     database.Run("SET oracle_session_pool_size=0");
     const auto compare_average = [&](double expected) {
         database.Run("SET oracle_join_pushdown=false; SET oracle_aggregate_pushdown=false; SET oracle_filter_pushdown=false");
@@ -3915,11 +3946,18 @@ void TestNestedOracleJoinsAndAggregates() {
         CHECK(!local->HasError() && local->GetValue(0, 0).GetValue<double>() == expected);
         const auto opened = script->sessions_opened;
         database.Run("SET oracle_join_pushdown=true; SET oracle_aggregate_pushdown=true; SET oracle_filter_pushdown=true");
+        script->queries.clear();
+        script->query_sessions.clear();
         auto remote = database.Query(average);
         if (remote->HasError()) { std::cerr << remote->GetError() << "\n" << script->queries.back() << std::endl; }
         CHECK(!remote->HasError() && remote->GetValue(0, 0) == local->GetValue(0, 0));
         CHECK(script->queries.back().find("\"EXTRA\".\"LINKS_B\"") != std::string::npos);
         CHECK(script->queries.back().find("WHERE") != std::string::npos);
+        CHECK(script->queries.size() == 2 && script->query_sessions.size() == 2);
+        CHECK(script->query_sessions[0].first.find("oracle_scanner_schema_check") != std::string::npos);
+        CHECK(script->query_sessions[0].second == script->query_sessions[1].second);
+        CHECK(script->queries.front().find("\"EXTRA\".\"LINKS_B\"") != std::string::npos);
+        CHECK(script->queries.front().find("\"EXTRA\".\"LINKS_C\"") != std::string::npos);
         return opened;
     };
     compare_average(2.0);
@@ -3927,10 +3965,56 @@ void TestNestedOracleJoinsAndAggregates() {
     database.Run("BEGIN; INSERT INTO o.LINKS(ID,V) VALUES (1,4.00)");
     // The fake transport records writes; supply the pinned session's visible row.
     script->tables["LINKS"].rows.push_back({Number("1"), Number("4")});
-    script->routes.back().second.rows = {{Number("36"), Number("12")}};
+    script->routes.back().second.rows = {{Number("24"), Number("8")}};
     const auto opened = compare_average(3.0);
     CHECK(script->sessions_opened == opened);
+    CHECK(script->query_sessions[0].second == script->write_sessions.back());
     database.Run("ROLLBACK");
+    script->tables["LINKS"].rows.pop_back();
+
+    // A changed source is refused before the main query, including when its
+    // type ID is unchanged and only NUMBER precision/scale differ.
+    for (bool precision : {false, true}) {
+        auto &column = script->tables["LINKS_C"].columns[0];
+        column.precision = precision ? 12 : 10;
+        column.scale = precision ? 0 : 2;
+        script->queries.clear();
+        auto stale = database.Query(average);
+        CHECK(stale->HasError() && stale->GetError().find("DETACH and ATTACH") != std::string::npos);
+        CHECK(script->queries.size() == 1);
+        CHECK(script->queries.front().find("oracle_scanner_schema_check") != std::string::npos);
+    }
+    script->tables["LINKS_C"].columns[0] = Column("ID", 2, 10, 0);
+    script->queries.clear();
+    CHECK(!database.Query(average + " LIMIT 0")->HasError());
+    CHECK(script->queries.empty());
+
+    script->routes.push_back({"TO_CHAR(SUM(",
+        {{Column("C0", 2, 10, 0), Column("C1", 1), Column("C2", 2, 18, 0)},
+         {{Number("1"), Text("300"), Number("2")}, {Number("2"), Text("300"), Number("1")},
+          {WireValue(), WireValue(), Number("0")}}}});
+    const auto grouped = "SELECT ID,avg(V) FROM o.LINKS GROUP BY ID ORDER BY ID";
+    database.Run("SET oracle_join_pushdown=false; SET oracle_aggregate_pushdown=false; SET oracle_filter_pushdown=false");
+    auto local_group = database.Query(grouped);
+    CHECK(!local_group->HasError() && local_group->RowCount() == 3);
+    database.Run("SET oracle_join_pushdown=true; SET oracle_aggregate_pushdown=true; SET oracle_filter_pushdown=true");
+    script->queries.clear();
+    script->query_sessions.clear();
+    auto remote_group = database.Query(grouped);
+    CHECK(!remote_group->HasError() && remote_group->RowCount() == 3);
+    for (idx_t i = 0; i < 2; ++i) {
+        CHECK(remote_group->GetValue(1, i) == local_group->GetValue(1, i));
+    }
+    CHECK(remote_group->GetValue(1, 2).IsNull() && local_group->GetValue(1, 2).IsNull());
+    CHECK(script->queries.size() == 2);
+    CHECK(script->query_sessions[0].second == script->query_sessions[1].second);
+    const auto profile = database.Query(std::string("EXPLAIN ANALYZE ") + grouped);
+    CHECK(!profile->HasError());
+    const auto text = profile->GetValue(1, 0).ToString();
+    CHECK(text.find("Oracle schema check:") != std::string::npos);
+    CHECK(text.find("1 round trip") != std::string::npos);
+    CHECK(text.find("included in Oracle network") != std::string::npos);
+    CHECK(text.find("2 round trips") != std::string::npos);
 }
 
 void TestExactAveragePartialPushdown() {
@@ -4452,12 +4536,28 @@ void TestParallelCountsCombineOneSnapshot() {
                                       {select + " WHERE \"ID\" < 0", {columns, {{Number("0"), Number("0")}}}});
             }
             script->queries.clear();
+            script->query_sessions.clear();
             const auto result = database.Query(std::string(query) + (empty ? " WHERE ID < 0" : ""));
             CHECK(!result->HasError() && result->RowCount() == 1);
             CHECK(result->GetTypes()[0] == duckdb::LogicalType::BIGINT);
             CHECK(result->GetValue(0, 0).GetValue<int64_t>() == (empty ? 0 : 44));
             CHECK(result->GetValue(1, 0).GetValue<int64_t>() == (empty ? 0 : 26));
             CHECK(ranges_read() == size_t(parts));
+            size_t checked_session = 0, schema_queries = 0;
+            for (const auto &entry : script->query_sessions) {
+                if (entry.first.find("oracle_scanner_schema_check") != std::string::npos) {
+                    checked_session = entry.second;
+                    schema_queries++;
+                }
+            }
+            CHECK(schema_queries == 1);
+            bool used_checked_session = false;
+            for (const auto &entry : script->query_sessions) {
+                if (entry.first.find("CAST(COUNT(") != std::string::npos && entry.second == checked_session) {
+                    used_checked_session = true;
+                }
+            }
+            CHECK(used_checked_session);
             for (const auto &sql : script->queries) {
                 if (sql.find("WHERE ROWID") != std::string::npos) {
                     CHECK(sql.find("AS OF SCN 424242") != std::string::npos);

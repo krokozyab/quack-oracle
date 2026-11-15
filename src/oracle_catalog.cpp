@@ -2760,20 +2760,49 @@ void AddOracleSourceSchemaChecks(OracleQueryBindData &target, const OracleQueryB
     }
 }
 
-void ValidateOracleSourceSchemas(const OracleQueryBindData &bind, OracleSession &session) {
+OracleIoStats ValidateOracleSourceSchemas(const OracleQueryBindData &bind, OracleSession &session) {
+    if (bind.source_schema_checks.empty()) {
+        return {};
+    }
+    std::string select_list, sources;
+    size_t count = 0;
+    for (size_t i = 0; i < bind.source_schema_checks.size(); ++i) {
+        const auto &check = bind.source_schema_checks[i];
+        const auto alias = "s" + std::to_string(i);
+        for (const auto &column : check.columns) {
+            select_list += (select_list.empty() ? "" : ", ") + alias + "." +
+                KeywordHelper::WriteQuotedAndEscaped(column.name, '"') + " \"SC" + std::to_string(count++) + "\"";
+        }
+        sources += std::string(sources.empty() ? "" : ", ") + "(" + check.sql + ") " + alias;
+    }
+    const auto before = session.IoStats();
+    auto cursor = session.Query("SELECT /* oracle_scanner_schema_check */ " + select_list + " FROM " + sources, {});
+    const auto &described = cursor->Columns();
+    if (described.size() != count) {
+        throw IOException("Oracle source schema check returned a different column count; DETACH and ATTACH to refresh its schema");
+    }
+    size_t offset = 0;
     for (const auto &check : bind.source_schema_checks) {
-        auto cursor = session.Query(check.sql, {});
         OracleQueryBindData source;
         source.object_name = check.object_name;
         source.columns = check.columns;
         std::vector<column_t> selected;
+        std::vector<OracleColumn> columns;
         selected.reserve(check.columns.size());
+        columns.reserve(check.columns.size());
         for (idx_t i = 0; i < check.columns.size(); ++i) {
+            auto column = described[offset];
+            if (column.name != "SC" + std::to_string(offset++)) {
+                throw IOException("Oracle source schema check returned different column aliases; DETACH and ATTACH to refresh its schema");
+            }
+            column.name = check.columns[i].name;
+            columns.push_back(std::move(column));
             selected.push_back(i);
         }
-        (void)ProjectedDescribe(source, selected, cursor->Columns());
-        cursor->Close();
+        (void)ProjectedDescribe(source, selected, std::move(columns));
     }
+    cursor->Close();
+    return session.IoStats() - before;
 }
 
 void InvalidateOracleScanPlan(ClientContext &context, const std::string &key) {
