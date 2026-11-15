@@ -2780,7 +2780,10 @@ unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context,
             sql.replace(at, marker.size(), replacement);
             at += replacement.size();
         }
+        const auto query_started = std::chrono::steady_clock::now();
         cursor = OpenOracleScalarRead(session.Get(), sql, bind.columns);
+        opened.query_nanoseconds = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - query_started).count());
         opened.sql = sql;
         opened.io = session->IoStats() - before;
     } catch (const std::exception &error) {
@@ -2816,6 +2819,7 @@ unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context,
     state->catalog_name = bind.catalog_name;
     state->sent_sql = opened.sql;
     state->metrics.Add(opened.io);
+    state->metrics.query_nanoseconds += opened.query_nanoseconds;
     state->metrics.sessions = 1;
     state->last_io = state->session ? state->session->IoStats() : OracleIoStats();
     return std::move(state);
@@ -3125,6 +3129,7 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
                                                        std::move(chunk_types), std::move(input.column_ids), chunk_columns);
         state->local_filter = std::move(local_filter);
         state->metrics.Add(described.io);
+        state->metrics.query_nanoseconds += described.query_nanoseconds;
         state->fetch_rows = OracleScanFetchRows(context, bind);
         state->direct_scalar = OracleDirectScanEnabled(context, bind);
         state->parallel = true;
@@ -3220,6 +3225,7 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
     state->sent_sql = opened.sql;
     state->local_filter_text = state->local_filter ? state->local_filter->ToString() : std::string();
     state->metrics.Add(opened.io);
+    state->metrics.query_nanoseconds += opened.query_nanoseconds;
     state->metrics.sessions = 1;
     state->last_io = io_after_open;
     return std::move(state);
@@ -3257,6 +3263,7 @@ void OracleQueryMetrics(TableFunctionGetMetricsInput &input) {
 	                                           " received, " +
 	                                           StringUtil::BytesToHumanReadableString(counters.bytes_sent.load()) +
 	                                           " sent, " + std::to_string(counters.round_trips.load()) + " round trips");
+	metrics.AddExtraInfo("Oracle query open time", seconds(counters.query_nanoseconds.load()));
 	metrics.AddExtraInfo("Oracle fetch time", seconds(counters.fetch_nanoseconds.load()));
     metrics.AddExtraInfo("Value conversion time", counters.direct_batches.load()
                                                       ? "included in fetch for direct batches"
@@ -3430,7 +3437,7 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
                 }
                 const auto opened_at = clock_now();
                 local->cursor = local->session->Query(state.chunk_sql[chunk], {});
-                state.metrics.fetch_nanoseconds += elapsed(opened_at);
+                state.metrics.query_nanoseconds += elapsed(opened_at);
                 state.metrics.chunks_read++;
                 const auto io_now = local->session->IoStats();
                 state.metrics.Add(io_now - local->last_io);

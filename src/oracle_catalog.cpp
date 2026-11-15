@@ -13,6 +13,7 @@
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/common/types/decimal.hpp"
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -2743,6 +2744,7 @@ void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const 
     try {
         session = AcquireOracleReadSession(context, bind.secret_name, bind.catalog_name, bind.config, bind.password);
         const auto before = session->IoStats();
+        const auto query_started = std::chrono::steady_clock::now();
         if (!schema_only && !bind.for_update && !bind.order_clause.empty()) {
             std::vector<OracleColumn> projected;
             for (const auto column : selected) {
@@ -2755,6 +2757,8 @@ void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const 
         if (opening) {
             opening->sql = sql;
             opening->io = session->IoStats() - before;
+            opening->query_nanoseconds = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - query_started).count());
         }
     } catch (const std::exception &error) {
         session.Poison();

@@ -71,3 +71,8 @@
 - Finish sequential scans after consuming an exhausted batch, avoiding an extra
   cursor fetch and interrupt watcher. Buffered rows and parallel ROWID ranges
   retain their normal traversal.
+
+- `EXPLAIN ANALYZE` reports cursor execution and initial-row latency as
+  `Oracle query open time`, separately from subsequent fetches. Parallel scans
+  now charge range opens to this metric instead of fetch time. Durations are
+  summed across readers and can exceed wall time.

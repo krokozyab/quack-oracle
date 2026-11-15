@@ -133,6 +133,8 @@ struct FakeScript {
     //! the way a real cursor does.
     bool two_batch_fetch = false;
     bool reject_fetch_after_exhaustion = false;
+    std::string query_delay_fragment;
+    std::chrono::milliseconds query_delay {0};
     bool packed_fetch = false;
     size_t packed_fetches = 0;
     bool direct_fetch = false;
@@ -435,6 +437,9 @@ public:
     }
 
     std::unique_ptr<OracleCursor> Query(const std::string &sql, const std::vector<OracleBind> &binds) override {
+        if (!script->query_delay_fragment.empty() && sql.find(script->query_delay_fragment) != std::string::npos) {
+            std::this_thread::sleep_for(script->query_delay);
+        }
         WaitIfBlocked(sql);
         {
             std::lock_guard<std::mutex> guard(script->record_lock);
@@ -3248,6 +3253,28 @@ void TestJoinKeysReachOracle() {
     CHECK(analysis.find("Oracle SQL") != std::string::npos && analysis.find("WHERE \"ID\" > 1000") != std::string::npos &&
           analysis.find("Oracle rows returned") != std::string::npos &&
           analysis.find("Oracle network") != std::string::npos && analysis.find("Oracle sessions") != std::string::npos);
+    // Initial execution happens in Query, before Fetch: short queries can do
+    // nearly all of their work there. Both scan and aggregate must report it.
+    script->query_delay_fragment = "FROM \"FACTS\"";
+    script->query_delay = std::chrono::milliseconds(25);
+    for (bool aggregate : {false, true}) {
+        database.Run(std::string("SET oracle_aggregate_pushdown=") + (aggregate ? "true" : "false"));
+        const auto query = aggregate
+                               ? "SELECT ID,count(*),sum(ID),min(ID) FROM o.main.FACTS GROUP BY ID"
+                               : "SELECT ID FROM o.main.FACTS";
+        auto timed = database.Query(std::string("EXPLAIN ANALYZE ") + query);
+        CHECK(!timed->HasError());
+        std::string timed_plan;
+        for (duckdb::idx_t row = 0; row < timed->RowCount(); row++) {
+            timed_plan += timed->GetValue(1, row).ToString();
+        }
+        const std::string label = "Oracle query open time: ";
+        const auto at = timed_plan.find(label);
+        CHECK(at != std::string::npos);
+        CHECK(std::stod(timed_plan.substr(at + label.size())) >= 0.020);
+    }
+    script->query_delay_fragment.clear();
+    database.Run("SET oracle_aggregate_pushdown=false;");
     // A system sample of a table is taken by Oracle, not by reading every row. A filter
     // above the sample stays above it, in DuckDB; a filter below it is part of the scan,
     // and the sample then stays in DuckDB, after the filter.
@@ -3819,6 +3846,20 @@ void TestAttachedScanReadsInRowidRanges() {
         "SELECT count(*), bool_and(ID > previous) FROM (SELECT ID, lag(ID, 1, -1) OVER (ORDER BY rowid) previous FROM copied);");
     CHECK(!copied->HasError() && copied->GetValue(0, 0).GetValue<int64_t>() == 10 * ROWS_PER_RANGE &&
           copied->GetValue(1, 0).GetValue<bool>());
+    script->query_delay_fragment = "WHERE ROWID";
+    script->query_delay = std::chrono::milliseconds(25);
+    auto timed_ranges = database.Query("EXPLAIN ANALYZE SELECT count(*) FROM o.main.FACTS;");
+    CHECK(!timed_ranges->HasError());
+    std::string range_plan;
+    for (duckdb::idx_t row = 0; row < timed_ranges->RowCount(); row++) {
+        range_plan += timed_ranges->GetValue(1, row).ToString();
+    }
+    const std::string open_label = "Oracle query open time: ";
+    const auto open_at = range_plan.find(open_label);
+    CHECK(open_at != std::string::npos);
+    // Ten delayed opens are accumulated across workers, not just the last one.
+    CHECK(std::stod(range_plan.substr(open_at + open_label.size())) >= 0.200);
+    script->query_delay_fragment.clear();
     // Planning and reading are sequential on one worker and fit a single lease.
     // Repeated scans must not authenticate a fresh dictionary session each time.
     database.Run("SET threads = 1;");

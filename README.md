@@ -850,6 +850,7 @@ Oracle SQL: SELECT "GRP", "PAD", "ID" FROM "MT" WHERE "GRP" < 10
 Oracle sessions: 1
 Oracle rows returned: 100000
 Oracle network: 1.2 MiB received, 1.0 KiB sent, 50 round trips
+Oracle query open time: 0.006 s
 Oracle fetch time: 0.056 s
 Value conversion time: 0.004 s
 Filters applied after fetching: ((#1 >= 'x') AND (#1 < 'y'))
@@ -858,8 +859,12 @@ Filters applied after fetching: ((#1 >= 'x') AND (#1 < 'y'))
 The statement is the one Oracle ran (the first of the ROWID ranges, with a count of the
 rest, for a parallel scan); the rows are what Oracle returned before DuckDB filtered them;
 the network line is the bytes and request/response round trips on the connections the
-scan used; fetch time is the wait for Oracle plus decoding its answer, conversion time is
-turning that into DuckDB values; and the last line is every filter Oracle was *not* sent.
+scan used. Query open time measures successful cursor opens, including execution,
+describe and initial rows; a small result may finish entirely in that step. It excludes
+session acquisition and snapshot/range planning. Fetch time measures subsequent cursor
+fetches and decoding; conversion time measures writing DuckDB values (included in fetch
+for direct batches). Parallel timings add the durations across readers, so their sum
+can exceed wall time. The last line is every filter Oracle was *not* sent.
 
 ---
 

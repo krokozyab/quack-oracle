@@ -323,6 +323,7 @@ struct OracleScanMetrics {
     std::atomic<uint64_t> bytes_received {0};
     std::atomic<uint64_t> bytes_sent {0};
     std::atomic<uint64_t> round_trips {0};
+    std::atomic<uint64_t> query_nanoseconds {0};
     std::atomic<uint64_t> fetch_nanoseconds {0};
     std::atomic<uint64_t> convert_nanoseconds {0};
     std::atomic<uint64_t> sessions {0};
@@ -583,6 +584,7 @@ PhysicalOperator &PlanOracleDelete(ClientContext &context, PhysicalPlanGenerator
 struct OracleScanOpening {
     std::string sql;
     OracleIoStats io;
+    uint64_t query_nanoseconds = 0;
 };
 //! Installs the plan rewrites for attached tables (src/oracle_optimizer.cpp).
 void RegisterOracleOptimizer(DatabaseInstance &db);
