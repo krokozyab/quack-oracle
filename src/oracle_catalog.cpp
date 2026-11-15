@@ -123,11 +123,14 @@ private:
 
 // Owners have independent metadata caches, but one attachment shares its DDL
 // epoch, DDL lock and transaction-session pool across every schema alias.
-std::atomic<uint64_t> next_attachment_id {0};
 struct OracleAttachedEpoch {
+    static uint64_t NextIdentity() {
+        static std::atomic<uint64_t> next_id {0};
+        return ++next_id;
+    }
     std::mutex ddl_lock;
     std::atomic<idx_t> version {0};
-    const uint64_t identity = ++next_attachment_id;
+    const uint64_t identity = NextIdentity();
 };
 
 struct OracleAttachedState {
@@ -2960,6 +2963,7 @@ void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const 
         const auto query_started = std::chrono::steady_clock::now();
         if (!schema_only && !bind.for_update && !bind.order_clause.empty()) {
             std::vector<OracleColumn> projected;
+            projected.reserve(selected.size());
             for (const auto column : selected) {
                 projected.push_back(column < bind.columns.size() ? bind.columns[column] : OracleColumn());
             }

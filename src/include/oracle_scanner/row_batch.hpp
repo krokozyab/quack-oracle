@@ -53,7 +53,7 @@ private:
 };
 
 inline bool operator==(OracleByteView left, OracleByteView right) {
-    return left.size() == right.size() && (!left.size() || std::memcmp(left.data(), right.data(), left.size()) == 0);
+    return left.size() == right.size() && (left.empty() || std::memcmp(left.data(), right.data(), left.size()) == 0);
 }
 inline bool operator==(OracleByteView left, const std::vector<uint8_t> &right) {
     return left == OracleByteView(right);
@@ -87,13 +87,13 @@ public:
         // or reassigning a column). Rebase the source after any reallocation.
         const auto address = reinterpret_cast<uintptr_t>(value.data());
         const auto base = reinterpret_cast<uintptr_t>(bytes.data());
-        const bool internal = value.size() && address >= base && address - base < bytes.size() &&
+        const bool internal = !value.empty() && address >= base && address - base < bytes.size() &&
                               value.size() <= bytes.size() - (address - base);
         const auto source_offset = internal ? address - base : 0;
         if (internal) {
             bytes.resize(offset + value.size());
             std::memmove(bytes.data() + offset, bytes.data() + source_offset, value.size());
-        } else if (value.size()) {
+        } else if (!value.empty()) {
             bytes.insert(bytes.end(), value.begin(), value.end());
         }
         return offset;

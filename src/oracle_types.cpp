@@ -946,7 +946,7 @@ std::unique_ptr<OracleCursor> OpenOracleScalarRead(OracleSession &session, const
                 return session.Query(sql, {});
             }
             // Allow for character-set expansion on the wire.
-            width = 4 * column.byte_width;
+            width = size_t(4) * column.byte_width;
             break;
         default:
             return session.Query(sql, {});
