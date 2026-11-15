@@ -421,6 +421,23 @@ SELECT oracle_scanner_version() = (SELECT oracle_scanner_version());
 ----
 true
 
+# Parallel Top-N is explicitly enabled; default queries retain one ranked read.
+query I
+SELECT current_setting('oracle_parallel_top_n');
+----
+false
+
+statement ok
+SET oracle_parallel_top_n=true;
+
+query I
+SELECT current_setting('oracle_parallel_top_n');
+----
+true
+
+statement ok
+SET oracle_parallel_top_n=false;
+
 # MERGE reaches bind validation as DML and fails locally for a missing placeholder.
 statement error
 SELECT * FROM oracle_execute_many('oracle_test', 'MERGE INTO app.t t USING dual ON (t.id=:missing) WHEN MATCHED THEN UPDATE SET t.id=:1', [[1]]);

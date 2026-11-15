@@ -3133,6 +3133,7 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
         state->fetch_rows = OracleScanFetchRows(context, bind);
         state->direct_scalar = OracleDirectScanEnabled(context, bind);
         state->parallel = true;
+        state->parallel_top_n = !bind.order_clause.empty();
         state->thread_count = MinValue<idx_t>(sessions, chunks.size());
         state->chunk_sql = std::move(chunks);
         state->secret_name = bind.secret_name;
@@ -3436,7 +3437,9 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
                     local->last_io = local->session->IoStats();
                 }
                 const auto opened_at = clock_now();
-                local->cursor = local->session->Query(state.chunk_sql[chunk], {});
+                local->cursor = state.parallel_top_n
+                                    ? OpenOracleScalarRead(local->session.Get(), state.chunk_sql[chunk], state.columns)
+                                    : local->session->Query(state.chunk_sql[chunk], {});
                 state.metrics.query_nanoseconds += elapsed(opened_at);
                 state.metrics.chunks_read++;
                 const auto io_now = local->session->IoStats();

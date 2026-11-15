@@ -381,6 +381,7 @@ struct OracleQueryGlobalState final : GlobalTableFunctionState {
     bool direct_scalar = false;
     size_t fetch_rows = STANDARD_VECTOR_SIZE;
     bool parallel = false;
+    bool parallel_top_n = false;
     std::vector<std::string> chunk_sql;
     std::atomic<idx_t> next_chunk {0};
     idx_t thread_count = 1;

@@ -1348,6 +1348,25 @@ SET oracle_parallel_scan = 8;
 SELECT * FROM o.BIG_TABLE;          -- up to 8 sessions, each reading ROWID ranges
 ```
 
+For a large ranked read on a low-latency connection, parallel Top-N can use the
+same readers. Enable it explicitly:
+
+```sql
+SET oracle_parallel_top_n = true;
+SET oracle_parallel_scan = 4;
+SELECT order_id, amount FROM o.ORDERS ORDER BY amount DESC, order_id LIMIT 10;
+```
+
+Each range uses the same SCN and returns its best `limit + offset` candidates;
+DuckDB's Top-N chooses the final rows. This targets roughly one range per reader.
+It requires an eligible pushed ordering and all its filters to be pushed, plus
+the ordinary parallel-scan privileges and table-size safeguards. Plain LIMIT,
+samples and reads pinned to a write transaction retain their existing paths.
+Without range-planning privileges it falls back to one ranked read.
+
+The default is `false`: extra planning exchanges and range queries can cost more
+than one query on a remote connection. Compare both settings for the actual workload.
+
 ROWID planning reuses the read-session pool (`oracle_session_pool_size`); a failed
 planning exchange discards its session before falling back to a serial scan.
 
@@ -1469,6 +1488,7 @@ response exceeding that count is rejected.
 | `oracle_direct_scan` | `true` | Decode eligible attached scalar scans directly into typed vectors. NUMBER, DATE/TIMESTAMP, binary floats, BOOLEAN and short VARCHAR2/CHAR/RAW are supported; other columns retain the existing path. Set `false` for comparisons or troubleshooting. |
 | `oracle_fetch_rows` | `16384` | Maximum scalar attached-scan fetch rows, 1..65536. Output vectors remain 2048 rows. Declared row widths reduce the request toward an 8 MiB estimate; deferred, locked and short-limit scans retain the smaller path. |
 | `oracle_parallel_scan` | `-1` | Maximum sessions one scan of an attached table may read through at once: `-1` chooses (up to 8 and DuckDB's thread count, for a table of 500,000 rows or more; roughly 16 MiB or 250,000 filtered rows per reader), `0` or `1` is one session. Small tables and selective filters stay sequential even with a positive maximum. See [section 7](#7-read-a-big-table-faster). |
+| `oracle_parallel_top_n` | `false` | Allow eligible Top-N reads to rank candidates per ROWID range at one SCN and merge them in DuckDB. Uses `oracle_parallel_scan` and the thread cap; adds exchanges and can be slower on a remote connection. Plain LIMIT stays on one read. |
 | `oracle_consistent_read` | `false` | Read every attached table of a statement `AS OF` one SCN. See [One moment for a whole statement](#one-moment-for-a-whole-statement). |
 
 Pooling matters more than it looks. Opening a session costs a TCP connect, a TLS

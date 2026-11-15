@@ -1226,6 +1226,9 @@ void OptimizeOraclePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperat
 } // namespace
 
 void RegisterOracleOptimizer(DatabaseInstance &db) {
+    DBConfig::GetConfig(db).AddExtensionOption(
+        "oracle_parallel_top_n", "Rank each ROWID range in Oracle and merge candidates in DuckDB; adds round trips.",
+        LogicalType::BOOLEAN, Value::BOOLEAN(false));
     DBConfig::GetConfig(db).AddExtensionOption("oracle_direct_scan",
                                                "Decode supported attached scalar rows into typed vectors during fetch.",
                                                LogicalType::BOOLEAN, Value::BOOLEAN(true));

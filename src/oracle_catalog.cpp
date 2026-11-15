@@ -2587,9 +2587,19 @@ std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const 
     // chunk, and a transaction that has written already holds the one session that
     // can see its rows. A scan that feeds an UPDATE or DELETE has pinned that session
     // already, to lock the rows it names, so it never reaches here in parallel.
-    if (sessions < 2 || !bind.sample_clause.empty() || !bind.order_clause.empty() ||
+    if (sessions < 2 || !bind.sample_clause.empty() ||
         TryTransactionSession(context, bind.catalog_name)) {
         return {};
+    }
+    const bool bounded = !bind.order_clause.empty();
+    if (bounded) {
+        Value enabled;
+        // Only ranked candidates can be merged by the retained DuckDB Top-N.
+        // Plain LIMIT stays on its one-query path, even with the opt-in set.
+        if (bind.top_n.empty() || !context.TryGetCurrentSetting("oracle_parallel_top_n", enabled) ||
+            enabled.IsNull() || !BooleanValue::Get(enabled)) {
+            return {};
+        }
     }
     OracleSessionHandle session;
     try {
@@ -2645,9 +2655,10 @@ std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const 
         if (extents.empty() || total_blocks < MINIMUM_BLOCKS) {
             return {};
         }
-        // About four chunks to a session, so a thread that finishes early takes
-        // another instead of waiting for the slowest.
-        const uint64_t chunks = MinValue<uint64_t>(MinValue<uint64_t>(sessions * 4, 64), total_blocks / 256);
+        // Unbounded copies use about four chunks per reader for balancing.
+        // Ranked reads use one: each extra range costs another bounded query.
+        const uint64_t chunks =
+            MinValue<uint64_t>(MinValue<uint64_t>(sessions * (bounded ? 1 : 4), 64), total_blocks / 256);
         const uint64_t target = (total_blocks + chunks - 1) / chunks;
         std::vector<std::string> cuts;
         uint64_t accumulated = 0;
@@ -2679,7 +2690,8 @@ std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const 
             if (index < cuts.size()) {
                 range += (range.empty() ? "" : " AND ") + std::string("ROWID < CHARTOROWID(") + TextLiteral(cuts[index]) + ")";
             }
-            statements.push_back("SELECT " + select_list + " FROM " + as_of + " WHERE " + range + where);
+            statements.push_back("SELECT " + select_list + " FROM " + as_of + " WHERE " + range + where +
+                                 bind.order_clause);
         }
         return statements.size() >= 2 ? statements : std::vector<std::string>();
     } catch (const std::exception &) {

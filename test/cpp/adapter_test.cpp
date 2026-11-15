@@ -3889,6 +3889,127 @@ void TestAttachedScanReadsInRowidRanges() {
     std::cout << "an attached scan can read in ROWID ranges at one SCN" << std::endl;
 }
 
+void TestParallelTopNRanksCandidatesAtOneSnapshot() {
+    auto script = std::make_shared<FakeScript>();
+    script->routes = {
+        {"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}},
+        {"dbms_flashback", {{Column("SCN", 2)}, {{Number("424242")}}}},
+        {"iot_type", {{Column("IOT_TYPE", 1), Column("TEMPORARY", 1), Column("CLUSTER_NAME", 1)},
+                       {{std::nullopt, Text("N"), std::nullopt}}}},
+        {"num_rows IS NOT NULL", {{Column("TABLE_NAME", 1), Column("NUM_ROWS", 2)},
+                                   {{Text("TOPS"), Number("1000000")}}}},
+        {"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("TOPS")}}}},
+        {"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}},
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {{Text("TOPS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("Y")}}}},
+        {"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}}};
+    FakeResponse extents {{Column("LOW", 1), Column("BLOCKS", 2)}, {}};
+    for (int i = 0; i < 10; i++) {
+        extents.rows.push_back({Text("EXTENT" + std::to_string(i)), Number("1000")});
+    }
+    script->routes.insert(script->routes.begin(), {"dba_extents", extents});
+    auto &table = script->tables["TOPS"];
+    table.columns = {Column("ID", 2, 10, 0)};
+    for (int i = 0; i < 40; i++) {
+        table.rows.push_back({Number(std::to_string(i))});
+    }
+    table.rows.insert(table.rows.end(), 4, {std::nullopt});
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS o(TYPE oracle_scanner); SET threads=4; SET oracle_parallel_scan=4;");
+    database.Run("CREATE TEMP TABLE expected AS SELECT i::BIGINT AS ID FROM range(40) r(i) UNION ALL "
+                 "SELECT NULL::BIGINT FROM range(4);");
+    const auto ranges_read = [&] {
+        size_t count = 0;
+        for (const auto &sql : script->queries) {
+            count += sql.find("WHERE ROWID") != std::string::npos;
+        }
+        return count;
+    };
+    CHECK(!database.Query("SELECT ID FROM o.TOPS ORDER BY ID DESC LIMIT 3;")->HasError());
+    CHECK(ranges_read() == 0); // default remains one bounded query
+    database.Run("SET oracle_parallel_top_n=true;");
+    for (int mode = 0; mode < 4; mode++) {
+        const bool descending = mode % 2 == 0;
+        const bool nulls_first = mode < 2;
+        const std::string filter = mode == 3 ? " WHERE ID > 5" : "";
+        const std::string remote_filter = mode == 3 ? " AND (\"ID\" > 5)" : "";
+        const std::string direction = descending ? " DESC" : " ASC";
+        const std::string null_order = nulls_first ? " NULLS FIRST" : " NULLS LAST";
+        const std::string remote_order = " ORDER BY \"ID\"" + direction + null_order + " FETCH FIRST 5 ROWS ONLY";
+        for (int range = 0; range < 4; range++) {
+            std::vector<std::optional<int>> values;
+            if (mode != 3) {
+                values.push_back(std::nullopt);
+            }
+            for (int i = range * 10; i < (range + 1) * 10; i++) {
+                if (mode != 3 || i > 5) {
+                    values.push_back(i);
+                }
+            }
+            std::sort(values.begin(), values.end(), [&](const auto &a, const auto &b) {
+                if (!a || !b) {
+                    return a.has_value() != b.has_value() && (nulls_first ? !a : !b);
+                }
+                return descending ? *a > *b : *a < *b;
+            });
+            FakeResponse candidates {table.columns, {}};
+            for (size_t i = 0; i < (std::min)(size_t(5), values.size()); i++) {
+                candidates.rows.push_back({values[i] ? Number(std::to_string(*values[i])) : WireValue()});
+            }
+            std::string range_where;
+            if (range > 0) {
+                range_where = "ROWID >= CHARTOROWID('EXTENT" + std::to_string(range * 3) + "')";
+            }
+            if (range < 3) {
+                range_where += (range_where.empty() ? "" : " AND ") +
+                               std::string("ROWID < CHARTOROWID('EXTENT") + std::to_string((range + 1) * 3) + "')";
+            }
+            const auto sql = "SELECT \"ID\" FROM \"TOPS\" AS OF SCN 424242 WHERE " + range_where + remote_filter + remote_order;
+            script->routes.insert(script->routes.begin(), {sql, std::move(candidates)});
+        }
+        script->queries.clear();
+        script->initial_fetch_rows.clear();
+        const auto suffix = filter + " ORDER BY ID" + direction + null_order + " LIMIT 3 OFFSET 2";
+        auto actual = database.Query("SELECT ID FROM o.TOPS" + suffix);
+        auto expected = database.Query("SELECT ID FROM expected" + suffix);
+        CHECK(!actual->HasError() && !expected->HasError() && actual->RowCount() == 3);
+        for (duckdb::idx_t row = 0; row < 3; row++) {
+            CHECK(actual->GetValue(0, row).ToString() == expected->GetValue(0, row).ToString());
+        }
+        CHECK(ranges_read() == 4);
+        CHECK(script->initial_fetch_rows.size() == 4);
+        for (const auto rows : script->initial_fetch_rows) {
+            CHECK(rows == 32);
+        }
+        for (const auto &sql : script->queries) {
+            if (sql.find("WHERE ROWID") != std::string::npos) {
+                CHECK(sql.find("AS OF SCN 424242") != std::string::npos && sql.find(remote_order) != std::string::npos);
+            }
+        }
+        script->routes.erase(script->routes.begin(), script->routes.begin() + 4);
+    }
+    // Plain LIMIT, samples, a single reader and a pinned write retain their paths.
+    for (const auto &sql : {"SELECT ID FROM o.TOPS LIMIT 3",
+                           "SELECT ID FROM o.TOPS TABLESAMPLE SYSTEM(10%) ORDER BY ID LIMIT 3"}) {
+        script->queries.clear();
+        CHECK(!database.Query(sql)->HasError() && ranges_read() == 0);
+    }
+    database.Run("SET oracle_parallel_scan=1;");
+    script->queries.clear();
+    CHECK(!database.Query("SELECT ID FROM o.TOPS ORDER BY ID DESC LIMIT 3;")->HasError() && ranges_read() == 0);
+    database.Run("SET oracle_parallel_scan=4; BEGIN; INSERT INTO o.TOPS VALUES (100);");
+    script->queries.clear();
+    CHECK(!database.Query("SELECT ID FROM o.TOPS ORDER BY ID DESC LIMIT 3;")->HasError() && ranges_read() == 0);
+    database.Run("ROLLBACK;");
+    script->query_failure_fragment = "dba_extents";
+    script->queries.clear();
+    CHECK(!database.Query("SELECT ID FROM o.TOPS ORDER BY ID DESC LIMIT 3;")->HasError() && ranges_read() == 0);
+    std::cout << "parallel Top-N merges bounded candidates at one SCN and keeps serial fallbacks" << std::endl;
+}
+
 void TestCallableArgumentsOfTheNewTypes() {
     using oracle_scanner::BindDirection;
     const auto encode = [](const char *type, const char *text) {
@@ -6302,6 +6423,7 @@ int main() {
     TestJoinKeysReachOracle();
     TestHeavyColumnsAreReadAfterTheFilter();
     TestAttachedScanReadsInRowidRanges();
+    TestParallelTopNRanksCandidatesAtOneSnapshot();
     TestTextComparesByTheSessionCollation();
     TestLargeScalarFetchKeepsRowsAndLocalFilters();
     TestNestedOracleJoinsAndAggregates();

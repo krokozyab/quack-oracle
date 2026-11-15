@@ -2,6 +2,11 @@
 
 ## Added
 
+- Opt-in `oracle_parallel_top_n`: rank candidates per ROWID range at one SCN,
+  then retain DuckDB's global Top-N for the final result, including OFFSET and
+  NULL ordering. Uses the ordinary reader cap and privilege fallback. Defaults
+  to false because additional exchanges can be slower on remote connections.
+
 - Partial AVG pushdown for exact NUMBER(p,s), p <= 18 and 0 <= s <= p:
   Oracle computes the scaled sum and non-NULL count; DuckDB finalizes the
   result with the pinned engine's integer/decimal rounding rules. Other AVG
