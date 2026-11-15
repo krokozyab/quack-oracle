@@ -4624,9 +4624,9 @@ void TestAutomaticTopNUsesWorkAndRoundTripCosts() {
     for (const bool remote : {false, true}) {
         auto script = std::make_shared<FakeScript>();
         script->top_n_cost_model = true;
-        script->top_n_network_delay = std::chrono::milliseconds(remote ? 8 : 1);
-        script->top_n_serial_work = std::chrono::milliseconds(remote ? 20 : 30);
-        script->top_n_range_work = std::chrono::milliseconds(2);
+        script->top_n_network_delay = std::chrono::milliseconds(remote ? 80 : 10);
+        script->top_n_serial_work = std::chrono::milliseconds(remote ? 200 : 300);
+        script->top_n_range_work = std::chrono::milliseconds(20);
         script->routes = {
             {"oracle_scanner_range_identity", RangeIdentity()},
             {"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}},
@@ -4676,7 +4676,7 @@ void TestAutomaticTopNUsesWorkAndRoundTripCosts() {
                 CHECK(!database.Query("SELECT ID FROM o.AUTO_TOP ORDER BY ID DESC LIMIT " + std::to_string(bound))
                            ->HasError());
             }
-            script->top_n_serial_work = std::chrono::milliseconds(30);
+            script->top_n_serial_work = std::chrono::milliseconds(300);
             // The original positive observation has been evicted, so the same
             // query must collect its baseline again instead of keeping history
             // for every distinct ranked statement indefinitely.
@@ -4708,12 +4708,12 @@ void TestAutomaticTopNUsesWorkAndRoundTripCosts() {
             CHECK(!database.Query(query)->HasError() && calls("WHERE ROWID") == 4);
             // If the predicted speedup fails in reality, the following read
             // must use the observed range work rather than the initial model.
-            script->top_n_range_work = std::chrono::milliseconds(40);
+            script->top_n_range_work = std::chrono::milliseconds(400);
             script->queries.clear();
             CHECK(!database.Query(query)->HasError() && calls("WHERE ROWID") == 4);
             script->queries.clear();
             CHECK(!database.Query(query)->HasError() && calls("WHERE ROWID") == 0);
-            script->top_n_range_work = std::chrono::milliseconds(2);
+            script->top_n_range_work = std::chrono::milliseconds(20);
         }
         // Both explicit overrides still work regardless of learned costs.
         database.Run("SET oracle_parallel_top_n=true;");
