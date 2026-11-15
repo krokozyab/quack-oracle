@@ -3725,6 +3725,35 @@ void TestWideDirectScanFallsBackBeforeFetching() {
     database.Run("ROLLBACK");
 }
 
+void TestDirectConversionFailureKeepsSessionUsable() {
+    auto script = std::make_shared<FakeScript>();
+    script->direct_fetch = true;
+    script->routes = {
+        {"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}},
+        {"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("MOMENTS")}}}},
+        {"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}},
+        {"FROM user_tab_columns", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1),
+         Column("DATA_LENGTH", 2), Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+         {{Text("MOMENTS"), Text("TS"), Text("TIMESTAMP(9)"), Number("11"), WireValue(), Number("9"), Text("Y")}}}},
+        {"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}}};
+    const auto valid = oracle_scanner::EncodeOracleTimestamp({2000, 1, 1, 0, 0, 0, 1, 0, false}, false);
+    const auto ancient = oracle_scanner::EncodeOracleTimestamp({1, 1, 1, 0, 0, 0, 1, 0, false}, false);
+    script->tables["MOMENTS"] = {{Column("TS", 180, 0, 9)}, {{valid}}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS o(TYPE oracle_scanner); SET oracle_parallel_scan=1");
+    CHECK(!database.Query("SELECT TS FROM o.MOMENTS")->HasError());
+    const auto opened = script->sessions_opened;
+    script->tables["MOMENTS"].rows = {{ancient}, {valid}};
+    const auto failure = database.Query("SELECT TS FROM o.MOMENTS");
+    CHECK(failure->HasError());
+    CHECK(failure->GetError().find("Conversion Error") != std::string::npos);
+    CHECK(failure->GetError().find("could not fetch") == std::string::npos);
+    script->tables["MOMENTS"].rows = {{valid}};
+    CHECK(!database.Query("SELECT TS FROM o.MOMENTS")->HasError());
+    CHECK(script->sessions_opened == opened);
+}
+
 void TestUnselectedLobKeepsLargeScalarFetches() {
     auto script = std::make_shared<FakeScript>();
     script->routes = {
@@ -7148,6 +7177,7 @@ int main() {
     TestParallelMetricSnapshotsSurviveReverseFlushOrder();
     TestTextComparesByTheSessionCollation();
     TestLargeScalarFetchKeepsRowsAndLocalFilters();
+    TestDirectConversionFailureKeepsSessionUsable();
     TestUnselectedLobKeepsLargeScalarFetches();
     TestWideDirectScanFallsBackBeforeFetching();
     TestNestedOracleJoinsAndAggregates();

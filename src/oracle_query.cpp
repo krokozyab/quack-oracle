@@ -29,6 +29,7 @@
 #include "oracle_scanner/wallet_archive.hpp"
 
 #include "duckdb.hpp"
+#include "duckdb/common/exception/conversion_exception.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/profiler/profiling_node.hpp"
@@ -50,6 +51,7 @@
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 
+#include <exception>
 #include <iomanip>
 #include <limits>
 #include <mutex>
@@ -2926,6 +2928,10 @@ public:
         if (row != rows || row >= maximum_rows || values.size() != columns.size()) {
             throw IOException("Oracle direct row disagrees with the requested shape");
         }
+        if (conversion_error) {
+            rows++;
+            return;
+        }
         const auto index = row / STANDARD_VECTOR_SIZE;
         if (index == chunks.size()) {
             ConsumeBudget(chunk_bytes);
@@ -2942,13 +2948,27 @@ public:
                 }
                 ConsumeBudget(values[column]->size() * 4);
             }
-            WriteOracleValueView(chunk.data[column], row % STANDARD_VECTOR_SIZE, columns[column], values[column]);
+            try {
+                WriteOracleValueView(chunk.data[column], row % STANDARD_VECTOR_SIZE, columns[column], values[column]);
+            } catch (const ConversionException &) {
+                conversion_error = std::current_exception();
+                break;
+            } catch (const OutOfRangeException &) {
+                conversion_error = std::current_exception();
+                break;
+            }
         }
         rows++;
+    }
+    std::exception_ptr ConversionError() const {
+        return conversion_error;
     }
     void Finish(size_t count) {
         if (count != rows) {
             throw IOException("Oracle direct row count disagrees with sink");
+        }
+        if (conversion_error) {
+            return;
         }
         for (size_t i = 0; i < chunks.size(); i++) {
             chunks[i]->SetChildCardinality(MinValue<size_t>(STANDARD_VECTOR_SIZE, count - i * STANDARD_VECTOR_SIZE));
@@ -2967,6 +2987,7 @@ private:
     vector<LogicalType> types;
     std::vector<std::shared_ptr<DataChunk>> &chunks;
     size_t maximum_rows;
+    std::exception_ptr conversion_error;
     size_t rows = 0;
     size_t retained_bytes = 0;
     size_t chunk_bytes = 0;
@@ -3837,17 +3858,21 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
             batch = TranslatingOracleErrors("oracle_query could not fetch from Oracle", [&] {
                 if (state.direct_scalar && state.chunk_columns == state.columns.size() &&
                     OracleTypedSink::Fits(state.columns, state.types, state.fetch_rows)) {
+                    std::exception_ptr conversion_error;
                     try {
                         OracleTypedSink sink(context, state.columns, state.types, typed_chunks, state.fetch_rows);
                         oracle_scanner::OracleFetchResult result;
                         auto &cursor = local ? local->cursor : state.cursor;
                         if (cursor->FetchInto(state.fetch_rows, sink, result)) {
                             sink.Finish(result.rows);
-                            typed_rows = result.rows;
-                            state.metrics.direct_batches++;
-                            oracle_scanner::OracleBatch direct;
-                            direct.exhausted = result.exhausted;
-                            return direct;
+                            conversion_error = sink.ConversionError();
+                            if (!conversion_error) {
+                                typed_rows = result.rows;
+                                state.metrics.direct_batches++;
+                                oracle_scanner::OracleBatch direct;
+                                direct.exhausted = result.exhausted;
+                                return direct;
+                            }
                         }
                     } catch (...) {
                         if (local) {
@@ -3864,6 +3889,14 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
                             }
                         }
                         throw;
+                    }
+                    // The complete reply has been consumed. A value that DuckDB
+                    // cannot represent does not make the Oracle session unusable.
+                    if (conversion_error) {
+                        if (interrupt) {
+                            interrupt->Stop();
+                        }
+                        std::rethrow_exception(conversion_error);
                     }
                 }
                 if (local) {
