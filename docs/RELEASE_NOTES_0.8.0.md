@@ -7,6 +7,10 @@
   result with the pinned engine's integer/decimal rounding rules. Other AVG
   inputs retain local execution.
 
+- Compose eligible inner joins across three or more attached tables in one
+  Oracle catalog, and push eligible aggregates over their result. Each base
+  table keeps its owner, filters and transaction snapshot.
+
 ## Behaviour changes
 
 - Eligible AVG queries can return groups instead of all input rows. An

@@ -3361,6 +3361,55 @@ void TestTextComparesByTheSessionCollation() {
 }
 
 // DISTINCT counts need the equality of decoded values to match Oracle.
+void TestNestedOracleJoinsAndAggregates() {
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+    script->routes.push_back({"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("LINKS")}}}});
+    script->routes.push_back({"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}});
+    script->routes.push_back(
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {{Text("LINKS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("Y")}}}});
+    script->routes.push_back({"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}});
+    script->tables["LINKS"] = {{Column("ID", 2, 10, 0)}, {{Number("1")}, {Number("1")}, {Number("2")}, {WireValue()}}};
+    script->routes.push_back({"COUNT(*)", {{Column("C0", 2, 10, 0), Column("C1", 2, 18, 0)}, {}}});
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS o(TYPE oracle_scanner);");
+    for (int tables = 2; tables <= 4; tables++) {
+        std::string sql = "SELECT a.ID,count(*) FROM o.LINKS a";
+        for (int i = 1; i < tables; i++) {
+            sql += " JOIN o.LINKS t" + std::to_string(i) + " ON a.ID=t" + std::to_string(i) + ".ID";
+        }
+        sql += " GROUP BY a.ID ORDER BY a.ID;";
+        database.Run("SET oracle_join_pushdown=false; SET oracle_aggregate_pushdown=false;");
+        auto local = database.Query(sql);
+        CHECK(!local->HasError() && local->RowCount() == 2);
+        script->routes.back().second.rows = {{Number("1"), Number(std::to_string(1 << tables))},
+                                             {Number("2"), Number("1")}};
+        database.Run("SET oracle_join_pushdown=true; SET oracle_aggregate_pushdown=true;");
+        script->queries.clear();
+        auto remote = database.Query(sql);
+        if (remote->HasError()) {
+            std::cerr << remote->GetError() << "\n" << script->queries.back() << std::endl;
+        }
+        CHECK(!remote->HasError() && remote->RowCount() == local->RowCount());
+        for (duckdb::idx_t row = 0; row < local->RowCount(); row++) {
+            CHECK(remote->GetValue(0, row) == local->GetValue(0, row));
+            CHECK(remote->GetValue(1, row) == local->GetValue(1, row));
+        }
+        CHECK(script->queries.size() == 1);
+        const auto &sent = script->queries.back();
+        CHECK(sent.find("GROUP BY") != std::string::npos);
+        size_t joins = 0;
+        for (auto pos = sent.find(" JOIN "); pos != std::string::npos; pos = sent.find(" JOIN ", pos + 1)) {
+            joins++;
+        }
+        CHECK(joins == size_t(tables - 1));
+    }
+}
+
 void TestExactAveragePartialPushdown() {
     for (const int precision : {4, 10, 18}) {
         for (const int scale : {0, 2}) {
@@ -6041,6 +6090,7 @@ int main() {
     TestHeavyColumnsAreReadAfterTheFilter();
     TestAttachedScanReadsInRowidRanges();
     TestTextComparesByTheSessionCollation();
+    TestNestedOracleJoinsAndAggregates();
     TestExactAveragePartialPushdown();
     TestDistinctCountPushesOnlyEquivalentEquality();
     TestSelectiveFiltersReadThroughOneSession();

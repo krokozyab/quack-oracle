@@ -363,7 +363,9 @@ bool PlanPushedAggregate(ClientContext &context, LogicalAggregate &aggregate, Lo
 	if (result.columns.empty()) {
 		return false;
 	}
-    result.sql = "SELECT " + select_list + " FROM " + OracleObjectReference(bind.schema_name, bind.object_name) + " /*SCN*/";
+    const auto from = bind.statement_scan ? "(" + bind.statement_sql + ") oracle_input"
+                                          : OracleObjectReference(bind.schema_name, bind.object_name) + " /*SCN*/";
+    result.sql = "SELECT " + select_list + " FROM " + from;
     if (!where.empty()) {
 		result.sql += " WHERE " + where;
 	}
@@ -406,7 +408,7 @@ void PushAggregate(ClientContext &context, unique_ptr<LogicalOperator> &op, Colu
 	}
 	auto &get = node->Cast<LogicalGet>();
 	auto *bind = get.bind_data ? dynamic_cast<OracleQueryBindData *>(get.bind_data.get()) : nullptr;
-    if (!bind || !bind->deferred_scan) {
+    if (!bind || (!bind->deferred_scan && !bind->statement_scan)) {
         return;
     }
     PushedAggregate pushed;
@@ -487,7 +489,7 @@ void PushAggregate(ClientContext &context, unique_ptr<LogicalOperator> &op, Colu
 	}
 }
 
-// Joins. An inner join of two attached tables of one Oracle database is one
+// Joins. Eligible inner joins of attached tables of one Oracle database form one
 // statement there: `FROM (SELECT ... WHERE ...) a JOIN (SELECT ... WHERE ...) b ON ...`,
 // so the join's result travels and not both tables. Each side keeps its own
 // filters inside its own inline view, where its column names mean what they did.
@@ -517,11 +519,12 @@ bool PrepareSide(LogicalOperator &child, JoinSide &side) {
 	}
 	side.get = &child.Cast<LogicalGet>();
 	side.bind = side.get->bind_data ? dynamic_cast<OracleQueryBindData *>(side.get->bind_data.get()) : nullptr;
-	if (!side.bind || !side.bind->deferred_scan || side.get->extra_info.sample_options) {
-		return false;
-	}
-	std::vector<column_t> scanned;
-	for (const auto &id : side.get->GetColumnIds()) {
+    if (!side.bind || (!side.bind->deferred_scan && !side.bind->statement_scan) ||
+        side.get->extra_info.sample_options) {
+        return false;
+    }
+    std::vector<column_t> scanned;
+    for (const auto &id : side.get->GetColumnIds()) {
 		if (id.HasChildren() || id.GetPrimaryIndex() >= side.bind->columns.size()) {
 			return false;
 		}
@@ -556,12 +559,14 @@ std::string SideView(const JoinSide &side) {
 	for (const auto column : side.selected) {
 		list += (list.empty() ? "" : ", ") + Quoted(side.bind->columns[column]);
 	}
-	auto sql = "(SELECT " + list + " FROM " + OracleObjectReference(side.bind->schema_name, side.bind->object_name) +
-	           " /*SCN*/";
-	if (!side.where.empty()) {
-		sql += " WHERE " + side.where;
-	}
-	return sql + ")";
+    const auto from = side.bind->statement_scan
+                          ? "(" + side.bind->statement_sql + ") oracle_input"
+                          : OracleObjectReference(side.bind->schema_name, side.bind->object_name) + " /*SCN*/";
+    auto sql = "(SELECT " + list + " FROM " + from;
+    if (!side.where.empty()) {
+        sql += " WHERE " + side.where;
+    }
+    return sql + ")";
 }
 
 const char *ComparisonSql(ExpressionType type) {
@@ -697,8 +702,10 @@ void PushJoin(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &op, C
 	function.cardinality = nullptr;
 	function.statistics = nullptr;
 	function.get_table_entry = nullptr;
-	const auto index = input.optimizer.binder.GenerateTableIndex();
-	auto scan = make_uniq<LogicalGet>(index, std::move(function), std::move(scan_bind), types, names);
+    function.get_bind_info = nullptr;
+    function.pushdown_expression = nullptr;
+    const auto index = input.optimizer.binder.GenerateTableIndex();
+    auto scan = make_uniq<LogicalGet>(index, std::move(function), std::move(scan_bind), types, names);
 	vector<ColumnIndex> ids;
 	for (idx_t position = 0; position < types.size(); position++) {
 		ids.emplace_back(position);
@@ -726,10 +733,13 @@ void Walk(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &op, Colum
 	for (auto &child : op->children) {
 		Walk(input, child, replacer, aggregates, joins);
 	}
-	if (joins && op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		PushJoin(input, op, replacer);
-	}
-	if (aggregates && op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+    if (!replacer.replacement_bindings.empty()) {
+        replacer.VisitOperator(*op);
+    }
+    if (joins && op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+        PushJoin(input, op, replacer);
+    }
+    if (aggregates && op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
 		PushAggregate(context, op, replacer);
 	}
 }
@@ -1218,14 +1228,14 @@ void RegisterOracleOptimizer(DatabaseInstance &db) {
 	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
     DBConfig::GetConfig(db).AddExtensionOption(
         "oracle_aggregate_pushdown",
-        "Let Oracle compute COUNT (including eligible DISTINCT), SUM, MIN, MAX and GROUP BY over an attached table "
+        "Let Oracle compute COUNT (including eligible DISTINCT), SUM, partial AVG, MIN, MAX and GROUP BY "
         "so the groups travel and not the rows.",
         LogicalType::BOOLEAN, Value::BOOLEAN(true));
     DBConfig::GetConfig(db).AddExtensionOption(
-	    "oracle_join_pushdown",
-	    "Let Oracle join two attached tables of the same database (inner joins on numbers, dates and timestamps) so "
-	    "the join's result travels and not both tables.",
-	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
+        "oracle_join_pushdown",
+        "Let Oracle join attached tables of the same database (inner joins on numbers, dates and timestamps) so "
+        "the join's result travels and not both tables.",
+        LogicalType::BOOLEAN, Value::BOOLEAN(true));
 }
 
 // The ORDER BY ... FETCH FIRST clause for a pushed Top-N, or empty when the keys

@@ -697,8 +697,9 @@ An inner join of two tables attached from the same Oracle database
 result travels and not both tables. Conditions are comparisons (`=`, `<>`, `<`, `<=`, `>`, `>=`)
 between columns of the same number, date or timestamp type; all filters on both sides must have
 gone to Oracle, neither side may be a sample, and the columns read must not be LOB, JSON, VECTOR,
-XML or ROWID. Outer, semi and anti joins, text keys and joins of more than two tables (a join of
-three comes out as a pushed pair joined by DuckDB to the third) are left to DuckDB.
+XML or ROWID. Eligible inner joins can be nested across three or more tables,
+and eligible aggregates over their result run in the same Oracle statement.
+Outer, semi and anti joins and text join keys are left to DuckDB.
 `SET oracle_join_pushdown = false` turns it off. 40 random joins (equality, inequality, composite
 conditions, self-joins, NULLs, pushed filters on both sides) returned the same rows with and
 without it on 19c and 23ai.
@@ -1417,8 +1418,8 @@ the `k` from a subset.
 | `oracle_unconstrained_number` | `'varchar'` | What a `NUMBER` with no declared precision becomes: `'varchar'`, `'double'` or `'decimal(38,9)'`-style. Set it before the query or the table's first use. See [section 9](#9-which-oracle-types-work). |
 | `oracle_filter_pushdown` | `true` | Send `WHERE` clauses on attached tables to Oracle, and narrow JSON path tests. See [Pushing filters down](#pushing-filters-down-to-oracle). |
 | `oracle_top_n_pushdown` | `true` | Let Oracle rank and cut an `ORDER BY … LIMIT` over a number, date or timestamp key. See [Top-N](#top-n). |
-| `oracle_aggregate_pushdown` | `true` | Let Oracle compute `count` (including eligible `DISTINCT`), `sum`, `min`, `max` and `GROUP BY` over number, date and timestamp keys. See [Aggregates](#aggregates). |
-| `oracle_join_pushdown` | `true` | Let Oracle join two attached tables of one database (an inner join on number, date or timestamp columns). See [Joining two attached tables](#joining-two-attached-tables). |
+| `oracle_aggregate_pushdown` | `true` | Let Oracle compute `count` (including eligible `DISTINCT`), `sum`, partial `avg`, `min`, `max` and `GROUP BY` over number, date and timestamp keys. See [Aggregates](#aggregates). |
+| `oracle_join_pushdown` | `true` | Let Oracle join attached tables of one database (an inner join on number, date or timestamp columns). See [Joining two attached tables](#joining-two-attached-tables). |
 | `oracle_deferred_columns` | `true` | Read LOB, JSON, VECTOR and XML columns only for the rows that pass a filter DuckDB applies itself. See [Heavy columns after the filter](#heavy-columns-after-the-filter). |
 | `oracle_parallel_scan` | `-1` | How many sessions one scan of an attached table may read through at once: `-1` chooses (DuckDB's thread count, up to 8, for a table of 500,000 rows or more), `0` or `1` is one session. See [section 7](#7-read-a-big-table-faster). |
 | `oracle_consistent_read` | `false` | Read every attached table of a statement `AS OF` one SCN. See [One moment for a whole statement](#one-moment-for-a-whole-statement). |
