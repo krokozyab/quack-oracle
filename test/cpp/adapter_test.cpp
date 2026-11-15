@@ -3361,6 +3361,50 @@ void TestTextComparesByTheSessionCollation() {
 }
 
 // DISTINCT counts need the equality of decoded values to match Oracle.
+void TestLargeScalarFetchKeepsRowsAndLocalFilters() {
+    for (bool packed : {false, true}) {
+        auto script = std::make_shared<FakeScript>();
+        script->routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+        script->routes.push_back({"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("LINKS")}}}});
+        script->routes.push_back({"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}});
+        script->routes.push_back(
+            {"FROM user_tab_columns",
+             {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+               Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+              {{Text("LINKS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("Y")}}}});
+        script->routes.push_back({"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}});
+        script->packed_fetch = packed;
+        auto &table = script->tables["LINKS"];
+        table.columns = {Column("ID", 2, 10, 0)};
+        int64_t count = 0, sum = 0;
+        for (int64_t i = 0; i < 10003; i++) {
+            table.rows.push_back({i % 11 == 0 ? WireValue() : Number(std::to_string(i))});
+            if (i % 11 && i % 3 == 0) {
+                count++;
+                sum += i;
+            }
+        }
+        auto factory = InstallFake(script);
+        TestDatabase database;
+        database.Run("ATTACH 'ora' AS o(TYPE oracle_scanner); SET oracle_fetch_rows=16384;");
+        auto all = database.Query("SELECT count(*) FROM o.LINKS;");
+        CHECK(!all->HasError() && all->GetValue(0, 0).GetValue<int64_t>() == 10003);
+        auto filtered = database.Query("SELECT count(*),sum(ID) FROM o.LINKS WHERE ID%3=0;");
+        CHECK(!filtered->HasError() && filtered->GetValue(0, 0).GetValue<int64_t>() == count);
+        CHECK(filtered->GetValue(1, 0).ToString() == std::to_string(sum));
+        int64_t tail_count = 0;
+        for (int64_t i = 9001; i < 10003; i++) { tail_count += i % 11 != 0; }
+        auto tail = database.Query("SELECT count(*) FROM o.LINKS WHERE abs(ID)>9000;");
+        CHECK(!tail->HasError() && tail->GetValue(0,0).GetValue<int64_t>() == tail_count);
+        CHECK(!database.Query("SELECT * FROM o.LINKS LIMIT 3;")->HasError());
+        for (auto value : {0, 65537}) {
+            database.Run("SET oracle_fetch_rows=" + std::to_string(value));
+            CHECK(database.Query("SELECT * FROM o.LINKS;")->HasError());
+        }
+        CHECK(!database.Query("SELECT 42;")->HasError());
+    }
+}
+
 void TestNestedOracleJoinsAndAggregates() {
     auto script = std::make_shared<FakeScript>();
     script->routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
@@ -6097,6 +6141,7 @@ int main() {
     TestHeavyColumnsAreReadAfterTheFilter();
     TestAttachedScanReadsInRowidRanges();
     TestTextComparesByTheSessionCollation();
+    TestLargeScalarFetchKeepsRowsAndLocalFilters();
     TestNestedOracleJoinsAndAggregates();
     TestExactAveragePartialPushdown();
     TestDistinctCountPushesOnlyEquivalentEquality();

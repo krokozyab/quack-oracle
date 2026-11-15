@@ -347,12 +347,15 @@ struct OracleQueryGlobalState final : GlobalTableFunctionState {
     std::string local_filter_text;
     //! The connection's counters when this scan last looked, for the serial scan.
     OracleIoStats last_io;
+    oracle_scanner::OracleBatch buffered;
+    size_t buffer_position = 0;
     //! Set when heavy columns are fetched for the rows that pass the local filter only.
     std::unique_ptr<OracleDeferredColumns> deferred;
 
     //! A table read in chunks through several sessions: each thread takes the next
     //! statement and reads it on a session of its own. The session and cursor above
     //! are then unused.
+    size_t fetch_rows = STANDARD_VECTOR_SIZE;
     bool parallel = false;
     std::vector<std::string> chunk_sql;
     std::atomic<idx_t> next_chunk {0};
@@ -371,6 +374,8 @@ struct OracleQueryLocalState final : LocalTableFunctionState {
     OracleSessionHandle session;
     std::unique_ptr<OracleCursor> cursor;
     OracleIoStats last_io;
+    oracle_scanner::OracleBatch buffered;
+    size_t buffer_position = 0;
     //! The ROWID range the cursor reads, which is the batch its rows belong to.
     idx_t batch_index = 0;
 };

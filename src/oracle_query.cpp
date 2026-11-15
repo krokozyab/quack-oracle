@@ -2821,6 +2821,41 @@ unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context,
     return std::move(state);
 }
 
+static size_t OracleScanFetchRows(ClientContext &context, const OracleQueryBindData &bind) {
+    if (!bind.deferred_scan || bind.for_update || bind.limit_rows || !bind.top_n.empty() ||
+        !bind.sample_clause.empty()) {
+        return STANDARD_VECTOR_SIZE;
+    }
+    Value setting;
+    size_t requested = 16384;
+    if (context.TryGetCurrentSetting("oracle_fetch_rows", setting) && !setting.IsNull()) {
+        const auto value = setting.GetValue<int64_t>();
+        if (value < 1 || value > 65536) {
+            throw InvalidInputException("oracle_fetch_rows must be between 1 and 65536");
+        }
+        requested = size_t(value);
+    }
+    size_t width = 0;
+    for (const auto &column : bind.columns) {
+        switch (column.oracle_type) {
+        case 1:
+        case 2:
+        case 12:
+        case 23:
+        case 96:
+        case 100:
+        case 101:
+        case 180:
+        case 252:
+            break;
+        default:
+            return STANDARD_VECTOR_SIZE;
+        }
+        width += 16 + MaxValue<size_t>(column.byte_width, 32);
+    }
+    return MinValue<size_t>(requested, MaxValue<size_t>(1, (8U << 20U) / MaxValue<size_t>(width, 1)));
+}
+
 unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, TableFunctionInitInput &input) {
     auto &bind = input.bind_data->CastNoConst<OracleQueryBindData>();
     if (bind.statement_scan) {
@@ -2977,6 +3012,7 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
                                                        std::move(chunk_types), std::move(input.column_ids), chunk_columns);
         state->local_filter = std::move(local_filter);
         state->metrics.Add(described.io);
+        state->fetch_rows = OracleScanFetchRows(context, bind);
         state->parallel = true;
         state->thread_count = MinValue<idx_t>(sessions, chunks.size());
         state->chunk_sql = std::move(chunks);
@@ -3065,6 +3101,7 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
                                                    std::move(types), std::move(input.column_ids), chunk_columns);
     state->local_filter = std::move(local_filter);
     state->deferred = std::move(deferred);
+    state->fetch_rows = state->deferred ? STANDARD_VECTOR_SIZE : OracleScanFetchRows(context, bind);
     state->sent_sql = opened.sql;
     state->local_filter_text = state->local_filter ? state->local_filter->ToString() : std::string();
     state->metrics.Add(opened.io);
@@ -3275,34 +3312,43 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
             }
         }
         const auto fetch_started = clock_now();
-        const auto batch = TranslatingOracleErrors("oracle_query could not fetch from Oracle", [&] {
-            if (local) {
+        auto &batch = local ? local->buffered : state.buffered;
+        auto &position = local ? local->buffer_position : state.buffer_position;
+        if (position == batch.RowCount()) {
+            batch = TranslatingOracleErrors("oracle_query could not fetch from Oracle", [&] {
+                if (local) {
+                    try {
+                        return local->cursor->FetchPacked(state.fetch_rows);
+                    } catch (...) {
+                        local->session.Poison();
+                        throw;
+                    }
+                }
                 try {
-                    return local->cursor->FetchPacked(STANDARD_VECTOR_SIZE);
+                    return state.deferred ? state.cursor->Fetch(STANDARD_VECTOR_SIZE)
+                                          : state.cursor->FetchPacked(state.fetch_rows);
                 } catch (...) {
-                    local->session.Poison();
+                    if (interrupt) {
+                        interrupt->Stop();
+                    }
+                    // Same rule as at bind: a failed fetch leaves the channel in a
+                    // state this side cannot describe, so the session is not reused.
+                    state.session.Poison();
+                    if (!state.catalog_name.empty()) {
+                        state.cursor.reset();
+                        PoisonTransactionSession(context, state.catalog_name);
+                    }
                     throw;
                 }
-            }
-            try {
-                return state.deferred ? state.cursor->Fetch(STANDARD_VECTOR_SIZE)
-                                      : state.cursor->FetchPacked(STANDARD_VECTOR_SIZE);
-            } catch (...) {
-                if (interrupt) {
-                    interrupt->Stop();
-                }
-                // Same rule as at bind: a failed fetch leaves the channel in a
-                // state this side cannot describe, so the session is not reused.
-                state.session.Poison();
-                if (!state.catalog_name.empty()) {
-                    state.cursor.reset();
-                    PoisonTransactionSession(context, state.catalog_name);
-                }
-                throw;
-            }
-        });
-        state.metrics.fetch_nanoseconds += elapsed(fetch_started);
-        state.metrics.rows_fetched += batch.RowCount();
+            });
+            state.metrics.fetch_nanoseconds += elapsed(fetch_started);
+            state.metrics.rows_fetched += batch.RowCount();
+            position = 0;
+        }
+        const auto row_start = position;
+        const auto row_count = MinValue<size_t>(STANDARD_VECTOR_SIZE, batch.RowCount() - position);
+        position += row_count;
+        const bool exhausted = batch.exhausted && position == batch.RowCount();
         if (local) {
             const auto io_now = local->session->IoStats();
             state.metrics.Add(io_now - local->last_io);
@@ -3321,8 +3367,8 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
         if (output.ColumnCount() != state.chunk_columns) {
             throw InternalException("oracle_query output chunk does not match its describe metadata");
         }
-        for (idx_t row_index = 0; row_index < batch.RowCount(); row_index++) {
-            const auto width = batch.packed ? batch.packed->ColumnCount() : batch.rows[row_index].size();
+        for (idx_t row_index = 0; row_index < row_count; row_index++) {
+            const auto width = batch.packed ? batch.packed->ColumnCount() : batch.rows[row_start + row_index].size();
             if (width != state.columns.size()) {
                 throw InternalException("oracle_query row has a different column count from its describe metadata");
             }
@@ -3333,10 +3379,10 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
                 TranslatingOracleErrors("oracle_query could not convert an Oracle value", [&] {
                     if (batch.packed) {
                         WriteOracleValueView(output.data[vector_index], row_index, state.columns[column_index],
-                                             batch.packed->Get(row_index, column_index));
+                                             batch.packed->Get(row_start + row_index, column_index));
                     } else {
                         WriteOracleValue(output.data[vector_index], row_index, state.columns[column_index],
-                                         batch.rows[row_index][column_index]);
+                                         batch.rows[row_start + row_index][column_index]);
                     }
                     return true;
                 });
@@ -3348,13 +3394,13 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
         // then reads the validity mask by the vector's size and sees no NULL at
         // all: `col IS NULL` matched every row, and count(col) counted them. The
         // compiler cannot see that; the adapter suite now does.
-        output.SetChildCardinality(batch.RowCount());
+        output.SetChildCardinality(row_count);
         state.metrics.convert_nanoseconds += elapsed(convert_started);
-        if (local && batch.exhausted) {
+        if (local && exhausted) {
             local->cursor->Close();
             local->cursor.reset();
         }
-        if (state.local_filter && batch.RowCount() != 0) {
+        if (state.local_filter && row_count != 0) {
             // The filters Oracle was not sent. A chunk they empty is not the end of
             // the scan — an empty chunk means that — so fetch on until one has rows
             // or Oracle has no more.
@@ -3369,10 +3415,10 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
                 state.metrics.Add(io_now - state.last_io);
                 state.last_io = io_now;
             }
-            if (kept != batch.RowCount()) {
+            if (kept != row_count) {
                 output.Slice(selection, kept);
             }
-            if (kept == 0 && !batch.exhausted) {
+            if (kept == 0 && !exhausted) {
                 output.Reset();
                 continue;
             }

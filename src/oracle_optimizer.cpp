@@ -1224,7 +1224,10 @@ void OptimizeOraclePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperat
 } // namespace
 
 void RegisterOracleOptimizer(DatabaseInstance &db) {
-	OptimizerExtension extension;
+    DBConfig::GetConfig(db).AddExtensionOption(
+        "oracle_fetch_rows", "Maximum scalar attached-scan fetch rows (1..65536); output vectors remain 2048 rows.",
+        LogicalType::BIGINT, Value::BIGINT(16384));
+    OptimizerExtension extension;
 	extension.optimize_function = OptimizeOraclePlan;
     extension.pre_optimize_function = PreOptimizeOraclePlan;
     OptimizerExtension::Register(DBConfig::GetConfig(db), std::move(extension));
