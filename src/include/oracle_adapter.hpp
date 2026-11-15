@@ -243,7 +243,14 @@ struct OracleTopNKey {
     bool nulls_first;
 };
 
+struct OracleSourceSchemaCheck {
+    std::string sql;
+    std::string object_name;
+    std::vector<OracleColumn> columns;
+};
+
 struct OracleQueryBindData final : TableFunctionData {
+    std::vector<OracleSourceSchemaCheck> source_schema_checks;
     // oracle_query has to run its statement while binding, because only the
     // Oracle describe can tell DuckDB what the result columns are.
     OracleSessionHandle session;
@@ -320,6 +327,10 @@ struct OracleQueryBindData final : TableFunctionData {
     // scans a statement rather than a table.
     optional_ptr<TableCatalogEntry> table_entry;
 };
+
+void AddOracleSourceSchemaChecks(OracleQueryBindData &target, const OracleQueryBindData &source,
+                                 const std::vector<column_t> &selected);
+void ValidateOracleSourceSchemas(const OracleQueryBindData &bind, OracleSession &session);
 
 //! Counters a scan keeps for EXPLAIN ANALYZE. Atomic, because the threads of a
 //! parallel scan add to them together.

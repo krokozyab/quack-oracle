@@ -441,6 +441,12 @@ void PushAggregate(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &
 	auto scan_bind = make_uniq<OracleQueryBindData>();
 	scan_bind->statement_scan = true;
 	scan_bind->statement_sql = std::move(pushed.sql);
+    std::vector<column_t> checked;
+    checked.reserve(get.GetColumnIds().size());
+    for (const auto &column : get.GetColumnIds()) {
+        checked.push_back(column.GetPrimaryIndex());
+    }
+    AddOracleSourceSchemaChecks(*scan_bind, *bind, checked);
 	scan_bind->columns = std::move(pushed.columns);
 	scan_bind->types = pushed.types;
 	scan_bind->config = bind->config;
@@ -731,6 +737,14 @@ void PushJoin(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &op, C
 	auto scan_bind = make_uniq<OracleQueryBindData>();
 	scan_bind->statement_scan = true;
 	std::string list;
+    for (const auto &side : sides) {
+        std::vector<column_t> checked;
+        checked.reserve(side.get->GetColumnIds().size());
+        for (const auto &column : side.get->GetColumnIds()) {
+            checked.push_back(column.GetPrimaryIndex());
+        }
+        AddOracleSourceSchemaChecks(*scan_bind, *side.bind, checked);
+    }
 	vector<LogicalType> types;
 	vector<Identifier> names;
 	for (const auto &output : outputs) {

@@ -2700,8 +2700,24 @@ std::vector<OracleColumn> ProjectedDescribe(const OracleQueryBindData &bind, con
             continue;
         }
         const auto &dictionary = bind.columns[selected[index]];
-        if (dictionary.oracle_type != 0 && columns[index].oracle_type != dictionary.oracle_type) {
-            throw IOException("Oracle ATTACH table '%s' column '%s' wire type changed; DETACH and ATTACH to refresh its schema",
+        const auto &actual = columns[index];
+        const auto character_form = [](const OracleColumn &column) {
+            return (column.oracle_type == 1 || column.oracle_type == 96 || column.oracle_type == 112) &&
+                           column.character_set_form == 0
+                       ? uint8_t(1) : column.character_set_form;
+        };
+        const bool number_changed = dictionary.oracle_type == 2 &&
+            (actual.precision != dictionary.precision ||
+             (dictionary.precision > 0 && actual.scale != dictionary.scale));
+        const bool temporal_changed = (dictionary.oracle_type == 180 || dictionary.oracle_type == 181 ||
+                                       dictionary.oracle_type == 231 || dictionary.oracle_type == 182 ||
+                                       dictionary.oracle_type == 183) && actual.scale != dictionary.scale;
+        if (dictionary.oracle_type != 0 &&
+            (actual.oracle_type != dictionary.oracle_type || number_changed || temporal_changed ||
+             character_form(actual) != character_form(dictionary) ||
+             ((dictionary.oracle_type == 1 || dictionary.oracle_type == 96) &&
+              MappedType(actual) != MappedType(dictionary)))) {
+            throw IOException("Oracle ATTACH table '%s' column '%s' wire type changed or its precision, scale or character form changed; DETACH and ATTACH to refresh its schema",
                               bind.object_name, dictionary.name);
         }
         if (columns[index].name != dictionary.name) {
@@ -2715,6 +2731,47 @@ std::vector<OracleColumn> ProjectedDescribe(const OracleQueryBindData &bind, con
 }
 
 } // namespace
+
+void AddOracleSourceSchemaChecks(OracleQueryBindData &target, const OracleQueryBindData &source,
+                                 const std::vector<column_t> &selected) {
+    if (source.statement_scan) {
+        target.source_schema_checks.insert(target.source_schema_checks.end(), source.source_schema_checks.begin(),
+                                            source.source_schema_checks.end());
+        return;
+    }
+    std::vector<column_t> ordinary;
+    ordinary.reserve(selected.size());
+    OracleSourceSchemaCheck check;
+    check.object_name = source.object_name;
+    check.columns.reserve(selected.size());
+    for (const auto id : selected) {
+        if (id < source.columns.size()) {
+            ordinary.push_back(id);
+            check.columns.push_back(source.columns[id]);
+        }
+    }
+    if (!ordinary.empty()) {
+        check.sql = "SELECT " + ProjectedSelectList(source, ordinary) + " FROM " +
+                    OracleObjectReference(source.schema_name, source.object_name) + " WHERE 1 = 0";
+        target.source_schema_checks.push_back(std::move(check));
+    }
+}
+
+void ValidateOracleSourceSchemas(const OracleQueryBindData &bind, OracleSession &session) {
+    for (const auto &check : bind.source_schema_checks) {
+        auto cursor = session.Query(check.sql, {});
+        OracleQueryBindData source;
+        source.object_name = check.object_name;
+        source.columns = check.columns;
+        std::vector<column_t> selected;
+        selected.reserve(check.columns.size());
+        for (idx_t i = 0; i < check.columns.size(); ++i) {
+            selected.push_back(i);
+        }
+        (void)ProjectedDescribe(source, selected, cursor->Columns());
+        cursor->Close();
+    }
+}
 
 void InvalidateOracleScanPlan(ClientContext &context, const std::string &key) {
     if (key.empty()) {

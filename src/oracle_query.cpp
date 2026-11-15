@@ -2765,6 +2765,11 @@ static bool DeferrableColumn(const OracleColumn &column);
 // supplies the wire representation and has to map to the same types.
 unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context, OracleQueryBindData &bind,
                                                          TableFunctionInitInput &input) {
+    if (!bind.source_schema_checks.empty()) {
+        auto schema_session = AcquireOracleReadSession(context, bind.secret_name, bind.catalog_name,
+                                                       bind.config, bind.password);
+        ValidateOracleSourceSchemas(bind, schema_session.Get());
+    }
     if (bind.count_source) {
         auto &source = *bind.count_source;
         Value enabled, requested;

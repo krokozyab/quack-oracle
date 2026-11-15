@@ -2186,6 +2186,73 @@ void TestAttachedScanRefusesChangedWireTypes() {
     std::cout << "an attached scan refuses a changed wire type before decoding values" << std::endl;
 }
 
+void TestAttachedScanRefusesChangedNumericShape() {
+    auto script = std::make_shared<FakeScript>();
+    script->routes = {
+        {"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}},
+        {"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("SHAPE_CHANGE")}}}},
+        {"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}},
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {{Text("SHAPE_CHANGE"), Text("V"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("Y")}}}},
+        {"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}}};
+    script->tables["SHAPE_CHANGE"] = {{Column("V", 2, 10, 0)}, {{Number("7")}}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS o(TYPE oracle_scanner); SET oracle_parallel_scan=1;");
+    const auto query = "SELECT V FROM o.SHAPE_CHANGE";
+    CHECK(database.Query(query)->GetValue(0, 0).ToString() == "7");
+    script->tables["SHAPE_CHANGE"] = {{Column("V", 2, 12, 2)}, {{Number("1.25")}, {Number("-99.99")}}};
+    for (const auto *direct : {"true", "false"}) {
+        database.Run(std::string("SET oracle_direct_scan=") + direct);
+        for (const auto *expression : {"V", "sum(V)", "avg(V)", "min(V)", "max(V)"}) {
+            auto changed = database.Query(std::string("SELECT ") + expression + " FROM o.SHAPE_CHANGE");
+            CHECK(changed->HasError());
+            CHECK(changed->GetError().find("DETACH and ATTACH") != std::string::npos);
+        }
+    }
+    // A failed schema check leaves the connection usable and owns no cursor.
+    CHECK(database.Query("SELECT 42")->GetValue(0, 0).ToString() == "42");
+    script->tables["SHAPE_CHANGE"] = {{Column("V", 2, 10, 0)}, {{Number("42")}}};
+    CHECK(database.Query(query)->GetValue(0, 0).ToString() == "42");
+    std::cout << "attached scans and pushed aggregates refuse stale numeric precision and scale" << std::endl;
+}
+
+void TestAttachedScanRefusesChangedTemporalAndCharacterShape() {
+    struct Shape { const char *type; uint16_t wire; int16_t precision; int16_t scale; };
+    for (const auto &shape : {Shape {"NUMBER", 2, 10, 0}, Shape {"TIMESTAMP(6)", 180, 0, 6},
+                              Shape {"INTERVAL DAY(2) TO SECOND(6)", 183, 2, 6},
+                              Shape {"VARCHAR2", 1, 0, 0}}) {
+        auto script = std::make_shared<FakeScript>();
+        script->routes = {
+            {"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}},
+            {"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("META_CHANGE")}}}},
+            {"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}},
+            {"FROM user_tab_columns", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1),
+              Column("DATA_LENGTH", 2), Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+             {{Text("META_CHANGE"), Text("V"), Text(shape.type), Number("22"),
+               Number(std::to_string(shape.precision)), Number(std::to_string(shape.scale)), Text("Y")}}}},
+            {"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}}};
+        script->tables["META_CHANGE"] = {{Column("V", shape.wire, shape.precision, shape.scale)}, {{WireValue()}}};
+        auto factory = InstallFake(script);
+        TestDatabase database;
+        database.Run("ATTACH 'ora' AS o(TYPE oracle_scanner); SET oracle_parallel_scan=1");
+        CHECK(!database.Query("SELECT V FROM o.META_CHANGE")->HasError());
+        auto &changed = script->tables["META_CHANGE"].columns[0];
+        if (shape.wire == 2) {
+            changed.precision = 12;
+        } else if (shape.wire == 1) {
+            changed.character_set_form = 2;
+        } else {
+            changed.scale = 9;
+        }
+        auto result = database.Query("SELECT V FROM o.META_CHANGE");
+        CHECK(result->HasError() && result->GetError().find("DETACH and ATTACH") != std::string::npos);
+        CHECK(database.Query("SELECT 42")->GetValue(0, 0).ToString() == "42");
+    }
+}
+
 void TestStatementCacheSettingKeepsSessionPoolBounded() {
     auto script = std::make_shared<FakeScript>();
     script->columns = {Column("label", 1)};
@@ -3670,7 +3737,7 @@ void TestNestedOracleJoinsAndAggregates() {
             CHECK(remote->GetValue(0, row) == local->GetValue(0, row));
             CHECK(remote->GetValue(1, row) == local->GetValue(1, row));
         }
-        CHECK(script->queries.size() == 1);
+        CHECK(script->queries.size() == size_t(tables + 1));
         const auto &sent = script->queries.back();
         CHECK(sent.find("GROUP BY") != std::string::npos);
         size_t joins = 0;
@@ -3773,6 +3840,9 @@ void TestDistinctCountPushesOnlyEquivalentEquality() {
         for (const auto &definition : definitions) {
             const auto &column = definition.first;
             table.columns.push_back(column);
+            if (definition.second == "NVARCHAR2") {
+                table.columns.back().character_set_form = 2;
+            }
             dictionary.rows.push_back({Text("DCOUNT"),Text(column.name),Text(definition.second),Number("40"),
                 column.precision ? Number(std::to_string(column.precision)) : WireValue(),
                 Number(std::to_string(column.scale)),Text("Y")});
@@ -3802,6 +3872,7 @@ void TestDistinctCountPushesOnlyEquivalentEquality() {
         database.Run("SET oracle_aggregate_pushdown=true;");
         for (const auto *column : {"G","N","D","T","F","B","V","CODE","CH","NAT","RAWCOL"}) {
             auto result = database.Query(std::string("SELECT count(DISTINCT ")+column+") FROM o.DCOUNT;");
+            if (result->HasError()) { std::cerr << column << ": " << result->GetError() << std::endl; }
             CHECK(!result->HasError() && result->GetValue(0,0).ToString()=="2");
             CHECK(result->GetValue(0,0).type()==duckdb::LogicalType::BIGINT);
             const bool text = std::string(column)=="V";
@@ -6932,6 +7003,8 @@ int main() {
     TestStatementCacheSettingKeepsSessionPoolBounded();
     TestAttachedCatalogAgainstAFakeSession();
     TestAttachedScanRefusesChangedWireTypes();
+    TestAttachedScanRefusesChangedNumericShape();
+    TestAttachedScanRefusesChangedTemporalAndCharacterShape();
     TestAttachedDdlRefreshesAndCompensates();
     TestAttachedUpsertsUseOracleMerge();
     TestAttachedMergesRefuseUnsafeKeyEquality();
