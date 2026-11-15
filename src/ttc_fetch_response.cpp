@@ -159,7 +159,7 @@ TtcRowDataPrefix DecodePartialRowDataPrefix(const uint8_t *data, size_t size,
 }
 
 TtcRowData MergeChangedColumns(const TtcRowData &previous_row, const std::vector<size_t> &present_columns,
-                               TtcRowData values, size_t column_count) {
+                               const TtcRowData &values, size_t column_count) {
     if (previous_row.size() != column_count || present_columns.size() != values.size()) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC partial row disagrees with cursor columns");
     }
@@ -611,7 +611,7 @@ bool TtcFetchResponseDecoder::DecodeInternal(const std::vector<uint8_t> &message
                 }
                 // Selected zero-width columns keep the previous row's value,
                 // which is already NULL for them.
-                auto merged = MergeChangedColumns(*previous_row, wire_columns, std::move(values), columns.size());
+                auto merged = MergeChangedColumns(*previous_row, wire_columns, values, columns.size());
                 result.used_row_header_selection = true;
                 row_header_present_columns.reset();
                 keep_row(std::move(merged));
@@ -671,7 +671,7 @@ bool TtcFetchResponseDecoder::DecodeInternal(const std::vector<uint8_t> &message
                 DecodePartialRowDataPrefix(at + continuation.bytes_consumed, remaining - continuation.bytes_consumed,
                                            wire_columns, partial_framing, row_arena);
             offset += continuation.bytes_consumed + partial.bytes_consumed;
-            auto merged = MergeChangedColumns(*previous_row, wire_columns, std::move(partial.values), columns.size());
+            auto merged = MergeChangedColumns(*previous_row, wire_columns, partial.values, columns.size());
             result.used_row_continuation = true;
             keep_row(std::move(merged));
             break;
