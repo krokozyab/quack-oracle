@@ -3278,7 +3278,7 @@ void TestSelectiveFiltersReadThroughOneSession() {
     CHECK(read_in_ranges("KIND = 1"));                      // half
     // A number of sessions set by hand is used as set.
     database.Run("SET oracle_parallel_scan = 4;");
-    CHECK(read_in_ranges("ID = 7"));
+    CHECK(!read_in_ranges("ID = 7"));
     std::cout << "a selective filter reads through one session" << std::endl;
 }
 

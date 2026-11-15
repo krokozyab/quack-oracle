@@ -22,3 +22,10 @@
 
 - Reject scalar fetch responses exceeding the requested row count before
   materializing them, including compressed repeats and legacy fallback.
+
+- Scalar attached scans fetch up to 16384 rows and retain unread rows while
+  returning DuckDB vectors of at most 2048 rows. `oracle_fetch_rows` controls
+  the maximum (1..65536); declared widths reduce the request toward an 8 MiB
+  estimate. This estimate is not a hard limit on all scan memory.
+- A positive `oracle_parallel_scan` is a maximum: known small tables and
+  selective filters stay sequential.

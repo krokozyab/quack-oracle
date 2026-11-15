@@ -2985,6 +2985,11 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
         const auto requested = parallel_setting.GetValue<int64_t>();
         if (requested >= 0) {
             sessions = static_cast<idx_t>(MinValue<int64_t>(64, requested));
+            if (bind.estimated_rows &&
+                (*bind.estimated_rows < AUTOMATIC_PARALLEL_MINIMUM_ROWS ||
+                 EstimatedRowsAfterFilters(bind, filter_estimates) < AUTOMATIC_PARALLEL_FILTERED_ROWS)) {
+                sessions = MinValue<idx_t>(sessions, 1);
+            }
         } else if (bind.estimated_rows && *bind.estimated_rows >= AUTOMATIC_PARALLEL_MINIMUM_ROWS &&
                    EstimatedRowsAfterFilters(bind, filter_estimates) >= AUTOMATIC_PARALLEL_FILTERED_ROWS) {
             // Automatic: a table Oracle's statistics say is big gets as many
