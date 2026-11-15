@@ -49,3 +49,7 @@
   snapshots use independent storage. Converters consume byte views without
   materializing temporary wire-cell vectors. SQL result types are unchanged;
   LOB I/O may still allocate temporary content buffers.
+
+- Reuse pooled read sessions for ROWID planning instead of authenticating a new
+  dictionary session for each parallel scan. Failed planning exchanges discard
+  the lease before serial fallback.

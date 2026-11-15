@@ -1329,6 +1329,9 @@ SET oracle_parallel_scan = 8;
 SELECT * FROM o.BIG_TABLE;          -- up to 8 sessions, each reading ROWID ranges
 ```
 
+ROWID planning reuses the read-session pool (`oracle_session_pool_size`); a failed
+planning exchange discards its session before falling back to a serial scan.
+
 The table is cut into ROWID ranges at its extent boundaries (about four chunks to a
 session, so a thread that finishes early takes another), and every chunk reads
 `AS OF SCN` at one change number taken first, so together they are one snapshot, not several

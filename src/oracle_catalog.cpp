@@ -2590,14 +2590,15 @@ std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const 
         TryTransactionSession(context, bind.catalog_name)) {
         return {};
     }
+    OracleSessionHandle session;
     try {
-        auto session = oracle_scanner::OpenOracleSession(bind.config, bind.password);
+        session = AcquireOracleReadSession(context, bind.secret_name, std::string(), bind.config, bind.password);
         // One snapshot for every chunk, taken before any of them reads. Without
         // a change number the chunks would be several moments, so no change
         // number means one stream.
         std::string scn = OracleQuerySnapshot(context, bind);
         if (scn.empty()) {
-            const auto scn_rows = TextRows(*session, "SELECT dbms_flashback.get_system_change_number FROM dual");
+            const auto scn_rows = TextRows(session.Get(), "SELECT dbms_flashback.get_system_change_number FROM dual");
             if (scn_rows.size() != 1 || scn_rows[0].size() != 1 || scn_rows[0][0].empty()) {
                 return {};
             }
@@ -2608,7 +2609,7 @@ std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const 
         const auto owner = TextLiteral(bind.schema_name);
         // A heap table only: an index-organized, clustered or temporary table
         // has no ROWID ranges to cut.
-        const auto kind = TextRows(*session, std::string("SELECT iot_type, temporary, cluster_name FROM ") +
+        const auto kind = TextRows(session.Get(), std::string("SELECT iot_type, temporary, cluster_name FROM ") +
                                                  (own ? "user_tables" : "all_tables") + " WHERE table_name = " + name +
                                                  (own ? std::string() : " AND owner = " + owner));
         if (kind.size() != 1 || !kind[0][0].empty() || kind[0][1] != "N" || !kind[0][2].empty()) {
@@ -2626,7 +2627,7 @@ std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const 
         // one dictionary view that needs a grant.
         const auto reference = OracleObjectReference(bind.schema_name, bind.object_name);
         const auto extents = TextRows(
-            *session,
+            session.Get(),
             std::string("SELECT ROWIDTOCHAR(DBMS_ROWID.ROWID_CREATE(1, o.data_object_id, e.relative_fno, e.block_id, 0)), "
                         "e.blocks FROM dba_extents e JOIN all_objects o ON o.owner = e.owner AND o.object_name = "
                         "e.segment_name AND (o.subobject_name = e.partition_name OR (o.subobject_name IS NULL AND "
@@ -2661,8 +2662,8 @@ std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const 
         }
         const auto as_of = reference + " AS OF SCN " + scn;
         // The snapshot must be readable, which needs FLASHBACK on the table.
-        (void)TextRows(*session, "SELECT 1 FROM " + as_of + " WHERE 1 = 0");
-        session->Close();
+        (void)TextRows(session.Get(), "SELECT 1 FROM " + as_of + " WHERE 1 = 0");
+        session = OracleSessionHandle();
 
         const auto select_list = ProjectedSelectList(bind, selected);
         const auto where = bind.where_clause.empty() ? std::string() : " AND (" + bind.where_clause + ")";
@@ -2681,6 +2682,7 @@ std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const 
         }
         return statements.size() >= 2 ? statements : std::vector<std::string>();
     } catch (const std::exception &) {
+        session.Poison();
         // Anything the dictionary or the privileges will not give is a reason to
         // read the table the ordinary way, not to fail a query that would work.
         return {};

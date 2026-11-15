@@ -193,6 +193,7 @@ struct FakeScript {
     // The transaction pool: whether a session reports itself ReadyForReuse
     // (until it fails or closes), and a rollback that fails.
     bool sessions_reusable = false;
+    std::string query_failure_fragment;
     bool rollback_should_fail = false;
     size_t session_closes = 0;
     // USER of the secret each session was opened from, in opening order, and
@@ -430,6 +431,10 @@ public:
             std::lock_guard<std::mutex> guard(script->record_lock);
             script->queries.push_back(sql);
             script->query_binds.push_back(binds);
+        }
+        if (!script->query_failure_fragment.empty() && sql.find(script->query_failure_fragment) != std::string::npos) {
+            throw oracle_scanner::ProtocolError(oracle_scanner::ProtocolErrorKind::MALFORMED,
+                                               "injected dictionary read failure");
         }
         return std::make_unique<FakeCursor>(script, sql);
     }
@@ -3718,6 +3723,7 @@ void TestAttachedScanReadsInRowidRanges() {
     script->tables["FACTS"] = {{Column("ID", 2, 10, 0)}, {{Number("1")}}};
     auto factory = InstallFake(script);
     TestDatabase database;
+    database.Run("SET oracle_session_pool_size = 1;");
     database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner);");
 
     // Automatic, and this table has no row-count statistics: one statement, no ranges.
@@ -3765,6 +3771,23 @@ void TestAttachedScanReadsInRowidRanges() {
         "SELECT count(*), bool_and(ID > previous) FROM (SELECT ID, lag(ID, 1, -1) OVER (ORDER BY rowid) previous FROM copied);");
     CHECK(!copied->HasError() && copied->GetValue(0, 0).GetValue<int64_t>() == 10 * ROWS_PER_RANGE &&
           copied->GetValue(1, 0).GetValue<bool>());
+    // Planning and reading are sequential on one worker and fit a single lease.
+    // Repeated scans must not authenticate a fresh dictionary session each time.
+    database.Run("SET threads = 1;");
+    script->sessions_reusable = true;
+    database.Run("SELECT count(*) FROM o.main.FACTS;");
+    const auto warm_sessions = script->sessions_opened;
+    database.Run("SELECT count(*) FROM o.main.FACTS;");
+    CHECK(script->sessions_opened == warm_sessions);
+    // A broken planning exchange must discard its lease before serial fallback.
+    const auto warm_closes = script->session_closes;
+    script->query_failure_fragment = "dba_extents";
+    database.Run("SELECT count(*) FROM o.main.FACTS;");
+    CHECK(script->session_closes == warm_closes + 1);
+    CHECK(script->sessions_opened == warm_sessions + 1);
+    script->query_failure_fragment.clear();
+    database.Run("SELECT count(*) FROM o.main.FACTS;");
+    CHECK(script->sessions_opened == warm_sessions + 1);
     // Once the transaction has written, the one session that sees its rows reads, as one stream.
     database.Run("BEGIN;");
     database.Run("INSERT INTO o.main.FACTS VALUES (5);");
