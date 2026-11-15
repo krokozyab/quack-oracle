@@ -3389,6 +3389,17 @@ void FillDeferredColumns(OracleQueryGlobalState &state, DataChunk &output, const
 
 void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
     auto &state = input.global_state->Cast<OracleQueryGlobalState>();
+    // The last batch can contain rows and already report EOF. Keep emitting
+    // its buffered slices, then finish without fetching or starting a watcher
+    // again. Parallel readers must first move on to their next ROWID range.
+    if (!state.parallel && state.buffered.exhausted &&
+        state.buffer_position == (state.typed_chunks.empty() ? state.buffered.RowCount() : state.typed_rows)) {
+        if (!state.catalog_name.empty() && context.IsInterrupted()) {
+            throw InterruptException();
+        }
+        output.SetChildCardinality(0);
+        return;
+    }
     // A parallel scan reads through the thread's own session and cursor, one
     // chunk of the table after another.
     OracleQueryLocalState *local = state.parallel ? &input.local_state->Cast<OracleQueryLocalState>() : nullptr;

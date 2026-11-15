@@ -132,6 +132,7 @@ struct FakeScript {
     //! Answer rows on the first Fetch and an empty exhausted batch on the second,
     //! the way a real cursor does.
     bool two_batch_fetch = false;
+    bool reject_fetch_after_exhaustion = false;
     bool packed_fetch = false;
     size_t packed_fetches = 0;
     bool direct_fetch = false;
@@ -333,6 +334,10 @@ public:
     }
 
     OracleBatch Fetch(size_t) override {
+        if (exhausted && script->reject_fetch_after_exhaustion) {
+            throw oracle_scanner::ProtocolError(oracle_scanner::ProtocolErrorKind::INVALID_STATE,
+                                                "fake cursor fetched after end of data");
+        }
         if (script->fetch_failure) {
             throw oracle_scanner::ProtocolError(*script->fetch_failure, script->fetch_failure_message);
         }
@@ -351,9 +356,11 @@ public:
             // Like a real cursor, which only learns it is exhausted on the
             // fetch that returns nothing: rows now, the empty end-of-data next.
             batch.exhausted = !script->two_batch_fetch;
+            exhausted = batch.exhausted;
             return batch;
         }
         batch.exhausted = true;
+        exhausted = true;
         return batch;
     }
 
@@ -409,6 +416,7 @@ private:
     FakeResponse projected;
     const FakeResponse *answer = nullptr;
     bool drained = false;
+    bool exhausted = false;
 };
 
 class FakeSession final : public OracleSession {
@@ -3462,11 +3470,16 @@ void TestLargeScalarFetchKeepsRowsAndLocalFilters() {
         auto factory = InstallFake(script);
         TestDatabase database;
         database.Run("ATTACH 'ora' AS o(TYPE oracle_scanner); SET oracle_fetch_rows=16384;");
+        script->reject_fetch_after_exhaustion = true;
         auto all = database.Query("SELECT count(*) FROM o.LINKS;");
         CHECK(!all->HasError() && all->GetValue(0, 0).GetValue<int64_t>() == 10003);
         auto filtered = database.Query("SELECT count(*),sum(ID) FROM o.LINKS WHERE ID%3=0;");
         CHECK(!filtered->HasError() && filtered->GetValue(0, 0).GetValue<int64_t>() == count);
         CHECK(filtered->GetValue(1, 0).ToString() == std::to_string(sum));
+        script->two_batch_fetch = true;
+        auto unknown_end = database.Query("SELECT count(*) FROM o.LINKS;");
+        CHECK(!unknown_end->HasError() && unknown_end->GetValue(0, 0).GetValue<int64_t>() == 10003);
+        script->two_batch_fetch = false;
         int64_t tail_count = 0;
         for (int64_t i = 9001; i < 10003; i++) { tail_count += i % 11 != 0; }
         auto tail = database.Query("SELECT count(*) FROM o.LINKS WHERE abs(ID)>9000;");

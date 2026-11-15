@@ -418,6 +418,8 @@ Full and continued rows accept scalar values through 16 MiB on both paths.
 Direct scalar reads resume short values split across network fragments without
 throwing an exception for an incomplete value. A row is emitted only after all
 its values arrive; malformed input still fails validation.
+Sequential scans finish once an exhausted batch has been fully consumed,
+without asking the cursor to fetch again. Unread buffered rows are still emitted.
 
 ### Passing values safely (bind parameters)
 

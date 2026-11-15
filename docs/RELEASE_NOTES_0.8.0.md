@@ -67,3 +67,7 @@
 - Resume incomplete short scalar rows without exception unwinding in the direct
   decoder. Rows are emitted only when complete; existing malformed-input and
   size checks remain in force. Chunked values retain their existing parser.
+
+- Finish sequential scans after consuming an exhausted batch, avoiding an extra
+  cursor fetch and interrupt watcher. Buffered rows and parallel ROWID ranges
+  retain their normal traversal.
