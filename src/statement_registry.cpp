@@ -111,6 +111,15 @@ void OracleStatementRegistry::Poison(OracleStatementHandle handle) {
     record.state = OracleStatementState::POISONED;
 }
 
+void OracleStatementRegistry::RestartQuery(OracleStatementHandle handle) {
+    std::lock_guard<std::mutex> guard(mutex);
+    auto &record = RequireOpen(handle);
+    if (record.state != OracleStatementState::EXHAUSTED || !record.remote_cursor_id) {
+        throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "Oracle query is not ready for reexecute");
+    }
+    record.state = OracleStatementState::OPEN;
+}
+
 bool OracleStatementRegistry::Close(OracleStatementHandle handle) {
     std::lock_guard<std::mutex> guard(mutex);
     if (handle.statement_id == 0) {

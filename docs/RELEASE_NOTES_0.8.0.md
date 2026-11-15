@@ -34,6 +34,13 @@
 
 ## Behaviour changes
 
+- Reuse bounded native scalar query cursors by default (`oracle_statement_cache`).
+  Repeat executions avoid resending SQL and bind metadata, retain no result rows
+  or bind values, and preserve transaction visibility. Writes, DDL and PL/SQL
+  invalidate idle entries. External DDL can supply a fresh describe or fail with
+  an Oracle invalidation error; failed statements are not replayed. Set false
+  to retain ordinary parse/describe behavior without disabling session pooling.
+
 - `oracle_parallel_top_n` changes from BOOLEAN default false to VARCHAR default
   `auto`. Existing `SET ... = true/false` remains valid as a forced choice; the
   reported canonical values are `auto`, `true`, `false`. Auto starts with two

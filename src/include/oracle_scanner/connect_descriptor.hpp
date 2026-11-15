@@ -73,6 +73,8 @@ struct ConnectRouting {
 };
 
 struct ConnectionConfig {
+    // Bounded native parsed-query cache; independent of transport identity.
+    bool statement_cache = true;
     // Session attributes Oracle shows in V$SESSION and SYS_CONTEXT, set once
     // when the session opens. Empty means leave them alone.
     std::string client_identifier;

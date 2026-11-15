@@ -106,4 +106,8 @@ bool ValidatedOracleSession::BindIoDeadline(std::shared_ptr<OracleIoDeadline> so
     return inner && inner->BindIoDeadline(std::move(source));
 }
 
+void ValidatedOracleSession::SetStatementCacheEnabled(bool enabled) {
+    Inner().SetStatementCacheEnabled(enabled);
+}
+
 } // namespace oracle_scanner

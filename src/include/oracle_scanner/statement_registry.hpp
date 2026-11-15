@@ -30,6 +30,7 @@ public:
     void MarkExecuted(OracleStatementHandle handle, bool has_rows);
     void BeginFetch(OracleStatementHandle handle);
     void MarkExhausted(OracleStatementHandle handle);
+    void RestartQuery(OracleStatementHandle handle);
     void Poison(OracleStatementHandle handle);
     bool Close(OracleStatementHandle handle);
     void CloseAll() noexcept;

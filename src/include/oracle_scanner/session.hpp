@@ -207,6 +207,10 @@ public:
         return {};
     }
     virtual std::unique_ptr<OracleCursor> Query(const std::string &sql, const std::vector<OracleBind> &binds) = 0;
+    // Optional bounded parsed-query reuse. Disabling releases idle statements;
+    // it does not change the session's authentication or transaction.
+    virtual void SetStatementCacheEnabled(bool) {
+    }
     // A hint for the initial result batch, for callers that know its row width.
     // Implementations may retain their ordinary query path.
     virtual std::unique_ptr<OracleCursor> QueryWithInitialFetch(const std::string &sql,

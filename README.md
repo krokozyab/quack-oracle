@@ -1413,6 +1413,29 @@ slower than one Oracle count, especially when Oracle can use an index.
 ROWID planning reuses the read-session pool (`oracle_session_pool_size`); a failed
 planning exchange discards its session before falling back to a serial scan.
 
+`oracle_statement_cache = true` keeps up to 32 idle parsed scalar queries per
+native session, with a 2 MiB accounting budget for keys and column metadata.
+Repeated executions reuse the server cursor and description, sending current
+scalar IN bind values. The key includes exact SQL and bind type, character form
+and buffer width; bind values and result rows are not retained. Each execution
+reads current data under the usual transaction or explicit SCN semantics.
+
+Only fully fetched scalar queries enter this cache. LOB, LONG, ROWID, callable
+result cursors, large SQL/bind sets and unfinished queries keep their existing
+paths. Writes, administrative DDL and PL/SQL on the session invalidate idle
+queries; cursors opened before invalidation cannot return to the cache.
+External DDL is handled by Oracle's cursor revalidation: a fresh describe
+replaces cached metadata, while an Oracle invalidation error fails the query
+and discards the pooled session. Failed statements are never replayed.
+External changes to an attached table still require DETACH/ATTACH to refresh
+DuckDB's catalog schema.
+
+Set `oracle_statement_cache = false` to release idle cursors and compare the
+ordinary parse/describe path. Switching modes preserves authenticated sessions
+and the configured pool limit. Eviction schedules the ordinary next-call cursor
+close; closing the session releases all remaining cursors. Session pooling must
+remain enabled for independent read statements to benefit across queries.
+
 `oracle_scan_plan_cache = true` also reuses range boundaries and projected wire
 descriptions, with at most 32 entries and an 8 MiB accounting budget per DuckDB
 connection. Each execution still checks the table's object ID, data object ID,
@@ -1538,6 +1561,7 @@ response exceeding that count is rejected.
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `oracle_session_pool_size` | `4` | How many authenticated Oracle sessions to keep and reuse for reads, per DuckDB connection per secret. `0` opens a fresh one every time. |
+| `oracle_statement_cache` | `true` | Reuse up to 32 fully fetched scalar query cursors per native session, within a 2 MiB accounting budget. False releases idle cursors and restores parse/describe on each execution. |
 | `oracle_transaction_pool_size` | `2` | How many idle sessions an attached catalog keeps between its transactions, so the next transaction need not connect and authenticate. Read at `ATTACH`; `0` opens a session per transaction. |
 | `oracle_unconstrained_number` | `'varchar'` | What a `NUMBER` with no declared precision becomes: `'varchar'`, `'double'` or `'decimal(38,9)'`-style. Set it before the query or the table's first use. See [section 9](#9-which-oracle-types-work). |
 | `oracle_filter_pushdown` | `true` | Send `WHERE` clauses on attached tables to Oracle, and narrow JSON path tests. See [Pushing filters down](#pushing-filters-down-to-oracle). |

@@ -40,6 +40,11 @@ public:
 
     void ExecuteNoBinds(OracleStatementHandle handle, const TtcExecuteNoBindsRequest &request);
     void ExecuteBinds(OracleStatementHandle handle, const TtcExecuteBindsRequest &request);
+    void ReexecuteQuery(OracleStatementHandle handle, uint8_t sequence, uint32_t rows,
+                        const std::vector<OracleBind> &binds);
+    TtcExecuteResponse ReceiveReexecuteResponse(OracleStatementHandle handle, const std::vector<OracleColumn> &columns,
+                                               uint8_t ttc_field_version, uint8_t server_field_version,
+                                               uint32_t maximum_rows = 32);
     std::vector<uint8_t> ReceiveExecuteResponse(OracleStatementHandle handle);
     TtcExecuteResponse ReceiveDecodedExecuteResponse(OracleStatementHandle handle, uint8_t ttc_field_version = 12,
                                                      uint8_t server_field_version = 12);

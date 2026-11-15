@@ -29,6 +29,7 @@ public:
     bool ReadyForReuse() const override;
     bool BindIoDeadline(std::shared_ptr<OracleIoDeadline> source) override;
     OracleIoStats IoStats() const override;
+    void SetStatementCacheEnabled(bool enabled) override;
 
 private:
     OracleSession &Inner() const;

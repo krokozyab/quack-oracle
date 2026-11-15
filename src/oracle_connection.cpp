@@ -60,6 +60,10 @@ ConnectionConfig ConnectionFromSecret(ClientContext &context, const std::string 
         throw BinderException("Secret '%s' is not an Oracle secret", secret_name);
     }
     ConnectionConfig config;
+    Value cache_setting;
+    if (context.TryGetCurrentSetting("oracle_statement_cache", cache_setting) && !cache_setting.IsNull()) {
+        config.statement_cache = BooleanValue::Get(cache_setting);
+    }
     config.io_deadline = OracleIoDeadlineFor(context);
     config.user = RequireString(*secret, "user");
     password = RequireString(*secret, "password");

@@ -5,6 +5,8 @@
 #include "oracle_scanner/ttc_error.hpp"
 #include "oracle_scanner/ttc_execute_response.hpp"
 #include "oracle_scanner/ttc_fetch.hpp"
+#include "oracle_scanner/ttc_parameter.hpp"
+#include "oracle_scanner/ttc_piggyback.hpp"
 #include "oracle_scanner/protocol_error.hpp"
 
 #include <string>
@@ -153,6 +155,67 @@ void TtcStatementChannel::ExecuteBinds(OracleStatementHandle handle, const TtcEx
     }
 }
 
+void TtcStatementChannel::ReexecuteQuery(OracleStatementHandle handle, uint8_t sequence, uint32_t rows,
+                                        const std::vector<OracleBind> &binds) {
+    const auto request = EncodeTtcReexecuteQuery(sequence, statements.RemoteCursorId(handle), rows, binds);
+    statements.RestartQuery(handle);
+    try {
+        channel.Send(request);
+    } catch (...) {
+        statements.Poison(handle);
+        throw;
+    }
+}
+
+TtcExecuteResponse TtcStatementChannel::ReceiveReexecuteResponse(OracleStatementHandle handle,
+                                                               const std::vector<OracleColumn> &columns,
+                                                               uint8_t ttc_field_version, uint8_t server_field_version,
+                                                               uint32_t maximum_rows) {
+    try {
+        std::optional<TtcExecuteResponse> decoded;
+        (void)ReceiveResponseFragments(channel, [&](const std::vector<uint8_t> &message) {
+            size_t offset = 0;
+            while (offset < message.size()) {
+                if (message[offset] == TTC_MESSAGE_PARAMETER) {
+                    offset += DecodeTtcReturnParameterPrefix(message.data() + offset, message.size() - offset).bytes_consumed;
+                } else if (message[offset] == TTC_MESSAGE_SERVER_PIGGYBACK) {
+                    offset += SkippedTtcServerPiggybackBytes(message.data() + offset, message.size() - offset);
+                } else {
+                    break;
+                }
+            }
+            // A revalidated cursor may send a fresh describe. Never decode it
+            // using cached columns. Otherwise decode rows with the saved shape,
+            // and no preceding row from its previous execution.
+            if (offset < message.size() && message[offset] == 16) {
+                const std::vector<uint8_t> described(message.begin() + static_cast<std::ptrdiff_t>(offset), message.end());
+                decoded = DecodeTtcExecuteResponse(described, ttc_field_version, server_field_version);
+                decoded->bytes_consumed += offset;
+            } else {
+                TtcFetchResponseDecoder decoder(columns, server_field_version, std::nullopt, false, maximum_rows);
+                decoder.Decode(message);
+                auto fetch = decoder.Take();
+                TtcExecuteResponse response;
+                response.columns = columns;
+                response.rows = std::move(fetch.rows);
+                response.completion = fetch.completion;
+                response.exhausted = fetch.exhausted;
+                response.completed = fetch.completed;
+                response.bytes_consumed = fetch.bytes_consumed;
+                decoded = std::move(response);
+            }
+            if (!maximum_rows || decoded->rows.size() > maximum_rows) {
+                throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle query reexecute exceeded requested rows");
+            }
+            return decoded->completed;
+        });
+        return std::move(*decoded);
+    } catch (...) {
+        statements.Poison(handle);
+        throw;
+    }
+}
+
 std::vector<uint8_t> TtcStatementChannel::ReceiveExecuteResponse(OracleStatementHandle handle) {
     try {
         auto response = channel.Receive();
@@ -254,6 +317,15 @@ TtcCallResponse TtcStatementChannel::ReceiveCallResponse(OracleStatementHandle h
 }
 
 void TtcStatementChannel::CompleteExecute(OracleStatementHandle handle, bool is_query, uint32_t remote_cursor_id) {
+    const auto previous = statements.TryRemoteCursorId(handle);
+    if (previous) {
+        if (!is_query || remote_cursor_id != *previous) {
+            statements.Poison(handle);
+            throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle reexecute changed its server cursor id");
+        }
+        statements.MarkExecuted(handle, true);
+        return;
+    }
     if (is_query) {
         if (remote_cursor_id == 0) {
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle query execute response has no cursor id");

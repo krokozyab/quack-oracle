@@ -258,6 +258,29 @@ void WriteBindValues(ByteWriter &writer, const std::vector<OracleBind> &binds,
 
 } // namespace
 
+std::vector<uint8_t> EncodeTtcReexecuteQuery(uint8_t sequence, uint32_t cursor_id, uint32_t rows,
+                                           const std::vector<OracleBind> &binds) {
+    if (!cursor_id || !rows || rows > MAX_PREFETCH_ROWS || binds.size() > MAX_BINDS) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC query reexecute has an invalid cursor or row count");
+    }
+    std::vector<uint32_t> widths;
+    for (const auto &bind : binds) {
+        ValidateBind(bind);
+        if (bind.direction != BindDirection::BIND_IN || IsVectorBind(bind) || IsLocatorBind(bind) ||
+            bind.oracle_type == ORACLE_WIRE_TYPE_CURSOR) {
+            throw ProtocolError(ProtocolErrorKind::UNSUPPORTED, "TTC query reexecute requires scalar IN binds");
+        }
+        widths.push_back(BindBufferSize(bind));
+    }
+    ByteWriter writer;
+    writer.WriteByte(TTC_MESSAGE_FUNCTION).WriteByte(78).WriteByte(sequence);
+    writer.WriteUB4(cursor_id).WriteUB4(rows).WriteUB4(OALL8_EXECUTE).WriteUB4(0);
+    if (!binds.empty()) {
+        WriteBindValues(writer, binds, widths);
+    }
+    return writer.Take();
+}
+
 std::vector<uint8_t> EncodeTtcExecuteNoBindsRequest(const TtcExecuteNoBindsRequest &request) {
     Validate(request);
     ByteWriter writer;

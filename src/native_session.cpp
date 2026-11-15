@@ -1,5 +1,6 @@
 #include "oracle_scanner/native_session.hpp"
 #include "oracle_scanner/native_fetch_cancellation.hpp"
+#include "oracle_scanner/query_cache.hpp"
 
 #include "oracle_scanner/bind_validation.hpp"
 #include "oracle_scanner/call_builder.hpp"
@@ -30,19 +31,59 @@ struct NativeSessionLifetime {
     // response unread, so the session is never handed to another caller.
     bool exchange_failed = false;
     NativeFetchCancellation fetch_cancellation;
+    OracleQueryCache queries;
+    uint64_t query_generation = 0;
+    bool cache_queries = true;
 };
 
 namespace {
+
+std::string QueryCacheKey(const std::string &sql, const std::vector<OracleBind> &binds) {
+    if (sql.size() > (64U << 10U) || binds.size() > 64) {
+        return {};
+    }
+    auto key = std::to_string(sql.size()) + ":" + sql;
+    for (const auto &bind : binds) {
+        const auto width = bind.maximum_bytes ? bind.maximum_bytes :
+            static_cast<uint32_t>(bind.value ? (std::max)(size_t(1), bind.value->size()) : 1);
+        if (bind.direction != BindDirection::BIND_IN || bind.lob_content || width > 32767 ||
+            bind.oracle_type == ORACLE_WIRE_TYPE_CURSOR ||
+            TtcFramingForType(bind.oracle_type) != TtcColumnFraming::SCALAR ||
+            (bind.value && bind.value->size() > width)) {
+            return {};
+        }
+        key += ":" + std::to_string(bind.oracle_type) + "," + std::to_string(bind.character_set_form) + "," +
+               std::to_string(width);
+    }
+    return key;
+}
+
+bool CacheableColumns(const std::vector<OracleColumn> &columns) {
+    if (columns.empty()) {
+        return false;
+    }
+    for (const auto &column : columns) {
+        if (TtcFramingForType(column.oracle_type) != TtcColumnFraming::SCALAR || column.inline_lob_cells) {
+            return false;
+        }
+    }
+    return true;
+}
 
 class NativeOracleCursor final : public OracleCursor {
 public:
     NativeOracleCursor(TtcStatementChannel &channel_p, uint8_t &next_sequence_p, std::shared_ptr<NativeSessionLifetime> lifetime_p,
                        OracleStatementHandle handle_p,
                        std::vector<OracleColumn> columns_p, std::vector<TtcRowData> prefetched_p, bool exhausted_p,
-                       uint8_t server_field_version_p, uint8_t field_version_p, bool opened_by_plsql_p)
+                       uint8_t server_field_version_p, uint8_t field_version_p, bool opened_by_plsql_p,
+                       std::string query_key_p = {})
         : channel(channel_p), next_sequence(next_sequence_p), lifetime(std::move(lifetime_p)), handle(handle_p),
           columns(std::move(columns_p)), pending(std::move(prefetched_p)), server_field_version(server_field_version_p),
-          exhausted(exhausted_p), field_version(field_version_p), opened_by_plsql(opened_by_plsql_p) {
+          exhausted(exhausted_p), field_version(field_version_p), opened_by_plsql(opened_by_plsql_p),
+          query_key(std::move(query_key_p)), query_generation(lifetime->query_generation) {
+        if (exhausted) {
+            channel.MarkFetchExhausted(handle);
+        }
         prefetch_eligible=SupportsLobPrefetchColumns(columns,field_version);
         if (prefetch_eligible) {
             try { (void)BoundedLobPrefetchRows(columns,1,prefetch_limits); }
@@ -350,7 +391,13 @@ public:
             // the transport already releases its server-side state.
             if (lifetime->open && lifetime->fetch_cancellation.CanUseConnection()) {
                 const auto call = channel.LockCall();
-                channel.Close(handle);
+                if (!lifetime->exchange_failed && lifetime->cache_queries && exhausted && !opened_by_plsql &&
+                    !query_key.empty() && query_generation == lifetime->query_generation && CacheableColumns(columns)) {
+                    lifetime->queries.Put({std::move(query_key), handle, columns},
+                                          [&](OracleStatementHandle evicted) { channel.Close(evicted); });
+                } else {
+                    channel.Close(handle);
+                }
             }
             closed = true;
         }
@@ -376,6 +423,8 @@ private:
     bool inline_eligible=false;
     bool inline_active=false;
     OracleLobPrefetchLimits prefetch_limits;
+    std::string query_key;
+    uint64_t query_generation;
 };
 
 // Temporary LOB operations on the session's own channel.
@@ -439,6 +488,7 @@ std::unique_ptr<NativeOracleSession> NativeOracleSession::Connect(const Connecti
     connection->Negotiate();
     connection->AuthenticateO5Logon(config.user, password);
     auto session = std::unique_ptr<NativeOracleSession>(new NativeOracleSession(std::move(connection)));
+    session->lifetime->cache_queries = config.statement_cache;
     session->deadline_binding = config.io_deadline_binding;
     TtcEndToEndAttributes attributes;
     if (!config.client_identifier.empty()) {
@@ -564,6 +614,32 @@ std::unique_ptr<OracleCursor> NativeOracleSession::OpenQuery(const std::string &
     RequireOpen();
     const auto call = channel->LockCall();
     const auto ordered_binds = OrderOracleStatementBinds(sql, binds, OracleBindUse::QUERY);
+    if (lifetime->exchange_failed) {
+        InvalidateQueries();
+    }
+    const auto key = lifetime->cache_queries && !lifetime->exchange_failed ? QueryCacheKey(sql, ordered_binds) : std::string();
+    if (!key.empty()) {
+        if (auto cached = lifetime->queries.Take(key)) {
+            channel->ReexecuteQuery(cached->handle, NextSequence(), static_cast<uint32_t>(initial_rows), ordered_binds);
+            auto response = channel->ReceiveReexecuteResponse(cached->handle, cached->columns,
+                                                              connection->TtcFieldVersion(),
+                                                              connection->TtcServerFieldVersion(),
+                                                              static_cast<uint32_t>(initial_rows));
+            if (!response.completion || !response.completion->cursor_id) {
+                statements.Poison(cached->handle);
+                throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle query reexecute has no cursor completion");
+            }
+            channel->CompleteExecute(cached->handle, true, response.completion->cursor_id);
+            return std::make_unique<NativeOracleCursor>(*channel, next_sequence, lifetime, cached->handle,
+                std::move(response.columns), std::move(response.rows), response.exhausted,
+                connection->TtcServerFieldVersion(), connection->TtcFieldVersion(), false, key);
+        }
+    }
+    // Idle cached statements must never reduce the pre-existing active-cursor
+    // limit. Evict one when a different query needs its registry slot.
+    if (statements.OpenCount() >= 64 && lifetime->queries.Size()) {
+        lifetime->queries.Evict([&](OracleStatementHandle evicted) { channel->Close(evicted); });
+    }
     const auto handle = statements.Open(OracleSqlKind::QUERY);
     if (ordered_binds.empty()) {
         TtcExecuteNoBindsRequest request;
@@ -589,7 +665,23 @@ std::unique_ptr<OracleCursor> NativeOracleSession::OpenQuery(const std::string &
     }
     channel->CompleteExecute(handle, true, response.completion->cursor_id);
     return std::make_unique<NativeOracleCursor>(*channel, next_sequence, lifetime, handle, response.columns, response.rows,
-                                                response.exhausted, connection->TtcServerFieldVersion(),connection->TtcFieldVersion(), false);
+                                                response.exhausted, connection->TtcServerFieldVersion(),connection->TtcFieldVersion(), false, key);
+}
+
+void NativeOracleSession::InvalidateQueries() {
+    RequireOpen();
+    const auto call = channel->LockCall();
+    ++lifetime->query_generation;
+    lifetime->queries.Clear([&](OracleStatementHandle evicted) { channel->Close(evicted); });
+}
+
+void NativeOracleSession::SetStatementCacheEnabled(bool enabled) {
+    RequireOpen();
+    const auto call = channel->LockCall();
+    if (lifetime->cache_queries != enabled) {
+        InvalidateQueries();
+        lifetime->cache_queries = enabled;
+    }
 }
 
 uint64_t NativeOracleSession::Execute(const std::string &sql, const std::vector<OracleBind> &binds) {
@@ -609,6 +701,7 @@ uint64_t NativeOracleSession::ExecuteStatement(const std::string &sql, const std
                                               OracleSqlKind kind) {
     RequireOpen();
     const auto call = channel->LockCall();
+    InvalidateQueries();
     const auto ordered_binds = OrderOracleStatementBinds(sql, binds, OracleBindUse::DML);
     const auto handle = statements.Open(kind);
     if (ordered_binds.empty()) {
@@ -634,6 +727,7 @@ uint64_t NativeOracleSession::ExecuteStatement(const std::string &sql, const std
 }
 
 uint64_t NativeOracleSession::ExecuteWithRowCount(const std::string &sql, const std::vector<OracleBind> &binds) {
+    InvalidateQueries();
     RequireOpen();
     return RunNativeOperation(*lifetime, [&]() {
     return WithTemporaryLobs(binds, [&](const std::vector<OracleBind> &binds) {
@@ -697,6 +791,7 @@ uint64_t NativeOracleSession::ExecuteWithRowCount(const std::string &sql, const 
 // request stays a bounded message; the row counts are summed across groups.
 uint64_t NativeOracleSession::ExecuteBatch(const std::string &sql, const std::vector<std::vector<OracleBind>> &rows) {
     RequireOpen();
+    InvalidateQueries();
     return RunNativeOperation(*lifetime, [&]() {
         if (rows.empty()) {
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "native Oracle DML batch cannot be empty");
@@ -782,6 +877,7 @@ uint64_t NativeOracleSession::ExecuteBatch(const std::string &sql, const std::ve
 
 std::vector<OracleBind> NativeOracleSession::ExecuteReturning(const std::string &sql,
                                                               const std::vector<OracleBind> &binds) {
+    InvalidateQueries();
     RequireOpen();
     return RunNativeOperation(*lifetime, [&]() {
     return WithTemporaryLobs(binds, [&](const std::vector<OracleBind> &binds) {
@@ -825,6 +921,7 @@ std::vector<OracleBind> NativeOracleSession::ExecuteReturning(const std::string 
 
 OracleCallResult NativeOracleSession::Call(const OracleCallRequest &request) {
     RequireOpen();
+    InvalidateQueries();
     auto called = RunNativeOperation(*lifetime, [&]() {
         const auto call = channel->LockCall();
         const auto sql = BuildOracleCallBlock(request);
@@ -950,7 +1047,7 @@ OracleIoStats NativeOracleSession::IoStats() const {
 bool NativeOracleSession::ReadyForReuse() const {
     return connection && connection->State() == OracleConnectionState::AUTHENTICATED && lifetime->open &&
            !lifetime->exchange_failed && lifetime->fetch_cancellation.CanUseConnection() &&
-           statements.OpenCount() == 0 && deadline_binding;
+           statements.OpenCount() == lifetime->queries.Size() && deadline_binding;
 }
 
 bool NativeOracleSession::BindIoDeadline(std::shared_ptr<OracleIoDeadline> source) {
@@ -969,6 +1066,7 @@ void NativeOracleSession::Cancel() {
 void NativeOracleSession::Close() {
     if (connection) {
         lifetime->open = false;
+        lifetime->queries.Clear([](OracleStatementHandle) {});
         statements.CloseAll();
         connection->Close();
         channel.reset();

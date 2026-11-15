@@ -94,8 +94,13 @@ void OracleSessionHandle::Poison() noexcept {
 }
 
 OracleSessionHandle AcquireOracleReadSession(ClientContext &context, const std::string &secret_name,
-                                             const std::string &catalog_name, const ConnectionConfig &config,
+                                             const std::string &catalog_name, const ConnectionConfig &original_config,
                                              const std::string &password) {
+    auto config = original_config;
+    Value cache_setting;
+    if (context.TryGetCurrentSetting("oracle_statement_cache", cache_setting) && !cache_setting.IsNull()) {
+        config.statement_cache = BooleanValue::Get(cache_setting);
+    }
     OracleSessionHandle handle;
     // A transaction that has written to this catalog already holds a session,
     // and its uncommitted rows exist on that session and nowhere else. Reading
@@ -103,6 +108,7 @@ OracleSessionHandle AcquireOracleReadSession(ClientContext &context, const std::
     if (!catalog_name.empty()) {
         handle.borrowed = TryTransactionSession(context, catalog_name);
         if (handle.borrowed) {
+            handle.Get().SetStatementCacheEnabled(config.statement_cache);
             return handle;
         }
     }
@@ -112,6 +118,7 @@ OracleSessionHandle AcquireOracleReadSession(ClientContext &context, const std::
         auto &pool = state->PoolFor(PoolKey(secret_name, config), maximum_sessions, config, password);
         try {
             handle.lease = pool.Acquire();
+            handle.Get().SetStatementCacheEnabled(config.statement_cache);
             return handle;
         } catch (const oracle_scanner::OracleSessionPoolExhausted &) {
             // Every pooled session is busy. One query can hold several at once
@@ -120,10 +127,14 @@ OracleSessionHandle AcquireOracleReadSession(ClientContext &context, const std::
         }
     }
     handle.owned = oracle_scanner::OpenOracleSession(config, password);
+    handle.Get().SetStatementCacheEnabled(config.statement_cache);
     return handle;
 }
 
 void RegisterOracleSessionPool(ExtensionLoader &loader) {
+    DBConfig::GetConfig(loader.GetDatabaseInstance())
+        .AddExtensionOption("oracle_statement_cache", "Reuse up to 32 parsed scalar queries per native Oracle session.",
+                            LogicalType::BOOLEAN, Value::BOOLEAN(true));
     DBConfig::GetConfig(loader.GetDatabaseInstance())
         .AddExtensionOption("oracle_session_pool_size",
                             "How many authenticated Oracle sessions one DuckDB connection keeps for reuse, per secret. "

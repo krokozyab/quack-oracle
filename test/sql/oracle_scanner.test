@@ -489,3 +489,20 @@ statement error
 SELECT * FROM oracle_execute_many('oracle_test', 'MERGE INTO app.t t USING dual ON (t.id=:missing) WHEN MATCHED THEN UPDATE SET t.id=:1', [[1]]);
 ----
 Binder Error: oracle_execute_many row 1 is invalid: Oracle SQL placeholders and supplied binds do not match
+
+# Parsed query reuse can be disabled independently of authenticated session reuse.
+query I
+SELECT CASE WHEN current_setting('oracle_statement_cache') THEN 1 ELSE 0 END
+----
+1
+
+statement ok
+SET oracle_statement_cache=false
+
+query I
+SELECT CASE WHEN current_setting('oracle_statement_cache') THEN 1 ELSE 0 END
+----
+0
+
+statement ok
+RESET oracle_statement_cache

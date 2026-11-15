@@ -39,6 +39,7 @@
 #include "oracle_scanner/sql_statement.hpp"
 #include "oracle_scanner/validating_session.hpp"
 #include "oracle_scanner/statement_registry.hpp"
+#include "oracle_scanner/query_cache.hpp"
 #include "oracle_scanner/connect_descriptor.hpp"
 #include "oracle_scanner/connect_error.hpp"
 #include "oracle_scanner/connect_plan.hpp"
@@ -740,6 +741,7 @@ static void TestStatementChannelJoinsFragmentedExecuteResponse() {
     response.WriteByte(6).WriteByte(0).WriteUB2(0).WriteUB4(0).WriteUB4(1);
     response.WriteUB2(0).WriteUB4(0).WriteUB4(0);
     response.WriteByte(TTC_MESSAGE_ROW_DATA).WriteLengthPrefixed(EncodeOracleNumber("7"));
+    const auto completion_offset = response.Data().size();
     response.WriteByte(TTC_MESSAGE_ERROR).WriteUB4(0).WriteUB2(0).WriteUB4(0);
     response.WriteUB2(0).WriteUB2(0).WriteUB2(0).WriteUB4(42).WriteUB4(0);
     response.WriteByte(0).WriteByte(0).WriteByte(0).WriteByte(0).WriteByte(0).WriteByte(0);
@@ -774,6 +776,53 @@ static void TestStatementChannelJoinsFragmentedExecuteResponse() {
     const auto decoded = statement_channel.ReceiveDecodedExecuteResponse(handle);
     CHECK(decoded.columns.size() == 1 && decoded.rows.size() == 1 && decoded.completion &&
           decoded.completion->cursor_id == 42 && DecodeOracleNumber(*decoded.rows[0][0]) == "7");
+    for (const bool fresh_describe : {false, true}) {
+        std::vector<uint8_t> reexecute_input;
+        for (const auto &packet : EncodeTnsDataPackets(fresh_describe ? response.Data() : second, true, 32, 0)) {
+            reexecute_input.insert(reexecute_input.end(), packet.begin(), packet.end());
+        }
+        FragmentedStream reexecute_stream(reexecute_input, 2);
+        TnsPacketStream reexecute_packets(reexecute_stream, true, 32);
+        TtcChannel reexecute_ttc(reexecute_packets, 32);
+        OracleStatementRegistry registry;
+        TtcStatementChannel reexecute(reexecute_ttc, registry);
+        const auto prepared = registry.Open(OracleSqlKind::QUERY);
+        reexecute.CompleteExecute(prepared, true, 42);
+        reexecute.MarkFetchExhausted(prepared);
+        reexecute.ReexecuteQuery(prepared, 8, 2, {});
+        // External DDL can change scalar types without changing row framing.
+        // A fresh describe must replace this deliberately stale text type.
+        const std::vector<OracleColumn> cached = {{"OLD", static_cast<uint16_t>(fresh_describe ? 1 : 2)}};
+        const auto replay = reexecute.ReceiveReexecuteResponse(prepared, cached, 12, 12);
+        CHECK(replay.completed && replay.columns[0].oracle_type == 2 && replay.rows.size() == 1);
+        CHECK(DecodeOracleNumber(*replay.rows[0][0]) == "7" && replay.completion->cursor_id == 42);
+        reexecute.CompleteExecute(prepared, true, replay.completion->cursor_id);
+        ByteWriter extra_row;
+        extra_row.WriteByte(TTC_MESSAGE_ROW_DATA).WriteLengthPrefixed(EncodeOracleNumber("8"));
+        auto too_many = response.Data();
+        too_many.insert(too_many.begin() + static_cast<std::ptrdiff_t>(completion_offset),
+                        extra_row.Data().begin(), extra_row.Data().end());
+        if (!fresh_describe) {
+            too_many.erase(too_many.begin(), too_many.begin() + static_cast<std::ptrdiff_t>(split));
+        }
+        std::vector<uint8_t> overflow_input;
+        for (const auto &packet : EncodeTnsDataPackets(too_many, true, 32, 0)) {
+            overflow_input.insert(overflow_input.end(), packet.begin(), packet.end());
+        }
+        FragmentedStream overflow_stream(overflow_input, 2);
+        TnsPacketStream overflow_packets(overflow_stream, true, 32);
+        TtcChannel overflow_ttc(overflow_packets, 32);
+        OracleStatementRegistry overflow_registry;
+        TtcStatementChannel overflow(overflow_ttc, overflow_registry);
+        const auto overflow_handle = overflow_registry.Open(OracleSqlKind::QUERY);
+        overflow.CompleteExecute(overflow_handle, true, 42);
+        overflow.MarkFetchExhausted(overflow_handle);
+        overflow.ReexecuteQuery(overflow_handle, 9, 1, {});
+        ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [&] {
+            overflow.ReceiveReexecuteResponse(overflow_handle, cached, 12, 12, 1);
+        });
+        CHECK(overflow_registry.State(overflow_handle) == OracleStatementState::POISONED);
+    }
 }
 
 static void TestTtcCancellation() {
@@ -2884,6 +2933,10 @@ static void TestSqlStatementValidation() {
 
 class TestSession : public OracleSession {
 public:
+    void SetStatementCacheEnabled(bool enabled) override {
+        cache_settings.push_back(enabled);
+    }
+    std::vector<bool> cache_settings;
     std::unique_ptr<OracleCursor> Query(const std::string &, const std::vector<OracleBind> &) override {
         queries++;
         return nullptr;
@@ -2933,6 +2986,15 @@ public:
     uint64_t counted_execute_rows = 0;
     bool fail_commit = false;
 };
+
+static void TestStatementCacheConfigurationReachesNativeSession() {
+    auto session = std::make_unique<TestSession>();
+    auto &observed = session->cache_settings;
+    ValidatedOracleSession validated(std::move(session));
+    validated.SetStatementCacheEnabled(false);
+    validated.SetStatementCacheEnabled(true);
+    CHECK(observed == std::vector<bool>({false, true}));
+}
 
 class BlockingCommitSession final : public TestSession {
 public:
@@ -3017,6 +3079,89 @@ static void TestInitialFetchHintIsValidatedAndForwarded() {
     TestSession fallback;
     fallback.QueryWithInitialFetch("select 1 from dual", {}, 32);
     CHECK(fallback.queries == 1);
+}
+
+static void TestPreparedQueryCacheOwnershipAndBounds() {
+    OracleQueryCache cache;
+    std::vector<uint32_t> closed;
+    const auto close = [&](OracleStatementHandle h) { closed.push_back(h.statement_id); };
+    const auto entry = [](uint32_t id, size_t bytes = 0) {
+        OraclePreparedQuery result;
+        result.key = "query" + std::to_string(id);
+        result.handle = {id};
+        result.columns = {{"N", 2}};
+        result.key.reserve(bytes);
+        return result;
+    };
+    cache.Put(entry(1), close);
+    const auto size = cache.Bytes();
+    CHECK(size > 0 && cache.Size() == 1);
+    auto active = cache.Take("query1");
+    CHECK(active && active->handle.statement_id == 1 && cache.Size() == 0 && cache.Bytes() == 0);
+    CHECK(!cache.Take("query1"));
+    cache.Put(std::move(*active), close);
+    for (uint32_t id = 2; id <= 32; ++id) {
+        cache.Put(entry(id), close);
+    }
+    active = cache.Take("query1");
+    CHECK(active);
+    cache.Put(std::move(*active), close);
+    cache.Put(entry(33), close);
+    CHECK(cache.Size() == 32 && closed == std::vector<uint32_t>({2}) && !cache.Take("query2"));
+    auto duplicate = entry(100);
+    duplicate.key = "query1";
+    cache.Put(std::move(duplicate), close);
+    CHECK(closed.back() == 1 && cache.Size() == 32);
+    CHECK(cache.Take("query1")->handle.statement_id == 100);
+    cache.Clear(close);
+    CHECK(cache.Size() == 0 && cache.Bytes() == 0);
+    closed.clear();
+    // Capacity, not length: each key has a tiny SQL but reserves 1 MiB.
+    cache.Put(entry(1, 1U << 20U), close);
+    cache.Put(entry(2, 1U << 20U), close);
+    CHECK(cache.Size() == 1 && cache.Bytes() <= OracleQueryCache::MAX_BYTES && closed == std::vector<uint32_t>({1}));
+    cache.Put(entry(3, OracleQueryCache::MAX_BYTES + 1), close);
+    CHECK(cache.Size() == 1 && closed.back() == 3);
+    cache.Clear(close);
+    CHECK(closed.back() == 2 && cache.Bytes() == 0);
+}
+
+static void TestPreparedQueryReexecuteWireAndState() {
+    CHECK(EncodeTtcReexecuteQuery(7, 42, 2) == std::vector<uint8_t>({3, 78, 7, 1, 42, 1, 2, 1, 32, 0}));
+    const std::vector<OracleBind> binds = {{"n", 2, BindDirection::BIND_IN, EncodeOracleNumber("7")}};
+    CHECK(EncodeTtcReexecuteQuery(8, 42, 2, binds) ==
+          std::vector<uint8_t>({3, 78, 8, 1, 42, 1, 2, 1, 32, 0, 7, 2, 193, 8}));
+    auto null_bind = binds;
+    null_bind[0].value.reset();
+    CHECK(EncodeTtcReexecuteQuery(8, 42, 2, null_bind).back() == 0);
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { EncodeTtcReexecuteQuery(1, 0, 2); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { EncodeTtcReexecuteQuery(1, 42, 0); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [] { EncodeTtcReexecuteQuery(1, 42, (1U << 20U) + 1); });
+    auto out = binds;
+    out[0].direction = BindDirection::BIND_OUT;
+    out[0].maximum_bytes = 22;
+    ExpectError(ProtocolErrorKind::UNSUPPORTED, [&] { EncodeTtcReexecuteQuery(1, 42, 2, out); });
+
+    FragmentedStream stream({}, 3);
+    TnsPacketStream packets(stream, true, 512);
+    TtcChannel ttc(packets, 512);
+    OracleStatementRegistry registry;
+    TtcStatementChannel channel(ttc, registry);
+    const auto handle = registry.Open(OracleSqlKind::QUERY);
+    ExpectError(ProtocolErrorKind::INVALID_STATE, [&] { channel.ReexecuteQuery(handle, 7, 2, {}); });
+    channel.CompleteExecute(handle, true, 42);
+    ExpectError(ProtocolErrorKind::INVALID_STATE, [&] { channel.ReexecuteQuery(handle, 7, 2, {}); });
+    channel.MarkFetchExhausted(handle);
+    channel.ReexecuteQuery(handle, 7, 2, {});
+    CHECK(registry.State(handle) == OracleStatementState::OPEN && registry.RemoteCursorId(handle) == 42);
+    channel.CompleteExecute(handle, true, 42);
+    CHECK(registry.State(handle) == OracleStatementState::EXECUTED);
+    channel.MarkFetchExhausted(handle);
+    channel.ReexecuteQuery(handle, 8, 2, binds);
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { channel.CompleteExecute(handle, true, 43); });
+    CHECK(registry.State(handle) == OracleStatementState::POISONED);
+    ExpectError(ProtocolErrorKind::INVALID_STATE, [&] { registry.RestartQuery(handle); });
+    CHECK(channel.Close(handle) && registry.OpenCount() == 0);
 }
 
 static void TestStatementRegistry() {
@@ -3474,6 +3619,170 @@ static void TestLiveTnsNegotiation() {
         const auto committed = connection->Ttc().Commit(3);
         const auto rolled_back = connection->Ttc().Rollback(4);
         CHECK(committed.call_status != 0 && rolled_back.call_status != 0);
+    }
+    if (stage && std::string(stage) == "prepared_cache") {
+        config.io_deadline_binding = std::make_shared<OracleIoDeadlineBinding>();
+        auto native = NativeOracleSession::Connect(config, RequiredEnvironment("ORA19C_PASSWORD"));
+        const auto read = [&](const std::string &sql, const std::vector<OracleBind> &binds = {}) {
+            auto cursor = native->Query(sql, binds);
+            OracleBatch all;
+            all.columns = cursor->Columns();
+            for (;;) {
+                auto batch = cursor->Fetch(100);
+                for (auto &row : batch.rows) {
+                    all.rows.push_back(std::move(row));
+                }
+                if (batch.exhausted) {
+                    break;
+                }
+            }
+            cursor->Close();
+            return all;
+        };
+        const auto sql = "SELECT /* RV_PREP_READ " + std::string(1024, 'x') + " */ 7 AS n FROM dual";
+        const auto begin = native->IoStats();
+        CHECK(DecodeOracleNumber(*read(sql).rows[0][0]) == "7");
+        const auto cold = native->IoStats();
+        CHECK(DecodeOracleNumber(*read(sql).rows[0][0]) == "7");
+        const auto warm = native->IoStats();
+        CHECK(warm.bytes_sent - cold.bytes_sent < cold.bytes_sent - begin.bytes_sent);
+        CHECK(warm.bytes_received - cold.bytes_received < cold.bytes_received - begin.bytes_received);
+        std::cout << "prepared query warm bytes sent/received " << warm.bytes_sent - cold.bytes_sent << "/"
+                  << warm.bytes_received - cold.bytes_received << std::endl;
+        CHECK(native->ReadyForReuse());
+        native->SetStatementCacheEnabled(false);
+        const auto disabled_begin = native->IoStats();
+        CHECK(read(sql).rows.size() == 1);
+        CHECK(native->IoStats().bytes_sent - disabled_begin.bytes_sent > 1024);
+        CHECK(native->ReadyForReuse());
+        native->SetStatementCacheEnabled(true);
+        CHECK(read(sql).rows.size() == 1);
+        const auto enabled_begin = native->IoStats();
+        CHECK(read(sql).rows.size() == 1);
+        CHECK(native->IoStats().bytes_sent - enabled_begin.bytes_sent < 128);
+        // Bind values change on every reexecute, metadata stays the same.
+        const auto bound_sql = "SELECT /* RV_PREP_BINDS " + std::string(1024, 'y') + " */ :n AS n FROM dual";
+        for (int i = 1; i <= 6; ++i) {
+            const auto value = std::to_string(i * 111);
+            const std::vector<OracleBind> binds = {{"n", 2, BindDirection::BIND_IN, EncodeOracleNumber(value), 22}};
+            CHECK(DecodeOracleNumber(*read(bound_sql, binds).rows[0][0]) == value);
+        }
+        const std::vector<OracleBind> null_number = {{"n", 2, BindDirection::BIND_IN, std::nullopt, 22}};
+        CHECK(!read(bound_sql, null_number).rows[0][0]);
+        const std::vector<OracleBind> number_again = {{"n", 2, BindDirection::BIND_IN, EncodeOracleNumber("999"), 22}};
+        CHECK(DecodeOracleNumber(*read(bound_sql, number_again).rows[0][0]) == "999");
+        for (const auto &text : {std::string("abc"), std::string("xyz"), std::string(200, 'q')}) {
+            const std::vector<OracleBind> text_bind = {{"n", 1, BindDirection::BIND_IN,
+                std::vector<uint8_t>(text.begin(), text.end()), static_cast<uint32_t>((std::max)(size_t(22), text.size()))}};
+            const auto answer = read(bound_sql, text_bind);
+            CHECK(answer.columns[0].oracle_type == 1);
+            CHECK(std::string(answer.rows[0][0]->begin(), answer.rows[0][0]->end()) == text);
+        }
+        const std::vector<OracleBind> national = {{"n", 1, BindDirection::BIND_IN,
+            std::vector<uint8_t>({0x03, 0xa9}), 22, 2}};
+        const auto national_answer = read(bound_sql, national);
+        CHECK(national_answer.columns[0].character_set_form == 2);
+        CHECK(std::vector<uint8_t>(national_answer.rows[0][0]->begin(), national_answer.rows[0][0]->end()) ==
+              std::vector<uint8_t>({0x03, 0xa9}));
+        CHECK(DecodeOracleNumber(*read(bound_sql, number_again).rows[0][0]) == "999");
+        // EOF and row-compression state must be fresh for each execution.
+        for (int i = 0; i < 3; ++i) {
+            auto rows = read("SELECT 7 n FROM dual CONNECT BY level <= 300");
+            CHECK(rows.rows.size() == 300);
+            for (const auto &row : rows.rows) {
+                CHECK(DecodeOracleNumber(*row[0]) == "7");
+            }
+        }
+        for (int i = 0; i < 2; ++i) {
+            CHECK(read("SELECT 7 n FROM dual WHERE 1=0").rows.empty());
+        }
+        // Independent handles for overlapping executions of identical SQL.
+        const auto repeat = "SELECT level n FROM dual CONNECT BY level <= 3";
+        auto left = native->Query(repeat, {});
+        auto right = native->Query(repeat, {});
+        CHECK(!native->ReadyForReuse());
+        CHECK(left->Fetch(100).rows.size() == 3 && right->Fetch(100).rows.size() == 3);
+        left->Close();
+        right->Close();
+        CHECK(read(repeat).rows.size() == 3);
+        CHECK(native->ReadyForReuse());
+        // Eviction closes only idle handles; an unfinished cursor stays valid.
+        auto active = native->Query("SELECT level n FROM dual CONNECT BY level <= 200", {});
+        for (int i = 0; i < 70; ++i) {
+            CHECK(DecodeOracleNumber(*read("SELECT " + std::to_string(i) + " n FROM dual").rows[0][0]) == std::to_string(i));
+        }
+        size_t rows = 0;
+        for (;;) {
+            auto batch = active->Fetch(100);
+            rows += batch.rows.size();
+            if (batch.exhausted) {
+                break;
+            }
+        }
+        CHECK(rows == 200);
+        active->Close();
+        native->ExecuteAdmin("CREATE TABLE RV_PREP (n NUMBER(10))");
+        native->Execute("INSERT INTO RV_PREP VALUES (NULL)", {});
+        native->Commit();
+        const auto table_sql = "SELECT /* " + std::string(1024, 'z') + " */ * FROM RV_PREP";
+        CHECK(read(table_sql).columns[0].oracle_type == 2);
+        native->ExecuteAdmin("ALTER TABLE RV_PREP MODIFY (n VARCHAR2(20))");
+        native->Execute("UPDATE RV_PREP SET n='aa'", {});
+        native->Commit();
+        const auto after_ddl = native->IoStats();
+        CHECK(read(table_sql).columns[0].oracle_type == 1);
+        CHECK(native->IoStats().bytes_sent - after_ddl.bytes_sent > 1024);
+        const auto text_row = read(table_sql);
+        CHECK(std::string(text_row.rows[0][0]->begin(), text_row.rows[0][0]->end()) == "aa");
+        // External DDL must give a fresh describe or a real invalidation error,
+        // never bytes interpreted using the old NUMBER/VARCHAR descriptor.
+        auto stale = native->Query(table_sql, {});
+        native->ExecuteAdmin("ALTER TABLE RV_PREP ADD (v NUMBER(25))");
+        stale->Close();
+        const auto after_active_ddl = native->IoStats();
+        CHECK(read(table_sql).columns.size() == 2);
+        CHECK(native->IoStats().bytes_sent - after_active_ddl.bytes_sent > 1024);
+        auto external = NativeOracleSession::Connect(config, RequiredEnvironment("ORA19C_PASSWORD"));
+        external->ExecuteAdmin("ALTER TABLE RV_PREP MODIFY (v NUMBER(38))");
+        try {
+            auto changed = read(table_sql);
+            CHECK(changed.columns.size() == 2 && changed.columns[1].precision == 38);
+        } catch (const ProtocolError &error) {
+            CHECK(error.OracleCode() == 1007 || error.OracleCode() == 932);
+            std::cout << "external DDL invalidation ORA " << *error.OracleCode() << std::endl;
+        }
+        native->Close();
+        native = NativeOracleSession::Connect(config, RequiredEnvironment("ORA19C_PASSWORD"));
+        CHECK(read(table_sql).columns.size() == 2);
+        CHECK(read(table_sql).columns[1].precision == 38);
+        external->ExecuteAdmin("DROP TABLE RV_PREP PURGE");
+        external->ExecuteAdmin("CREATE TABLE RV_PREP (n NUMBER(25), v NUMBER(38))");
+        external->Execute("INSERT INTO RV_PREP VALUES (1234567890123456789012345, 7)", {});
+        external->Commit();
+        try {
+            const auto replaced = read(table_sql);
+            CHECK(replaced.columns[0].oracle_type == 2 && replaced.columns[0].precision == 25);
+            CHECK(DecodeOracleNumber(*replaced.rows[0][0]) == "1234567890123456789012345");
+        } catch (const ProtocolError &error) {
+            CHECK(error.OracleCode() == 1007 || error.OracleCode() == 932);
+        }
+        external->ExecuteAdmin("DROP TABLE RV_PREP PURGE");
+        ExpectProtocolError([&] { read(table_sql); });
+        native->Close();
+        external->Close();
+        config.statement_cache = false;
+        native = NativeOracleSession::Connect(config, RequiredEnvironment("ORA19C_PASSWORD"));
+        const auto before_off = native->IoStats();
+        CHECK(read(sql).rows.size() == 1);
+        const auto first_off = native->IoStats();
+        CHECK(read(sql).rows.size() == 1);
+        const auto second_off = native->IoStats();
+        const auto off_first = first_off.bytes_sent - before_off.bytes_sent;
+        const auto off_second = second_off.bytes_sent - first_off.bytes_sent;
+        CHECK(off_first > 1024 && off_second > 1024);
+        CHECK(off_first + 64 > off_second && off_second + 64 > off_first);
+        native->Close();
+        std::cout << "prepared query cache live checks passed" << std::endl;
     }
     if (stage && std::string(stage) == "native_session") {
         auto native = NativeOracleSession::Connect(config, RequiredEnvironment("ORA19C_PASSWORD"));
@@ -9323,7 +9632,10 @@ int main() {
     TestTransactions();
     TestValidatedSession();
     TestInitialFetchHintIsValidatedAndForwarded();
+    TestStatementCacheConfigurationReachesNativeSession();
     TestStatementRegistry();
+    TestPreparedQueryCacheOwnershipAndBounds();
+    TestPreparedQueryReexecuteWireAndState();
     TestTtcStatementChannel();
     TestTtcCursorClosePiggyback();
     TestTtcTransactionCodec();

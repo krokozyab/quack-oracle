@@ -69,4 +69,9 @@ struct TtcExecuteBindsRequest {
 
 std::vector<uint8_t> EncodeTtcExecuteBindsRequest(const TtcExecuteBindsRequest &request);
 
+// REEXECUTE_AND_FETCH (78) uses an existing parsed scalar query. Bind metadata
+// must match its initial execute; only the current IN values travel again.
+std::vector<uint8_t> EncodeTtcReexecuteQuery(uint8_t sequence, uint32_t cursor_id, uint32_t rows,
+                                           const std::vector<OracleBind> &binds = {});
+
 } // namespace oracle_scanner

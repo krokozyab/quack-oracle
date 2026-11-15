@@ -110,6 +110,19 @@ endpoint is recorded in this repository.
 
 ## Synthetic fixtures
 
+Prepared scalar query reexecution uses `REEXECUTE_AND_FETCH` (function 78):
+cursor ID, prefetch row count, execute option 0x20, zero second option, then
+current scalar IN values. This layout was read from python-oracledb Thin at
+commit `db085e51783ea1fc6884b451a99c693fe0761703`,
+`messages/execute.pyx::_write_reexecute_message` and `constants.pxi`, and
+cross-checked against the sibling protocol reference's reexecute parser.
+Only protocol invariants were used. The byte expectations in
+`TestPreparedQueryReexecuteWireAndState` are synthetic, not recorded packets.
+The native path was exercised against Oracle 19c and Free, including changed
+binds, repeated/empty results, eviction, and external table/type/precision DDL.
+External revalidation can return a new describe; it must replace the saved
+shape before row decoding. No failed statement is replayed.
+
 The multi-address and redirect tests in `test/cpp/protocol_test.cpp` build
 their REDIRECT, REFUSE, ACCEPT and DATA packets in the test from the field
 layouts named above. They are not captures, carry no bytes from any server or

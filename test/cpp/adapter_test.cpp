@@ -169,6 +169,7 @@ struct FakeScript {
 
     std::vector<std::string> queries;
     std::vector<std::vector<OracleBind>> query_binds;
+    std::vector<bool> statement_cache_settings;
     std::vector<std::string> plain_executes;
     std::vector<std::string> admin_executes;
     std::function<void(const std::string &)> admin_action;
@@ -442,6 +443,11 @@ public:
         std::lock_guard<std::mutex> guard(script->record_lock);
         script->sessions_opened++;
         script->session_users.push_back(user);
+    }
+
+    void SetStatementCacheEnabled(bool enabled) override {
+        std::lock_guard<std::mutex> guard(script->record_lock);
+        script->statement_cache_settings.push_back(enabled);
     }
 
     ~FakeSession() override {
@@ -2180,6 +2186,36 @@ void TestAttachedScanRefusesChangedWireTypes() {
     std::cout << "an attached scan refuses a changed wire type before decoding values" << std::endl;
 }
 
+void TestStatementCacheSettingKeepsSessionPoolBounded() {
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {Column("label", 1)};
+    script->rows = {{Text("only")}};
+    auto &settings = script->statement_cache_settings;
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("SET oracle_session_pool_size=1");
+    const auto query = "SELECT * FROM oracle_query('ora', 'SELECT label FROM app.items')";
+    CHECK(!database.Query(query)->HasError());
+    CHECK(!database.Query(query)->HasError());
+    CHECK(!settings.empty() && settings.back());
+    CHECK(script->sessions_opened == 1);
+    database.Run("SET oracle_statement_cache=false");
+    CHECK(!database.Query(query)->HasError());
+    CHECK(!database.Query(query)->HasError());
+    CHECK(!settings.empty() && !settings.back());
+    CHECK(script->sessions_opened == 1);
+    database.Run("SET oracle_statement_cache=true");
+    CHECK(!database.Query(query)->HasError());
+    CHECK(!settings.empty() && settings.back());
+    CHECK(script->sessions_opened == 1);
+    database.Run("SET oracle_session_pool_size=0");
+    database.Run("SET oracle_statement_cache=false");
+    CHECK(!database.Query(query)->HasError());
+    CHECK(!settings.empty() && !settings.back());
+    CHECK(script->sessions_opened == 2);
+    std::cout << "statement-cache settings preserve the authenticated session pool limit" << std::endl;
+}
+
 void TestReadSessionsArePooledPerConnection() {
     auto script = std::make_shared<FakeScript>();
     script->columns = {Column("label", 1)};
@@ -2273,6 +2309,10 @@ void TestAttachedCatalogAgainstAFakeSession() {
     CHECK(scanned->GetTypes()[0] == duckdb::LogicalType::BIGINT && scanned->GetTypes()[1] == duckdb::LogicalType::VARCHAR);
     CHECK(scanned->GetValue(0, 0).ToString() == "1" && scanned->GetValue(1, 1).ToString() == "second");
     CHECK(!script->initial_fetch_rows.empty() && script->initial_fetch_rows.back() == 32);
+    database.Run("SET oracle_statement_cache=false");
+    CHECK(!database.Query("SELECT LABEL FROM ora.main.ITEMS")->HasError());
+    CHECK(!script->statement_cache_settings.empty() && !script->statement_cache_settings.back());
+    database.Run("SET oracle_statement_cache=true");
 
 
     auto wide = std::find_if(script->routes.begin(), script->routes.end(), [](const auto &route) {
@@ -6889,6 +6929,7 @@ int main() {
     TestUnknownSecretIsRejected();
     TestScanReleasesItsSession();
     TestReadSessionsArePooledPerConnection();
+    TestStatementCacheSettingKeepsSessionPoolBounded();
     TestAttachedCatalogAgainstAFakeSession();
     TestAttachedScanRefusesChangedWireTypes();
     TestAttachedDdlRefreshesAndCompensates();
