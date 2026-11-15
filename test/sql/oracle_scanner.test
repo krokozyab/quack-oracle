@@ -506,3 +506,27 @@ SELECT CASE WHEN current_setting('oracle_statement_cache') THEN 1 ELSE 0 END
 
 statement ok
 RESET oracle_statement_cache
+
+statement error
+SET oracle_fetch_rows=0
+----
+oracle_fetch_rows must be between 1 and 65536
+
+statement error
+SET oracle_fetch_rows=65537
+----
+oracle_fetch_rows must be between 1 and 65536
+
+statement error
+SET oracle_fetch_rows=NULL
+----
+oracle_fetch_rows must be between 1 and 65536
+
+statement ok
+SET oracle_fetch_rows=1
+
+statement ok
+SET oracle_fetch_rows=65536
+
+statement ok
+RESET oracle_fetch_rows

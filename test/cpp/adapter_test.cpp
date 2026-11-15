@@ -3764,8 +3764,7 @@ void TestLargeScalarFetchKeepsRowsAndLocalFilters() {
         CHECK(!tail->HasError() && tail->GetValue(0,0).GetValue<int64_t>() == tail_count);
         CHECK(!database.Query("SELECT * FROM o.LINKS LIMIT 3;")->HasError());
         for (auto value : {0, 65537}) {
-            database.Run("SET oracle_fetch_rows=" + std::to_string(value));
-            CHECK(database.Query("SELECT * FROM o.LINKS;")->HasError());
+            CHECK(database.Query("SET oracle_fetch_rows=" + std::to_string(value))->HasError());
         }
         CHECK(!database.Query("SELECT 42;")->HasError());
         CHECK((script->direct_fetches != 0) == (mode == 2));

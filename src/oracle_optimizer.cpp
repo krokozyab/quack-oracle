@@ -1317,6 +1317,12 @@ static void SetOracleTopNMode(ClientContext &, SetScope, Value &value) {
     value = Value(mode == OracleTopNMode::AUTOMATIC ? "auto" : mode == OracleTopNMode::PARALLEL ? "true" : "false");
 }
 
+static void SetOracleFetchRows(ClientContext &, SetScope, Value &value) {
+    if (value.IsNull() || value.GetValue<int64_t>() < 1 || value.GetValue<int64_t>() > 65536) {
+        throw InvalidInputException("oracle_fetch_rows must be between 1 and 65536");
+    }
+}
+
 void RegisterOracleOptimizer(DatabaseInstance &db) {
     DBConfig::GetConfig(db).AddExtensionOption(
         "oracle_scan_plan_cache", "Cache checked ROWID boundaries and wire descriptions, never snapshots or rows.",
@@ -1332,7 +1338,7 @@ void RegisterOracleOptimizer(DatabaseInstance &db) {
                                                LogicalType::BOOLEAN, Value::BOOLEAN(true));
     DBConfig::GetConfig(db).AddExtensionOption(
         "oracle_fetch_rows", "Maximum scalar attached-scan fetch rows (1..65536); output vectors remain 2048 rows.",
-        LogicalType::BIGINT, Value::BIGINT(16384));
+        LogicalType::BIGINT, Value::BIGINT(16384), SetOracleFetchRows);
     OptimizerExtension extension;
 	extension.optimize_function = OptimizeOraclePlan;
     extension.pre_optimize_function = PreOptimizeOraclePlan;
