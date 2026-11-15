@@ -47,7 +47,7 @@ public:
                                                uint32_t maximum_rows = 32);
     std::vector<uint8_t> ReceiveExecuteResponse(OracleStatementHandle handle);
     TtcExecuteResponse ReceiveDecodedExecuteResponse(OracleStatementHandle handle, uint8_t ttc_field_version = 12,
-                                                     uint8_t server_field_version = 12);
+                                                     uint8_t server_field_version = 12, size_t maximum_rows = 0);
     TtcErrorInfo ReceiveDmlResponse(OracleStatementHandle handle, uint8_t server_field_version = 12);
     TtcPlsqlOutBindsResponse ReceivePlsqlOutBindsResponse(OracleStatementHandle handle,
                                                            const std::vector<OracleBind> &binds,

@@ -189,7 +189,7 @@ TtcExecuteResponse TtcStatementChannel::ReceiveReexecuteResponse(OracleStatement
             // and no preceding row from its previous execution.
             if (offset < message.size() && message[offset] == 16) {
                 const std::vector<uint8_t> described(message.begin() + static_cast<std::ptrdiff_t>(offset), message.end());
-                decoded = DecodeTtcExecuteResponse(described, ttc_field_version, server_field_version);
+                decoded = DecodeTtcExecuteResponse(described, ttc_field_version, server_field_version, maximum_rows);
                 decoded->bytes_consumed += offset;
             } else {
                 TtcFetchResponseDecoder decoder(columns, server_field_version, std::nullopt, false, maximum_rows);
@@ -234,7 +234,7 @@ std::vector<uint8_t> TtcStatementChannel::ReceiveExecuteResponse(OracleStatement
 
 TtcExecuteResponse TtcStatementChannel::ReceiveDecodedExecuteResponse(OracleStatementHandle handle,
                                                                         uint8_t ttc_field_version,
-                                                                        uint8_t server_field_version) {
+                                                                        uint8_t server_field_version, size_t maximum_rows) {
     try {
         std::optional<TtcExecuteResponse> decoded;
         (void)ReceiveResponseFragments(channel, [&](const std::vector<uint8_t> &message) {
@@ -247,7 +247,7 @@ TtcExecuteResponse TtcStatementChannel::ReceiveDecodedExecuteResponse(OracleStat
                                         completion.error_number);
                 }
             }
-            decoded = DecodeTtcExecuteResponse(message, ttc_field_version, server_field_version);
+            decoded = DecodeTtcExecuteResponse(message, ttc_field_version, server_field_version, maximum_rows);
             return decoded->completed;
         });
         return std::move(*decoded);

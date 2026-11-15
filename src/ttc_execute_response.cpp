@@ -11,7 +11,7 @@
 namespace oracle_scanner {
 
 TtcExecuteResponse DecodeTtcExecuteResponse(const std::vector<uint8_t> &message, uint8_t ttc_field_version,
-                                            uint8_t server_field_version) {
+                                            uint8_t server_field_version, size_t maximum_rows) {
     TtcDescribeInfo describe;
     try {
         describe = DecodeTtcDescribeInfoPrefix(message, ttc_field_version);
@@ -24,7 +24,9 @@ TtcExecuteResponse DecodeTtcExecuteResponse(const std::vector<uint8_t> &message,
     std::vector<uint8_t> remainder(message.begin() + static_cast<std::ptrdiff_t>(describe.bytes_consumed), message.end());
     TtcFetchResponse fetch;
     try {
-        fetch = DecodeTtcFetchResponse(remainder, describe.columns, server_field_version);
+        TtcFetchResponseDecoder decoder(describe.columns, server_field_version, std::nullopt, false, maximum_rows);
+        decoder.Decode(remainder);
+        fetch = decoder.Take();
     } catch (const ProtocolError &error) {
         throw ProtocolError(error.Kind(), std::string("TTC execute response after DESCRIBE_INFO: ") + error.what());
     }

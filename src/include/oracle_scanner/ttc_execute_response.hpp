@@ -24,7 +24,7 @@ struct TtcExecuteResponse {
 // messages and its TTIOER completion. The completion cursor_id is the server
 // cursor to use for OFETCH.
 TtcExecuteResponse DecodeTtcExecuteResponse(const std::vector<uint8_t> &message, uint8_t ttc_field_version = 12,
-                                            uint8_t server_field_version = 12);
+                                            uint8_t server_field_version = 12, size_t maximum_rows = 0);
 
 // Non-query OALL8 calls finish directly with TTIOER. Its wire-level message
 // type is ERROR even when its extended error number is zero, so callers must

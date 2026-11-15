@@ -749,6 +749,15 @@ static void TestStatementChannelJoinsFragmentedExecuteResponse() {
     response.WriteUB4(0).WriteByte(0).WriteByte(0).WriteUB2(0).WriteUB4(0).WriteByte(0);
     response.WriteUB2(0).WriteUB4(0).WriteUB2(0).WriteUB4(0).WriteUB8(1);
 
+    // The next row is deliberately incomplete: enforce the row count before
+    // touching its cell lengths, both for a fresh execute and revalidation.
+    auto oversized = std::vector<uint8_t>(response.Data().begin(),
+        response.Data().begin() + static_cast<std::ptrdiff_t>(completion_offset));
+    oversized.push_back(TTC_MESSAGE_ROW_DATA);
+    oversized.push_back(0xfe);
+    ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [&] {
+        DecodeTtcExecuteResponse(oversized, 12, 12, 1);
+    });
     const auto split = describe.Data().size();
     const auto first = std::vector<uint8_t>(response.Data().begin(),
                                             response.Data().begin() + static_cast<std::ptrdiff_t>(split));
