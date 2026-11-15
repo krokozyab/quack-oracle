@@ -2229,7 +2229,7 @@ void TestAttachedScanRefusesChangedNumericShape() {
 
 void TestAttachedScanRefusesChangedTemporalAndCharacterShape() {
     struct Shape { const char *type; uint16_t wire; int16_t precision; int16_t scale; };
-    for (const auto &shape : {Shape {"NUMBER", 2, 10, 0}, Shape {"TIMESTAMP(6)", 180, 0, 6},
+    for (const auto &shape : {Shape {"NUMBER", 2, 10, 0}, Shape {"NUMBER", 2, 0, 0}, Shape {"TIMESTAMP(6)", 180, 0, 6},
                               Shape {"INTERVAL DAY(2) TO SECOND(6)", 183, 2, 6},
                               Shape {"VARCHAR2", 1, 0, 0}}) {
         auto script = std::make_shared<FakeScript>();
@@ -2248,7 +2248,9 @@ void TestAttachedScanRefusesChangedTemporalAndCharacterShape() {
         database.Run("ATTACH 'ora' AS o(TYPE oracle_scanner); SET oracle_parallel_scan=1");
         CHECK(!database.Query("SELECT V FROM o.META_CHANGE")->HasError());
         auto &changed = script->tables["META_CHANGE"].columns[0];
-        if (shape.wire == 2) {
+        if (shape.wire == 2 && shape.precision == 0) {
+            changed.scale = 2;
+        } else if (shape.wire == 2) {
             changed.precision = 12;
         } else if (shape.wire == 1) {
             changed.character_set_form = 2;

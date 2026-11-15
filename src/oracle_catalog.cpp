@@ -2706,9 +2706,12 @@ std::vector<OracleColumn> ProjectedDescribe(const OracleQueryBindData &bind, con
                            column.character_set_form == 0
                        ? uint8_t(1) : column.character_set_form;
         };
+        const auto number_scale = [](const OracleColumn &column) {
+            // Unconstrained NUMBER is described with either 0 or -127 scale.
+            return column.precision == 0 && column.scale == -127 ? 0 : column.scale;
+        };
         const bool number_changed = dictionary.oracle_type == 2 &&
-            (actual.precision != dictionary.precision ||
-             (dictionary.precision > 0 && actual.scale != dictionary.scale));
+            (actual.precision != dictionary.precision || number_scale(actual) != number_scale(dictionary));
         const bool temporal_changed = (dictionary.oracle_type == 180 || dictionary.oracle_type == 181 ||
                                        dictionary.oracle_type == 231 || dictionary.oracle_type == 182 ||
                                        dictionary.oracle_type == 183) && actual.scale != dictionary.scale;
