@@ -40,8 +40,10 @@
   Value-conversion failures poison the active read handle and retain their
   original exception, without being mistaken for incomplete network framing.
 - Auto parallelism estimates the selected columns and filtered row count,
-  targeting approximately 16 MiB per reader, up to eight readers. Small narrow
-  copies therefore avoid paying for unnecessary range planning and sessions.
+  targeting approximately 16 MiB or 250,000 returned rows per reader, up to
+  eight readers and DuckDB's thread count. The row budget accounts for framing
+  and decoding work even when the selected columns are narrow. Existing small
+  table and selective-filter guards still apply.
 
 - Native result rows now use a response-owned byte arena with offset/NULL
   descriptors, including execute prefetch, ROWID and LOB paths. Row continuations

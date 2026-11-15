@@ -3343,8 +3343,12 @@ void TestSelectiveFiltersReadThroughOneSession() {
     CHECK(!read_in_ranges("ID BETWEEN 1000 AND 50000"));    // about 1%
     CHECK(!read_in_ranges("KIND = 1 AND ID < 20000"));      // the most selective column decides
     CHECK(read_in_ranges("ID > 1000"));                     // nearly all of them
-    CHECK(!read_in_ranges("KIND = 1"));                     // half: too little projected data
-    CHECK(!read_in_ranges("ID > 1000", "ID"));              // same rows, narrow projection stays serial
+    CHECK(read_in_ranges("KIND = 1"));                      // a million narrow rows still need decoding
+    CHECK(read_in_ranges("ID > 1000", "ID"));               // row work also sizes a narrow projection
+    CHECK(!read_in_ranges("ID < 200000", "ID"));            // below both the byte and row budgets
+    database.Run("SET threads = 1;");
+    CHECK(!read_in_ranges("ID > 1000", "ID"));              // row work respects DuckDB's thread cap
+    database.Run("SET threads = 4;");
     // A positive maximum still avoids selective reads.
     database.Run("SET oracle_parallel_scan = 4;");
     CHECK(!read_in_ranges("ID = 7"));

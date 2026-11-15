@@ -3096,9 +3096,15 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
             constexpr uint64_t bytes_per_reader = 16U << 20U;
             const auto rows = EstimatedRowsAfterFilters(bind, filter_estimates);
             const auto width = MaxValue<uint64_t>(row_bytes, 1);
-            const auto readers = rows > (bytes_per_reader * 8) / width
+            const auto volume_readers = rows > (bytes_per_reader * 8) / width
                                      ? 8
                                      : MaxValue<uint64_t>(1, (rows * width + bytes_per_reader - 1) / bytes_per_reader);
+            // Narrow projections still pay for row framing and scalar decoding.
+            // Use the filtered count, and divide before rounding to avoid an
+            // overflow even when dictionary statistics approach UINT64_MAX.
+            constexpr uint64_t rows_per_reader = 250000;
+            const auto row_readers = MinValue<uint64_t>(8, rows / rows_per_reader + (rows % rows_per_reader != 0));
+            const auto readers = MaxValue(volume_readers, row_readers);
             sessions =
                 MinValue<idx_t>(readers, static_cast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads()));
         }
