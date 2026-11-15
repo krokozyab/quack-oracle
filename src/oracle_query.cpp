@@ -2837,6 +2837,10 @@ unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context,
             std::chrono::steady_clock::now() - query_started).count());
         opened.sql = sql;
         opened.io = session->IoStats() - before;
+    } catch (const IOException &) {
+        // Schema refusals already contain the table, column and refresh advice.
+        session.Poison();
+        throw;
     } catch (const std::exception &error) {
         session.Poison();
         throw IOException("Oracle could not aggregate table '%s': %s", bind.object_name, error.what());

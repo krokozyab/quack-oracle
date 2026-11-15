@@ -2235,12 +2235,14 @@ void TestAttachedScanRefusesChangedNumericShape() {
     const auto query = "SELECT V FROM o.SHAPE_CHANGE";
     CHECK(database.Query(query)->GetValue(0, 0).ToString() == "7");
     script->tables["SHAPE_CHANGE"] = {{Column("V", 2, 12, 2)}, {{Number("1.25")}, {Number("-99.99")}}};
+    database.Run("SET oracle_aggregate_pushdown=true");
     for (const auto *direct : {"true", "false"}) {
         database.Run(std::string("SET oracle_direct_scan=") + direct);
         for (const auto *expression : {"V", "sum(V)", "avg(V)", "min(V)", "max(V)"}) {
             auto changed = database.Query(std::string("SELECT ") + expression + " FROM o.SHAPE_CHANGE");
             CHECK(changed->HasError());
             CHECK(changed->GetError().find("DETACH and ATTACH") != std::string::npos);
+            CHECK(changed->GetError().find("could not aggregate") == std::string::npos);
         }
     }
     // A failed schema check leaves the connection usable and owns no cursor.
@@ -3981,6 +3983,7 @@ void TestNestedOracleJoinsAndAggregates() {
         script->queries.clear();
         auto stale = database.Query(average);
         CHECK(stale->HasError() && stale->GetError().find("DETACH and ATTACH") != std::string::npos);
+        CHECK(stale->GetError().find("could not aggregate") == std::string::npos);
         CHECK(script->queries.size() == 1);
         CHECK(script->queries.front().find("oracle_scanner_schema_check") != std::string::npos);
     }
