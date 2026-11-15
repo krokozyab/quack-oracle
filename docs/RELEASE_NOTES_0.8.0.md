@@ -1,7 +1,10 @@
-# oracle_scanner 0.8.0 (draft)
+# oracle_scanner 0.8.0
 
-Built for DuckDB v2.0.0. This is an unpublished draft; the extension version
-remains 0.7.0 until a release is approved.
+Built for DuckDB v2.0.0. Install with `INSTALL oracle_scanner FROM community;`
+once the release is published. Faster scans and copies, more of the query
+sent to Oracle (AVG, joins of three or more tables), reuse of parsed cursors
+and range plans, and safer handling of tables changed outside DuckDB. Verified
+against Oracle 19c and Free 23ai and covered by tests.
 
 ## More of the query runs in Oracle
 
