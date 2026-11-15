@@ -2968,6 +2968,236 @@ static size_t OracleScanFetchRows(ClientContext &context, const OracleQueryBindD
     return MinValue<size_t>(requested, MaxValue<size_t>(1, (8U << 20U) / MaxValue<size_t>(width, 1)));
 }
 
+namespace {
+
+uint64_t TopNClock() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+void TopNMaximum(std::atomic<uint64_t> &target, uint64_t value) {
+    auto current = target.load();
+    while (current < value && !target.compare_exchange_weak(current, value)) {
+    }
+}
+
+struct OracleTopNCost {
+    double serial_ns = 0;
+    double serial_row_ns = 200;
+    double latency_ns = 0;
+    double planning_ns = 0;
+    double parallel_work_ns = 0;
+    uint64_t identity = 0;
+    uint64_t age = 0;
+    size_t serial_samples = 0;
+    size_t queries_since_probe = 0;
+    size_t cold_trials = 0;
+    bool calibrated = false;
+    bool unavailable = false;
+};
+
+// Cost observations only. Fixed-size keys never retain SQL, filters or values;
+// collisions can affect a cost choice, never the query's rows or snapshot.
+struct OracleTopNHistory final : ClientContextState {
+    std::mutex lock;
+    std::map<uint64_t, OracleTopNCost> entries;
+    uint64_t age = 0;
+
+    OracleTopNCost &Entry(uint64_t key) {
+        const auto found = entries.find(key);
+        if (found != entries.end()) {
+            found->second.age = ++age;
+            return found->second;
+        }
+        if (entries.size() >= 64) {
+            auto oldest = entries.begin();
+            for (auto it = entries.begin(); it != entries.end(); ++it) {
+                if (it->second.age < oldest->second.age) {
+                    oldest = it;
+                }
+            }
+            entries.erase(oldest);
+        }
+        auto &entry = entries[key];
+        entry.age = ++age;
+        return entry;
+    }
+};
+
+struct OracleTopNDecision {
+    bool track = false;
+    bool plan = true;
+    uint64_t key = 0;
+    std::string reason;
+};
+
+uint64_t TopNCostKey(const OracleQueryBindData &bind, const std::vector<column_t> &selected, idx_t readers) {
+    std::string signature;
+    const auto add = [&](const std::string &field) { signature += std::to_string(field.size()) + ":" + field; };
+    const auto epoch = OracleAttachedPlanEpoch(bind);
+    add(oracle_scanner::ConnectionTargetKey(bind.config));
+    add(bind.config.user);
+    add(bind.secret_name);
+    add(bind.schema_name);
+    add(bind.object_name);
+    add(std::to_string(epoch.first));
+    add(std::to_string(epoch.second));
+    add(std::to_string(readers));
+    add(bind.where_clause);
+    add(bind.order_clause);
+    for (const auto column : selected) {
+        add(std::to_string(column));
+    }
+    return std::hash<std::string>()(signature);
+}
+
+// Parallel scans of one heap share server resources. Diminishing returns and
+// candidate conversion keep the initial estimate conservative; completed reads
+// replace it with measured work. Require a 20% margin before paying setup.
+double PredictedTopNWork(const OracleTopNCost &cost, idx_t readers, idx_t bound) {
+    if (cost.parallel_work_ns > 0) {
+        return cost.parallel_work_ns;
+    }
+    const auto server = MaxValue(0.0, cost.serial_ns - cost.latency_ns);
+    const auto contention = 1.0 + double(readers - 1) / 3.0;
+    return server * contention / double(readers) + cost.latency_ns +
+           double(readers) * double(bound) * cost.serial_row_ns;
+}
+
+OracleTopNDecision ChooseOracleTopN(ClientContext &context, const OracleQueryBindData &bind,
+                                   const std::vector<column_t> &selected, uint64_t rows, idx_t &readers) {
+    OracleTopNDecision decision;
+    if (bind.top_n.empty() || bind.order_clause.empty()) {
+        return decision;
+    }
+    const auto mode = OracleTopNExecutionMode(context);
+    if (mode != OracleTopNMode::AUTOMATIC) {
+        decision.plan = mode == OracleTopNMode::PARALLEL;
+        decision.reason = decision.plan ? "forced parallel (subject to eligibility)" : "forced serial";
+        return decision;
+    }
+    if (TryTransactionSession(context, bind.catalog_name)) {
+        decision.plan = false;
+        decision.reason = "auto serial: write transaction";
+        return decision;
+    }
+    Value pool;
+    const auto capacity = context.TryGetCurrentSetting("oracle_session_pool_size", pool) && !pool.IsNull()
+                            ? MaxValue<int64_t>(0, pool.GetValue<int64_t>()) : 0;
+    const auto input_rows = bind.estimated_rows.value_or(0);
+    const auto volume = input_rows / 250000 + (input_rows % 250000 != 0);
+    Value scan_setting;
+    if (rows >= AUTOMATIC_PARALLEL_FILTERED_ROWS &&
+        context.TryGetCurrentSetting("oracle_parallel_scan", scan_setting) && !scan_setting.IsNull() &&
+        scan_setting.GetValue<int64_t>() < 0) {
+        // A Top-N can spend its time scanning/sorting a large table while
+        // returning few rows. The measured serial cost decides whether that
+        // work, rather than only the matching transfer volume, merits readers.
+        readers = MinValue<uint64_t>(8, volume);
+    }
+    readers = MinValue<idx_t>(readers, MinValue<uint64_t>(8, volume));
+    readers = MinValue<idx_t>(readers, static_cast<idx_t>(capacity));
+    readers = MinValue<idx_t>(readers, TaskScheduler::GetScheduler(context).NumberOfThreads());
+    decision.plan = false;
+    decision.reason = "auto serial: scan or candidate volume";
+    if (readers < 2 || input_rows < AUTOMATIC_PARALLEL_MINIMUM_ROWS ||
+        bind.top_n_rows >= rows / (64 * readers)) {
+        return decision;
+    }
+    decision.track = true;
+    decision.key = TopNCostKey(bind, selected, readers);
+    auto history = context.registered_state->GetOrCreate<OracleTopNHistory>("oracle_scanner.top_n_cost");
+    std::lock_guard<std::mutex> guard(history->lock);
+    auto &cost = history->Entry(decision.key);
+    cost.queries_since_probe = MinValue<size_t>(16, cost.queries_since_probe + 1);
+    decision.reason = "auto serial: collecting baseline";
+    if (cost.serial_samples < 2) {
+        return decision;
+    }
+    decision.reason = "auto serial: short indexed or cached read";
+    if (cost.serial_ns < 1000000) {
+        return decision;
+    }
+    if (!cost.calibrated || cost.queries_since_probe >= 16) {
+        decision.plan = true;
+        decision.reason = "auto: calibrating planning cost";
+        return decision;
+    }
+    decision.reason = cost.unavailable ? "auto serial: ranges unavailable" : "auto serial: setup/latency cost";
+    if (!cost.unavailable && cost.planning_ns + PredictedTopNWork(cost, readers, bind.top_n_rows) < cost.serial_ns * 0.8) {
+        decision.plan = true;
+        decision.reason = "auto: checking parallel cost";
+    }
+    return decision;
+}
+
+void RefineOracleTopN(ClientContext &context, const OracleQueryBindData &bind, idx_t readers,
+                      const OracleParallelPlan &plan, OracleTopNDecision &decision) {
+    if (!decision.track || !decision.plan) {
+        return;
+    }
+    auto history = context.registered_state->GetOrCreate<OracleTopNHistory>("oracle_scanner.top_n_cost");
+    std::lock_guard<std::mutex> guard(history->lock);
+    auto &cost = history->Entry(decision.key);
+    cost.queries_since_probe = 0;
+    cost.calibrated = true;
+    cost.unavailable = plan.statements.empty();
+    if (cost.unavailable) {
+        decision.plan = false;
+        decision.reason = "auto serial: ranges unavailable";
+        return;
+    }
+    if (cost.identity && cost.identity != plan.identity_hash) {
+        const auto age = cost.age;
+        cost = OracleTopNCost();
+        cost.age = age;
+        cost.identity = plan.identity_hash;
+        decision.plan = false;
+        decision.reason = "auto serial: table identity changed";
+        return;
+    }
+    cost.identity = plan.identity_hash;
+    cost.latency_ns = double(plan.probe_nanoseconds) / double(MaxValue<uint64_t>(1, plan.probe_round_trips));
+    // A miss primes the bounded plan cache. Future warm planning has two
+    // exchanges; without that cache use the measured cost of every plan.
+    cost.planning_ns = !plan.cache_enabled || plan.cache_hit ? double(plan.planning_nanoseconds)
+                                                           : 2.0 * cost.latency_ns;
+    const auto work = PredictedTopNWork(cost, readers, bind.top_n_rows);
+    const auto actual = double(plan.planning_nanoseconds) + work;
+    decision.plan = actual < cost.serial_ns * 0.8;
+    decision.reason = decision.plan ? "auto parallel: predicted benefit" : "auto serial: setup/latency cost";
+}
+
+void RecordOracleTopN(ClientContext &context, OracleQueryGlobalState &state) {
+    auto *feedback = state.top_n_feedback.get();
+    if (!feedback || feedback->recorded.exchange(true)) {
+        return;
+    }
+    auto history = context.registered_state->GetOrCreate<OracleTopNHistory>("oracle_scanner.top_n_cost");
+    std::lock_guard<std::mutex> guard(history->lock);
+    auto &cost = history->Entry(feedback->key);
+    if (!state.parallel) {
+        const auto sample = double(state.metrics.query_nanoseconds.load() + state.metrics.fetch_nanoseconds.load());
+        cost.serial_ns = cost.serial_samples == 0 ? sample : cost.serial_samples == 1 ? MinValue(cost.serial_ns, sample)
+                                                                                   : cost.serial_ns * 0.75 + sample * 0.25;
+        cost.serial_samples = MinValue<size_t>(64, cost.serial_samples + 1);
+        const auto rows = MaxValue<uint64_t>(1, state.metrics.rows_fetched.load());
+        cost.serial_row_ns = MinValue(5000.0, MaxValue(200.0,
+            double(state.metrics.fetch_nanoseconds.load() + state.metrics.convert_nanoseconds.load()) / double(rows)));
+    } else {
+        const auto acquisition = feedback->maximum_acquire_nanoseconds.load();
+        if (double(acquisition) > MaxValue(1000000.0, 2.0 * cost.latency_ns) && ++cost.cold_trials < 3) {
+            return; // one-time authentication is not a steady-state range cost
+        }
+        const auto elapsed = TopNClock() - feedback->started_nanoseconds;
+        const auto sample = double(elapsed > state.planning_nanoseconds ? elapsed - state.planning_nanoseconds : elapsed);
+        cost.parallel_work_ns = MaxValue(sample, double(feedback->maximum_range_nanoseconds.load()));
+        cost.cold_trials = 0;
+    }
+}
+
+} // namespace
+
 unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, TableFunctionInitInput &input) {
     auto &bind = input.bind_data->CastNoConst<OracleQueryBindData>();
     if (bind.statement_scan) {
@@ -3151,7 +3381,13 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
                 MinValue<idx_t>(readers, static_cast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads()));
         }
     }
-    auto plan = PlanParallelAttachedScan(context, bind, selected, sessions);
+    const auto top_n_started = TopNClock();
+    auto decision = ChooseOracleTopN(context, bind, selected, EstimatedRowsAfterFilters(bind, filter_estimates), sessions);
+    auto plan = decision.plan ? PlanParallelAttachedScan(context, bind, selected, sessions) : OracleParallelPlan();
+    RefineOracleTopN(context, bind, sessions, plan, decision);
+    if (!decision.plan) {
+        plan.statements.clear();
+    }
     auto &chunks = plan.statements;
     if (!chunks.empty()) {
         columns = std::move(plan.columns);
@@ -3174,6 +3410,12 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
         state->planning_nanoseconds = plan.planning_nanoseconds;
         state->planning_io = plan.planning_io;
         state->plan_cache_hit = plan.cache_hit;
+        state->top_n_execution = decision.reason;
+        if (decision.track) {
+            state->top_n_feedback = make_uniq<OracleTopNFeedback>();
+            state->top_n_feedback->key = decision.key;
+            state->top_n_feedback->started_nanoseconds = top_n_started;
+        }
         state->secret_name = bind.secret_name;
         state->config = bind.config;
         state->password = bind.password;
@@ -3267,6 +3509,15 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
     state->metrics.query_nanoseconds += opened.query_nanoseconds;
     state->metrics.sessions = 1;
     state->last_io = io_after_open;
+    state->top_n_execution = decision.reason;
+    state->planning_nanoseconds = plan.planning_nanoseconds;
+    state->planning_io = plan.planning_io;
+    state->plan_cache_hit = plan.cache_hit;
+    if (decision.track) {
+        state->top_n_feedback = make_uniq<OracleTopNFeedback>();
+        state->top_n_feedback->key = decision.key;
+        state->top_n_feedback->started_nanoseconds = top_n_started;
+    }
     return std::move(state);
 }
 
@@ -3313,6 +3564,11 @@ void OracleQueryMetrics(TableFunctionGetMetricsInput &input) {
 	if (state->parallel) {
 		metrics.AddExtraInfo("Oracle ROWID ranges", std::to_string(counters.chunks_read.load()) + " read of " +
 		                                                std::to_string(state->chunk_sql.size()));
+    }
+    if (!state->top_n_execution.empty()) {
+        metrics.AddExtraInfo("Oracle Top-N execution", state->top_n_execution);
+    }
+    if (state->parallel || state->planning_nanoseconds != 0) {
         metrics.AddExtraInfo("Oracle plan cache", state->plan_cache_hit ? "hit" : "miss or disabled");
         metrics.AddExtraInfo("Oracle planning time", seconds(state->planning_nanoseconds));
         metrics.AddExtraInfo("Oracle planning network",
@@ -3490,8 +3746,12 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
             local->batch_index = chunk;
             try {
                 if (!local->session) {
+                    const auto acquiring = state.top_n_feedback ? TopNClock() : 0;
                     local->session = AcquireOracleReadSession(context, state.secret_name, std::string(), state.config,
                                                               state.password);
+                    if (state.top_n_feedback) {
+                        TopNMaximum(state.top_n_feedback->maximum_acquire_nanoseconds, TopNClock() - acquiring);
+                    }
                     state.metrics.sessions++;
                     local->last_io = local->session->IoStats();
                 }
@@ -3512,7 +3772,9 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
                         throw IOException("Oracle partial COUNT describe changed");
                     }
                 }
-                state.metrics.query_nanoseconds += elapsed(opened_at);
+                const auto opening_ns = elapsed(opened_at);
+                local->range_nanoseconds = opening_ns;
+                state.metrics.query_nanoseconds += opening_ns;
                 state.metrics.chunks_read++;
                 const auto io_now = local->session->IoStats();
                 state.metrics.Add(io_now - local->last_io);
@@ -3588,7 +3850,11 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
                     throw;
                 }
             });
-            state.metrics.fetch_nanoseconds += elapsed(fetch_started);
+            const auto fetching_ns = elapsed(fetch_started);
+            state.metrics.fetch_nanoseconds += fetching_ns;
+            if (local && state.top_n_feedback) {
+                local->range_nanoseconds += fetching_ns;
+            }
             state.metrics.rows_fetched += typed_chunks.empty() ? batch.RowCount() : typed_rows;
             position = 0;
         }
@@ -3666,10 +3932,17 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
                 }
             }
         }
-        state.metrics.convert_nanoseconds += elapsed(convert_started);
+        const auto converting_ns = elapsed(convert_started);
+        state.metrics.convert_nanoseconds += converting_ns;
+        if (local && state.top_n_feedback) {
+            local->range_nanoseconds += converting_ns;
+        }
         if (local && exhausted) {
             local->cursor->Close();
             local->cursor.reset();
+            if (state.top_n_feedback) {
+                TopNMaximum(state.top_n_feedback->maximum_range_nanoseconds, local->range_nanoseconds);
+            }
             state.metrics.chunks_completed++;
         }
         if (state.local_filter && row_count != 0) {
@@ -3694,6 +3967,10 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
                 output.Reset();
                 continue;
             }
+        }
+        if (state.top_n_feedback &&
+            (state.parallel ? state.metrics.chunks_completed.load() == state.chunk_sql.size() : exhausted)) {
+            RecordOracleTopN(context, state);
         }
         if (local && output.size() == 0) {
             // A chunk of the table ended with nothing left to hand over; the next

@@ -144,6 +144,10 @@ struct FakeScript {
     bool reject_fetch_after_exhaustion = false;
     std::string query_delay_fragment;
     std::chrono::milliseconds query_delay {0};
+    bool top_n_cost_model = false;
+    std::chrono::milliseconds top_n_network_delay {0};
+    std::chrono::milliseconds top_n_serial_work {0};
+    std::chrono::milliseconds top_n_range_work {0};
     bool packed_fetch = false;
     size_t packed_fetches = 0;
     bool direct_fetch = false;
@@ -446,6 +450,14 @@ public:
     }
 
     std::unique_ptr<OracleCursor> Query(const std::string &sql, const std::vector<OracleBind> &binds) override {
+        ++io_queries;
+        if (script->top_n_cost_model) {
+            std::this_thread::sleep_for(script->top_n_network_delay);
+            if (sql.find(" ORDER BY \"ID\"") != std::string::npos) {
+                std::this_thread::sleep_for(sql.find("WHERE ROWID") == std::string::npos
+                                              ? script->top_n_serial_work : script->top_n_range_work);
+            }
+        }
         if (!script->query_delay_fragment.empty() && sql.find(script->query_delay_fragment) != std::string::npos) {
             std::this_thread::sleep_for(script->query_delay);
         }
@@ -460,6 +472,10 @@ public:
                                                "injected dictionary read failure");
         }
         return std::make_unique<FakeCursor>(script, sql);
+    }
+
+    oracle_scanner::OracleIoStats IoStats() const override {
+        return {0, 0, script->top_n_cost_model ? io_queries.load() : 0};
     }
 
     std::unique_ptr<OracleCursor> QueryWithInitialFetch(const std::string &sql,
@@ -612,6 +628,7 @@ public:
     }
 
     // Outside the record lock: the wait must not stop anything else.
+    std::atomic<uint64_t> io_queries {0};
     void WaitIfBlocked(const std::string &sql) {
         std::shared_ptr<oracle_scanner::OracleIoDeadline> source;
         {
@@ -4298,6 +4315,143 @@ void TestParallelPlanCacheChecksIdentityAndEveryCursor() {
     std::cout << "range plan cache validates identity, fresh SCNs, DDL epochs, worker shapes and eviction" << std::endl;
 }
 
+void TestAutomaticTopNUsesWorkAndRoundTripCosts() {
+    for (const bool remote : {false, true}) {
+        auto script = std::make_shared<FakeScript>();
+        script->top_n_cost_model = true;
+        script->top_n_network_delay = std::chrono::milliseconds(remote ? 8 : 1);
+        script->top_n_serial_work = std::chrono::milliseconds(remote ? 20 : 30);
+        script->top_n_range_work = std::chrono::milliseconds(2);
+        script->routes = {
+            {"oracle_scanner_range_identity", RangeIdentity()},
+            {"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}},
+            {"num_rows IS NOT NULL", {{Column("TABLE_NAME", 1), Column("NUM_ROWS", 2)},
+                                       {{Text("AUTO_TOP"), Number("1000000")}}}},
+            {"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("AUTO_TOP")}}}},
+            {"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}},
+            {"FROM user_tab_columns",
+             {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+               Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+              {{Text("AUTO_TOP"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("Y")}}}},
+            {"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}}};
+        FakeResponse extents {{Column("LOW", 1), Column("BLOCKS", 2)}, {}};
+        for (int i = 0; i < 10; i++) {
+            extents.rows.push_back({Text("EXTENT" + std::to_string(i)), Number("1000")});
+        }
+        script->routes.insert(script->routes.begin() + 1, {"dba_extents", extents});
+        script->tables["AUTO_TOP"] = {{Column("ID", 2, 10, 0)}, {{Number("7")}}};
+        auto factory = InstallFake(script);
+        TestDatabase database;
+        database.Run("ATTACH 'ora' AS o(TYPE oracle_scanner); SET threads=4; SET oracle_parallel_scan=4;");
+        const std::string query = "SELECT ID FROM o.AUTO_TOP ORDER BY ID DESC LIMIT 1";
+        const auto calls = [&](const std::string &fragment) {
+            size_t count = 0;
+            for (const auto &sql : script->queries) {
+                count += sql.find(fragment) != std::string::npos;
+            }
+            return count;
+        };
+        for (int iteration = 0; iteration < 7; iteration++) {
+            script->queries.clear();
+            const auto result = database.Query(query);
+            CHECK(!result->HasError() && result->GetValue(0, 0).ToString() == "7");
+            if (iteration < 2) {
+                CHECK(calls("WHERE ROWID") == 0 && calls("oracle_scanner_range_identity") == 0);
+            }
+            if (iteration >= 2) {
+                CHECK(calls("WHERE ROWID") == size_t(remote ? 0 : 4));
+            }
+            if (iteration >= 3) {
+                CHECK(calls("oracle_scanner_range_identity") == size_t(remote ? 0 : 1));
+            }
+        }
+        if (!remote) {
+            script->top_n_serial_work = std::chrono::milliseconds(0);
+            for (int bound = 1; bound <= 65; bound++) {
+                CHECK(!database.Query("SELECT ID FROM o.AUTO_TOP ORDER BY ID DESC LIMIT " + std::to_string(bound))
+                           ->HasError());
+            }
+            script->top_n_serial_work = std::chrono::milliseconds(30);
+            // The original positive observation has been evicted, so the same
+            // query must collect its baseline again instead of keeping history
+            // for every distinct ranked statement indefinitely.
+            for (int i = 0; i < 2; i++) {
+                script->queries.clear();
+                CHECK(!database.Query(query)->HasError() && calls("WHERE ROWID") == 0);
+            }
+            script->queries.clear();
+            CHECK(!database.Query(query)->HasError() && calls("WHERE ROWID") == 4);
+            database.Run("ALTER TABLE o.AUTO_TOP ADD COLUMN X BIGINT;");
+            for (int i = 0; i < 2; i++) {
+                script->queries.clear();
+                CHECK(!database.Query(query)->HasError() && calls("WHERE ROWID") == 0);
+            }
+            script->queries.clear();
+            CHECK(!database.Query(query)->HasError() && calls("WHERE ROWID") == 4);
+            script->routes[0].second = RangeIdentity("424243", "200", "201");
+            for (int i = 0; i < 2; i++) {
+                script->queries.clear();
+                CHECK(!database.Query(query)->HasError() && calls("WHERE ROWID") == 0);
+            }
+            script->queries.clear();
+            CHECK(!database.Query(query)->HasError() && calls("WHERE ROWID") == 4);
+            database.Run("BEGIN; INSERT INTO o.AUTO_TOP VALUES(99);");
+            script->queries.clear();
+            CHECK(!database.Query(query)->HasError() && calls("WHERE ROWID") == 0);
+            database.Run("ROLLBACK;");
+            script->queries.clear();
+            CHECK(!database.Query(query)->HasError() && calls("WHERE ROWID") == 4);
+            // If the predicted speedup fails in reality, the following read
+            // must use the observed range work rather than the initial model.
+            script->top_n_range_work = std::chrono::milliseconds(40);
+            script->queries.clear();
+            CHECK(!database.Query(query)->HasError() && calls("WHERE ROWID") == 4);
+            script->queries.clear();
+            CHECK(!database.Query(query)->HasError() && calls("WHERE ROWID") == 0);
+            script->top_n_range_work = std::chrono::milliseconds(2);
+        }
+        // Both explicit overrides still work regardless of learned costs.
+        database.Run("SET oracle_parallel_top_n=true;");
+        script->queries.clear();
+        CHECK(!database.Query(query)->HasError() && calls("WHERE ROWID") == 4);
+        database.Run("SET oracle_parallel_top_n=false;");
+        script->queries.clear();
+        CHECK(!database.Query(query)->HasError() && calls("WHERE ROWID") == 0);
+        CHECK(database.Query("SET oracle_parallel_top_n='guess'")->HasError());
+        database.Run("SET oracle_parallel_top_n='auto';");
+        // Candidate volume, samples, plain LIMIT, a disabled pool and a single
+        // reader must not trigger calibration or extra Oracle requests.
+        for (const auto &other : {"SELECT ID FROM o.AUTO_TOP ORDER BY ID LIMIT 5000",
+                                  "SELECT ID FROM o.AUTO_TOP LIMIT 1",
+                                  "SELECT ID FROM o.AUTO_TOP TABLESAMPLE SYSTEM(10%) ORDER BY ID LIMIT 1"}) {
+            for (int i = 0; i < 4; i++) {
+                script->queries.clear();
+                const auto other_result = database.Query(other);
+                CHECK(!other_result->HasError() && calls("WHERE ROWID") == 0);
+                CHECK(calls("oracle_scanner_range_identity") == 0);
+            }
+        }
+        database.Run("SET oracle_session_pool_size=0;");
+        for (int i = 0; i < 4; i++) {
+            script->queries.clear();
+            CHECK(!database.Query("SELECT ID FROM o.AUTO_TOP ORDER BY ID DESC LIMIT 2")->HasError());
+            CHECK(calls("WHERE ROWID") == 0 && calls("oracle_scanner_range_identity") == 0);
+        }
+        database.Run("SET oracle_session_pool_size=4;SET oracle_parallel_scan=1;");
+        script->queries.clear();
+        CHECK(!database.Query(query)->HasError() && calls("WHERE ROWID") == 0);
+        database.Run("SET oracle_parallel_scan=4;");
+        script->top_n_network_delay = std::chrono::milliseconds(0);
+        script->top_n_serial_work = std::chrono::milliseconds(0);
+        for (int i = 0; i < 6; i++) {
+            script->queries.clear();
+            CHECK(!database.Query("SELECT ID FROM o.AUTO_TOP ORDER BY ID ASC LIMIT 1")->HasError());
+            CHECK(calls("WHERE ROWID") == 0 && calls("oracle_scanner_range_identity") == 0);
+        }
+    }
+    std::cout << "automatic Top-N learns actual work, rejects costly exchanges and keeps explicit overrides" << std::endl;
+}
+
 void TestParallelMetricSnapshotsSurviveReverseFlushOrder() {
     auto script = std::make_shared<FakeScript>();
     auto factory = InstallFake(script);
@@ -6754,6 +6908,7 @@ int main() {
     TestParallelTopNRanksCandidatesAtOneSnapshot();
     TestParallelCountsCombineOneSnapshot();
     TestParallelPlanCacheChecksIdentityAndEveryCursor();
+    TestAutomaticTopNUsesWorkAndRoundTripCosts();
     TestParallelMetricSnapshotsSurviveReverseFlushOrder();
     TestTextComparesByTheSessionCollation();
     TestLargeScalarFetchKeepsRowsAndLocalFilters();

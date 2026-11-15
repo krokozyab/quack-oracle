@@ -421,22 +421,35 @@ SELECT oracle_scanner_version() = (SELECT oracle_scanner_version());
 ----
 true
 
-# Parallel Top-N is explicitly enabled; default queries retain one ranked read.
-query I
+# Automatic Top-N retains true/false as explicit overrides.
+query T
 SELECT current_setting('oracle_parallel_top_n');
 ----
-false
+auto
 
 statement ok
 SET oracle_parallel_top_n=true;
 
-query I
+query T
 SELECT current_setting('oracle_parallel_top_n');
 ----
 true
 
 statement ok
 SET oracle_parallel_top_n=false;
+
+query T
+SELECT current_setting('oracle_parallel_top_n');
+----
+false
+
+statement error
+SET oracle_parallel_top_n='sometimes';
+----
+oracle_parallel_top_n must be
+
+statement ok
+SET oracle_parallel_top_n='auto';
 
 # Partial COUNT is an explicit opt-in, independently of parallel Top-N.
 query I

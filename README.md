@@ -1355,11 +1355,13 @@ SET oracle_parallel_scan = 8;
 SELECT * FROM o.BIG_TABLE;          -- up to 8 sessions, each reading ROWID ranges
 ```
 
-For a large ranked read on a low-latency connection, parallel Top-N can use the
-same readers. Enable it explicitly:
+Eligible ranked reads choose serial or parallel Top-N automatically. The default
+`auto` mode uses the first two sequential executions as a baseline, then compares
+measured planning and round-trip costs with estimated scan work and candidate
+volume. It updates the estimate from completed range reads. To select the mode:
 
 ```sql
-SET oracle_parallel_top_n = true;
+SET oracle_parallel_top_n = 'auto';
 SET oracle_parallel_scan = 4;
 SELECT order_id, amount FROM o.ORDERS ORDER BY amount DESC, order_id LIMIT 10;
 ```
@@ -1371,8 +1373,22 @@ the ordinary parallel-scan privileges and table-size safeguards. Plain LIMIT,
 samples and reads pinned to a write transaction retain their existing paths.
 Without range-planning privileges it falls back to one ranked read.
 
-The default is `false`: extra planning exchanges and range queries can cost more
-than one query on a remote connection. Compare both settings for the actual workload.
+Set `oracle_parallel_top_n = true` (or `'parallel'`) to force eligible ranges, or
+`false` (or `'serial'`) to force a single ranked query. These overrides bypass the
+cost choice. The setting is now VARCHAR; its canonical values are `auto`, `true`
+and `false`.
+
+Automatic selection seeks at least a 20% estimated saving. It uses pooled readers,
+up to eight, the thread/reader caps and roughly one reader per 250,000 estimated
+input rows. Candidate volume is limited to less than 1/64 of the estimated input;
+short reads stay serial. Rejected plans are reconsidered after sixteen eligible
+executions. Cost history is bounded to 64 entries per connection and separated by
+attachment/DDL epoch, table, projection, predicates, ordering and reader count.
+EXPLAIN ANALYZE reports the choice in `Oracle Top-N execution`.
+
+The first calibration can add metadata exchanges and a cold parallel read can
+open sessions. These are heuristics for repeated queries; compare the manual
+modes when tuning a workload.
 
 Scalar `COUNT(*)` and `COUNT(column)` can also use range readers:
 
@@ -1532,7 +1548,7 @@ response exceeding that count is rejected.
 | `oracle_direct_scan` | `true` | Decode eligible attached scalar scans directly into typed vectors. NUMBER, DATE/TIMESTAMP, binary floats, BOOLEAN and short VARCHAR2/CHAR/RAW are supported; other columns retain the existing path. Set `false` for comparisons or troubleshooting. |
 | `oracle_fetch_rows` | `16384` | Maximum scalar attached-scan fetch rows, 1..65536. Output vectors remain 2048 rows. Declared row widths reduce the request toward an 8 MiB estimate; deferred, locked and short-limit scans retain the smaller path. |
 | `oracle_parallel_scan` | `-1` | Maximum sessions one scan of an attached table may read through at once: `-1` chooses (up to 8 and DuckDB's thread count, for a table of 500,000 rows or more; roughly 16 MiB or 250,000 filtered rows per reader), `0` or `1` is one session. Small tables and selective filters stay sequential even with a positive maximum. See [section 7](#7-read-a-big-table-faster). |
-| `oracle_parallel_top_n` | `false` | Allow eligible Top-N reads to rank candidates per ROWID range at one SCN and merge them in DuckDB. Uses `oracle_parallel_scan` and the thread cap; adds exchanges and can be slower on a remote connection. Plain LIMIT stays on one read. |
+| `oracle_parallel_top_n` | `auto` | VARCHAR mode: learn serial work and compare planning, network and candidate costs before using ROWID Top-N. `true`/`parallel` forces eligible ranges, `false`/`serial` forces one ranked read. Reader/thread/pool caps and snapshot/privilege safeguards apply. Plain LIMIT retains its path. |
 | `oracle_parallel_count` | `false` | Compute eligible scalar COUNT(*) and COUNT(column) per ROWID range at one SCN, then sum in DuckDB. Uses the reader/thread caps and serial privilege/write fallback; DISTINCT and grouped or mixed aggregates retain their existing paths. Multiple counts may be slower than one indexed count. |
 | `oracle_scan_plan_cache` | `true` | Reuse checked ROWID boundaries and projected wire descriptions (32 entries, 8 MiB accounting budget per connection). Each execution checks identity and flashback access and takes a fresh SCN. Set false for comparisons. |
 | `oracle_consistent_read` | `false` | Read every attached table of a statement `AS OF` one SCN. See [One moment for a whole statement](#one-moment-for-a-whole-statement). |

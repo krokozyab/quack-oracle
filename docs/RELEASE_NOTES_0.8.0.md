@@ -17,10 +17,11 @@
   Defaults to false because range planning and multiple counts can be slower
   than one Oracle count. Invalid or missing partial replies fail the query.
 
-- Opt-in `oracle_parallel_top_n`: rank candidates per ROWID range at one SCN,
-  then retain DuckDB's global Top-N for the final result, including OFFSET and
-  NULL ordering. Uses the ordinary reader cap and privilege fallback. Defaults
-  to false because additional exchanges can be slower on remote connections.
+- Automatic `oracle_parallel_top_n`: learn serial execution cost and choose
+  ranked ROWID ranges using planning latency, scan/candidate volume and observed
+  parallel work. DuckDB retains the global Top-N, OFFSET and NULL ordering.
+  Cost observations are bounded; snapshot, reader and privilege guards remain.
+  Explicit true/parallel and false/serial overrides are supported.
 
 - Partial AVG pushdown for exact NUMBER(p,s), p <= 18 and 0 <= s <= p:
   Oracle computes the scaled sum and non-NULL count; DuckDB finalizes the
@@ -32,6 +33,11 @@
   table keeps its owner, filters and transaction snapshot.
 
 ## Behaviour changes
+
+- `oracle_parallel_top_n` changes from BOOLEAN default false to VARCHAR default
+  `auto`. Existing `SET ... = true/false` remains valid as a forced choice; the
+  reported canonical values are `auto`, `true`, `false`. Auto starts with two
+  serial samples and can pay an initial planning/session calibration cost.
 
 - Reject attached scans when Oracle's wire type no longer matches the cached
   table schema. An external NUMBER-to-VARCHAR2 change could previously decode

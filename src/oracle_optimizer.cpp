@@ -1278,6 +1278,31 @@ void OptimizeOraclePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperat
 
 } // namespace
 
+static OracleTopNMode ParseOracleTopNMode(const Value &value) {
+    const auto mode = StringUtil::Lower(value.ToString());
+    if (mode == "auto") {
+        return OracleTopNMode::AUTOMATIC;
+    }
+    if (mode == "true" || mode == "on" || mode == "parallel") {
+        return OracleTopNMode::PARALLEL;
+    }
+    if (mode == "false" || mode == "off" || mode == "serial") {
+        return OracleTopNMode::SERIAL;
+    }
+    throw InvalidInputException("oracle_parallel_top_n must be auto, true/parallel or false/serial");
+}
+
+OracleTopNMode OracleTopNExecutionMode(ClientContext &context) {
+    Value value;
+    return context.TryGetCurrentSetting("oracle_parallel_top_n", value) ? ParseOracleTopNMode(value)
+                                                                       : OracleTopNMode::AUTOMATIC;
+}
+
+static void SetOracleTopNMode(ClientContext &, SetScope, Value &value) {
+    const auto mode = ParseOracleTopNMode(value);
+    value = Value(mode == OracleTopNMode::AUTOMATIC ? "auto" : mode == OracleTopNMode::PARALLEL ? "true" : "false");
+}
+
 void RegisterOracleOptimizer(DatabaseInstance &db) {
     DBConfig::GetConfig(db).AddExtensionOption(
         "oracle_scan_plan_cache", "Cache checked ROWID boundaries and wire descriptions, never snapshots or rows.",
@@ -1286,8 +1311,8 @@ void RegisterOracleOptimizer(DatabaseInstance &db) {
         "oracle_parallel_count", "Count ROWID ranges at one SCN and sum their counts in DuckDB.",
         LogicalType::BOOLEAN, Value::BOOLEAN(false));
     DBConfig::GetConfig(db).AddExtensionOption(
-        "oracle_parallel_top_n", "Rank each ROWID range in Oracle and merge candidates in DuckDB; adds round trips.",
-        LogicalType::BOOLEAN, Value::BOOLEAN(false));
+        "oracle_parallel_top_n", "Choose ranked reads automatically, or force true/parallel or false/serial.",
+        LogicalType::VARCHAR, Value("auto"), SetOracleTopNMode);
     DBConfig::GetConfig(db).AddExtensionOption("oracle_direct_scan",
                                                "Decode supported attached scalar rows into typed vectors during fetch.",
                                                LogicalType::BOOLEAN, Value::BOOLEAN(true));

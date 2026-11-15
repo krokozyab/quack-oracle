@@ -343,6 +343,18 @@ struct OracleScanMetrics {
     }
 };
 
+enum class OracleTopNMode { AUTOMATIC, SERIAL, PARALLEL };
+OracleTopNMode OracleTopNExecutionMode(ClientContext &context);
+std::pair<uint64_t, uint64_t> OracleAttachedPlanEpoch(const OracleQueryBindData &bind);
+
+struct OracleTopNFeedback {
+    uint64_t key = 0;
+    uint64_t started_nanoseconds = 0;
+    std::atomic<uint64_t> maximum_acquire_nanoseconds {0};
+    std::atomic<uint64_t> maximum_range_nanoseconds {0};
+    std::atomic<bool> recorded {false};
+};
+
 struct OracleQueryGlobalState final : GlobalTableFunctionState {
     OracleQueryGlobalState(OracleSessionHandle session_p, std::unique_ptr<OracleCursor> cursor_p,
                            std::vector<OracleColumn> columns_p, std::vector<LogicalType> types_p,
@@ -399,6 +411,8 @@ struct OracleQueryGlobalState final : GlobalTableFunctionState {
     uint64_t planning_nanoseconds = 0;
     OracleIoStats planning_io;
     bool plan_cache_hit = false;
+    unique_ptr<OracleTopNFeedback> top_n_feedback;
+    std::string top_n_execution;
     std::atomic<idx_t> next_chunk {0};
     idx_t thread_count = 1;
     std::string secret_name;
@@ -422,6 +436,7 @@ struct OracleQueryLocalState final : LocalTableFunctionState {
     //! The ROWID range the cursor reads, which is the batch its rows belong to.
     idx_t batch_index = 0;
     size_t count_rows = 0;
+    uint64_t range_nanoseconds = 0;
 };
 unique_ptr<LocalTableFunctionState> OracleQueryInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
                                                          GlobalTableFunctionState *global_state);
@@ -634,6 +649,10 @@ struct OracleParallelPlan {
     uint64_t planning_nanoseconds = 0;
     OracleIoStats planning_io;
     bool cache_hit = false;
+    bool cache_enabled = false;
+    uint64_t probe_nanoseconds = 0;
+    uint64_t probe_round_trips = 0;
+    uint64_t identity_hash = 0;
 };
 OracleParallelPlan PlanParallelAttachedScan(ClientContext &context, const OracleQueryBindData &bind,
                                            const std::vector<column_t> &selected, idx_t sessions,

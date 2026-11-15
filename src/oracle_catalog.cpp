@@ -2741,6 +2741,11 @@ bool OracleScanDescribeMatches(const std::vector<OracleColumn> &expected, const 
     return true;
 }
 
+std::pair<uint64_t, uint64_t> OracleAttachedPlanEpoch(const OracleQueryBindData &bind) {
+    const auto *entry = bind.table_entry ? dynamic_cast<const OracleAttachedTableEntry *>(bind.table_entry.get()) : nullptr;
+    return entry ? entry->PlanEpoch() : std::pair<uint64_t, uint64_t> {0, 0};
+}
+
 OracleParallelPlan PlanParallelAttachedScan(ClientContext &context, const OracleQueryBindData &bind,
                                            const std::vector<column_t> &selected, idx_t sessions,
                                            const std::string &aggregate_select) {
@@ -2750,9 +2755,7 @@ OracleParallelPlan PlanParallelAttachedScan(ClientContext &context, const Oracle
     }
     const bool bounded = !bind.order_clause.empty();
     if (bounded) {
-        Value enabled;
-        if (bind.top_n.empty() || !context.TryGetCurrentSetting("oracle_parallel_top_n", enabled) ||
-            enabled.IsNull() || !BooleanValue::Get(enabled)) {
+        if (bind.top_n.empty() || OracleTopNExecutionMode(context) == OracleTopNMode::SERIAL) {
             return {};
         }
     }
@@ -2850,6 +2853,8 @@ OracleParallelPlan PlanParallelAttachedScan(ClientContext &context, const Oracle
         // Also on cache hits: revoked FLASHBACK or a changed table must retain
         // the ordinary serial fallback. On misses this same exchange describes
         // the projected wire columns, avoiding a second schema-only query.
+        const auto probe_started = std::chrono::steady_clock::now();
+        const auto probe_before = session->IoStats();
         auto probe = session->Query("SELECT " + (hit ? std::string("1") : select_list) + " FROM " + as_of +
                                     " WHERE 1 = 0", {});
         if (!hit) {
@@ -2857,6 +2862,11 @@ OracleParallelPlan PlanParallelAttachedScan(ClientContext &context, const Oracle
         }
         probe->Close();
         OracleParallelPlan result;
+        result.probe_nanoseconds = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - probe_started).count());
+        result.probe_round_trips = (session->IoStats() - probe_before).round_trips;
+        result.cache_enabled = caching;
+        result.identity_hash = std::hash<std::string>()(identity);
         result.wire_columns = saved.wire_columns;
         if (aggregate_select.empty()) {
             result.columns = ProjectedDescribe(bind, selected, saved.wire_columns);
