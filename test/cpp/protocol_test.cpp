@@ -3100,18 +3100,18 @@ static void TestPreparedQueryCacheOwnershipAndBounds() {
     CHECK(active && active->handle.statement_id == 1 && cache.Size() == 0 && cache.Bytes() == 0);
     CHECK(!cache.Take("query1"));
     cache.Put(std::move(*active), close);
-    for (uint32_t id = 2; id <= 32; ++id) {
+    for (uint32_t id = 2; id <= 20; ++id) {
         cache.Put(entry(id), close);
     }
     active = cache.Take("query1");
     CHECK(active);
     cache.Put(std::move(*active), close);
-    cache.Put(entry(33), close);
-    CHECK(cache.Size() == 32 && closed == std::vector<uint32_t>({2}) && !cache.Take("query2"));
+    cache.Put(entry(21), close);
+    CHECK(cache.Size() == 20 && closed == std::vector<uint32_t>({2}) && !cache.Take("query2"));
     auto duplicate = entry(100);
     duplicate.key = "query1";
     cache.Put(std::move(duplicate), close);
-    CHECK(closed.back() == 1 && cache.Size() == 32);
+    CHECK(closed.back() == 1 && cache.Size() == 20);
     CHECK(cache.Take("query1")->handle.statement_id == 100);
     cache.Clear(close);
     CHECK(cache.Size() == 0 && cache.Bytes() == 0);
@@ -3124,6 +3124,17 @@ static void TestPreparedQueryCacheOwnershipAndBounds() {
     CHECK(cache.Size() == 1 && closed.back() == 3);
     cache.Clear(close);
     CHECK(closed.back() == 2 && cache.Bytes() == 0);
+}
+
+static void TestTransientSnapshotAndRowIdQueriesBypassCursorCache() {
+    for (const auto *sql : {"SELECT ID FROM T AS OF SCN 123", "select id from t as/*comment*/of\nscn 123",
+                           "SELECT ID FROM T WHERE ROWID >= CHARTOROWID(:1)", "SELECT \"ROWID\" FROM T"}) {
+        CHECK(OracleQueryUsesTransientCursor(sql));
+    }
+    for (const auto *sql : {"SELECT id FROM t", "SELECT 'AS OF SCN' FROM dual", "SELECT q'[ROWID]' FROM dual",
+                           "SELECT my_rowid FROM t /* AS OF SCN 1 */"}) {
+        CHECK(!OracleQueryUsesTransientCursor(sql));
+    }
 }
 
 static void TestPreparedQueryReexecuteWireAndState() {
@@ -9635,6 +9646,7 @@ int main() {
     TestStatementCacheConfigurationReachesNativeSession();
     TestStatementRegistry();
     TestPreparedQueryCacheOwnershipAndBounds();
+    TestTransientSnapshotAndRowIdQueriesBypassCursorCache();
     TestPreparedQueryReexecuteWireAndState();
     TestTtcStatementChannel();
     TestTtcCursorClosePiggyback();

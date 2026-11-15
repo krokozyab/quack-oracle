@@ -30,7 +30,7 @@ struct OraclePreparedQuery {
 // All operations run under the native session's TTC call lock.
 class OracleQueryCache {
 public:
-    static constexpr size_t MAX_ENTRIES = 32;
+    static constexpr size_t MAX_ENTRIES = 20;
     static constexpr size_t MAX_BYTES = 2U << 20U;
 
     std::optional<OraclePreparedQuery> Take(const std::string &key) {

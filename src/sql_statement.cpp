@@ -112,6 +112,51 @@ void RejectStatementTerminators(const std::string &sql) {
 
 } // namespace
 
+bool OracleQueryUsesTransientCursor(const std::string &sql) {
+    size_t index = 0;
+    unsigned snapshot_words = 0;
+    while (index < sql.size()) {
+        SkipTrivia(sql, index);
+        if (index == sql.size()) {
+            break;
+        }
+        if ((sql[index] == 'q' || sql[index] == 'Q') && index + 2 < sql.size() && sql[index + 1] == '\'') {
+            const auto end = sql.find(std::string() + QQuoteTerminator(sql[index + 2]) + "'", index + 3);
+            if (end == std::string::npos) {
+                return true;
+            }
+            index = end + 2;
+            snapshot_words = 0;
+            continue;
+        }
+        if (sql[index] == '\'' || sql[index] == '"') {
+            const auto start = index;
+            const auto quote = sql[index];
+            SkipQuoted(sql, index, quote);
+            if (quote == '"' && sql.substr(start, index - start) == "\"ROWID\"") {
+                return true;
+            }
+            snapshot_words = 0;
+            continue;
+        }
+        if (std::isalpha(static_cast<unsigned char>(sql[index])) || sql[index] == '_') {
+            std::string word;
+            while (index < sql.size() && (std::isalnum(static_cast<unsigned char>(sql[index])) ||
+                   sql[index] == '_' || sql[index] == '$' || sql[index] == '#')) {
+                word += static_cast<char>(std::toupper(static_cast<unsigned char>(sql[index++])));
+            }
+            if (word == "ROWID" || (snapshot_words == 2 && word == "SCN")) {
+                return true;
+            }
+            snapshot_words = word == "AS" ? 1 : (snapshot_words == 1 && word == "OF" ? 2 : 0);
+        } else {
+            ++index;
+            snapshot_words = 0;
+        }
+    }
+    return false;
+}
+
 OracleSqlKind ClassifyOracleSql(const std::string &sql) {
     const auto keyword = FirstKeyword(sql);
     if (keyword == "SELECT" || keyword == "WITH") {

@@ -39,7 +39,7 @@ struct NativeSessionLifetime {
 namespace {
 
 std::string QueryCacheKey(const std::string &sql, const std::vector<OracleBind> &binds) {
-    if (sql.size() > (64U << 10U) || binds.size() > 64) {
+    if (sql.size() > (64U << 10U) || binds.size() > 64 || OracleQueryUsesTransientCursor(sql)) {
         return {};
     }
     auto key = std::to_string(sql.size()) + ":" + sql;

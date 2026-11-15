@@ -133,7 +133,7 @@ OracleSessionHandle AcquireOracleReadSession(ClientContext &context, const std::
 
 void RegisterOracleSessionPool(ExtensionLoader &loader) {
     DBConfig::GetConfig(loader.GetDatabaseInstance())
-        .AddExtensionOption("oracle_statement_cache", "Reuse up to 32 parsed scalar queries per native Oracle session.",
+        .AddExtensionOption("oracle_statement_cache", "Reuse up to 20 parsed scalar queries per native Oracle session.",
                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
     DBConfig::GetConfig(loader.GetDatabaseInstance())
         .AddExtensionOption("oracle_session_pool_size",
