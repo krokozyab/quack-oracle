@@ -21,6 +21,7 @@
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 #include <functional>
+#include <map>
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/planner/operator/logical_merge_into.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
@@ -33,6 +34,7 @@
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/optimizer/filter_pushdown.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
@@ -195,6 +197,8 @@ struct PushedAggregate {
 	std::vector<OracleColumn> columns;
 	vector<LogicalType> types;      // what the scan returns
 	vector<LogicalType> wanted;     // what the AGGREGATE returned, groups first
+    // AVG expands into SUM and COUNT on the wire, but one local result.
+    std::map<idx_t, std::pair<double, bool>> averages;
 };
 
 bool KeyType(const LogicalType &type) {
@@ -321,9 +325,23 @@ bool PlanPushedAggregate(ClientContext &context, LogicalAggregate &aggregate, Lo
                 count_column, LogicalType::BIGINT, wanted);
         } else if ((name == "min" || name == "max") && KeyType(type) && wanted == type) {
 			add(name == "min" ? "MIN(" + Quoted(source) + ")" : "MAX(" + Quoted(source) + ")", source, type, type);
-		} else if (name == "sum" && source.oracle_type == 2 && source.precision >= 1 && source.scale >= 0 &&
-		           source.scale <= source.precision && source.precision <= 38) {
-			if (type.id() == LogicalTypeId::BIGINT && wanted == LogicalType::HUGEINT) {
+        } else if (name == "avg" && wanted == LogicalType::DOUBLE && source.oracle_type == 2 && source.precision >= 1 &&
+                   source.precision <= 18 && source.scale >= 0 && source.scale <= source.precision &&
+                   !OracleColumnRoundsOnRead(source)) {
+            // With <=18 input digits and an 18-digit COUNT, the exact scaled sum
+            // fits both Oracle NUMBER and DuckDB HUGEINT. Floating sums stay local.
+            const auto scale = type.id() == LogicalTypeId::DECIMAL ? DecimalType::GetScale(type) : 0;
+            const auto multiplier = Hugeint::Cast<double>(Hugeint::POWERS_OF_TEN[scale]);
+            const bool narrow = type.id() == LogicalTypeId::DECIMAL && DecimalType::GetWidth(type) <= 4;
+            result.averages.emplace(result.types.size(), std::make_pair(multiplier, narrow));
+            OracleColumn text;
+            add("TO_CHAR(SUM(" + Quoted(source) + ") * " + std::to_string(uint64_t(multiplier)) + ", 'TM9')", text,
+                LogicalType::VARCHAR, LogicalType::HUGEINT);
+            add("CAST(COUNT(" + Quoted(source) + ") AS NUMBER(18,0))", count_column, LogicalType::BIGINT,
+                LogicalType::BIGINT);
+        } else if (name == "sum" && source.oracle_type == 2 && source.precision >= 1 && source.scale >= 0 &&
+                   source.scale <= source.precision && source.precision <= 38) {
+            if (type.id() == LogicalTypeId::BIGINT && wanted == LogicalType::HUGEINT) {
 				// A sum of integers can pass 18 digits, which no NUMBER this client maps to a
 				// number can hold; Oracle spells it out and DuckDB reads it as a HUGEINT.
 				OracleColumn text;
@@ -338,21 +356,41 @@ bool PlanPushedAggregate(ClientContext &context, LogicalAggregate &aggregate, Lo
 			} else {
 				return false;
 			}
-		} else {
-			return false;
-		}
-	}
+        } else {
+            return false;
+        }
+    }
 	if (result.columns.empty()) {
 		return false;
 	}
-	result.sql = "SELECT " + select_list + " FROM " + OracleObjectReference(bind.schema_name, bind.object_name) + " /*SCN*/";
-	if (!where.empty()) {
+    result.sql = "SELECT " + select_list + " FROM " + OracleObjectReference(bind.schema_name, bind.object_name) + " /*SCN*/";
+    if (!where.empty()) {
 		result.sql += " WHERE " + where;
 	}
 	if (!group_list.empty()) {
 		result.sql += " GROUP BY " + group_list;
 	}
 	return true;
+}
+
+// Match the pinned DuckDB AVG finalizers, including the platform's extended
+// precision for BIGINT and DECIMAL backed by INT32/INT64. Do not replace this
+// with a SQL DOUBLE division: it rounds the numerator too early.
+void FinalizeOracleAverage(DataChunk &input, ExpressionState &, Vector &result) {
+    using Extended = decltype(0.0L);
+    for (idx_t row = 0; row < input.size(); row++) {
+        const auto count = input.GetValue(1, row).GetValue<int64_t>();
+        if (!count) {
+            result.SetValue(row, Value(LogicalType::DOUBLE));
+            continue;
+        }
+        const auto sum = input.GetValue(0, row).GetValue<hugeint_t>();
+        const auto scale = input.GetValue(2, row).GetValue<double>();
+        const auto narrow = input.GetValue(3, row).GetValue<bool>();
+        const auto value = narrow ? Hugeint::Cast<double>(sum) / (double(count) * scale)
+                                  : double(Hugeint::Cast<Extended>(sum) / (Extended(count) * Extended(scale)));
+        result.SetValue(row, Value::DOUBLE(value));
+    }
 }
 
 void PushAggregate(ClientContext &context, unique_ptr<LogicalOperator> &op, ColumnBindingReplacer &replacer) {
@@ -368,10 +406,10 @@ void PushAggregate(ClientContext &context, unique_ptr<LogicalOperator> &op, Colu
 	}
 	auto &get = node->Cast<LogicalGet>();
 	auto *bind = get.bind_data ? dynamic_cast<OracleQueryBindData *>(get.bind_data.get()) : nullptr;
-	if (!bind || !bind->deferred_scan) {
-		return;
-	}
-	PushedAggregate pushed;
+    if (!bind || !bind->deferred_scan) {
+        return;
+    }
+    PushedAggregate pushed;
 	if (!PlanPushedAggregate(context, aggregate, get, projections, *bind, pushed)) {
 		return;
 	}
@@ -409,15 +447,31 @@ void PushAggregate(ClientContext &context, unique_ptr<LogicalOperator> &op, Colu
 	// The AGGREGATE's own types, reached by a cast where the scan's differ (a sum
 	// of integers arrives as text and is a HUGEINT here).
 	vector<unique_ptr<Expression>> select;
-	for (idx_t index = 0; index < pushed.types.size(); index++) {
-		unique_ptr<Expression> reference =
-		    make_uniq<BoundColumnRefExpression>(pushed.types[index], ColumnBinding(get_index, ProjectionIndex(index)));
-		if (pushed.types[index] != pushed.wanted[index]) {
-			reference = BoundCastExpression::AddCastToType(context, std::move(reference), pushed.wanted[index]);
-		}
-		select.push_back(std::move(reference));
-	}
-	const auto groups = aggregate.groups.size();
+    for (idx_t index = 0; index < pushed.types.size(); index++) {
+        unique_ptr<Expression> reference =
+            make_uniq<BoundColumnRefExpression>(pushed.types[index], ColumnBinding(get_index, ProjectionIndex(index)));
+        if (pushed.types[index] != pushed.wanted[index]) {
+            reference = BoundCastExpression::AddCastToType(context, std::move(reference), pushed.wanted[index]);
+        }
+        const auto average = pushed.averages.find(index);
+        if (average != pushed.averages.end()) {
+            vector<unique_ptr<Expression>> arguments;
+            arguments.push_back(std::move(reference));
+            arguments.push_back(make_uniq<BoundColumnRefExpression>(
+                LogicalType::BIGINT, ColumnBinding(get_index, ProjectionIndex(++index))));
+            arguments.push_back(make_uniq<BoundConstantExpression>(Value::DOUBLE(average->second.first)));
+            arguments.push_back(make_uniq<BoundConstantExpression>(Value::BOOLEAN(average->second.second)));
+            ScalarFunction function(
+                "oracle_finalize_average",
+                {LogicalType::HUGEINT, LogicalType::BIGINT, LogicalType::DOUBLE, LogicalType::BOOLEAN},
+                LogicalType::DOUBLE, FinalizeOracleAverage);
+            function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+            reference =
+                make_uniq<BoundFunctionExpression>(BoundScalarFunction(function), std::move(arguments), nullptr);
+        }
+        select.push_back(std::move(reference));
+    }
+    const auto groups = aggregate.groups.size();
 	const auto group_index = aggregate.group_index;
 	const auto aggregate_index = aggregate.aggregate_index;
 	const auto aggregates = aggregate.expressions.size();

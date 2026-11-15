@@ -3361,6 +3361,70 @@ void TestTextComparesByTheSessionCollation() {
 }
 
 // DISTINCT counts need the equality of decoded values to match Oracle.
+void TestExactAveragePartialPushdown() {
+    for (const int precision : {4, 10, 18}) {
+        for (const int scale : {0, 2}) {
+            auto script = std::make_shared<FakeScript>();
+            script->routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+            script->routes.push_back({"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("AVGS")}}}});
+            script->routes.push_back({"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}});
+            script->routes.push_back(
+                {"FROM user_tab_columns",
+                 {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+                   Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+                  {{Text("AVGS"), Text("V"), Text("NUMBER"), Number("22"), Number(std::to_string(precision)),
+                    Number(std::to_string(scale)), Text("Y")},
+                   {Text("AVGS"), Text("G"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("Y")}}}});
+            script->routes.push_back(
+                {"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}});
+            const auto maximum = precision == 18   ? int64_t(999999999999999999LL)
+                                 : precision == 10 ? int64_t(9999999999LL)
+                                                   : int64_t(9999);
+            const auto third = precision == 18 ? int64_t(9007199254740992LL) : int64_t(1234);
+            const auto literal = [&](int64_t v) {
+                // Build exact decimal literals without binary floating arithmetic.
+                auto digits = std::to_string(v);
+                if (scale) {
+                    digits.insert(digits.size() - 2, ".");
+                }
+                return digits;
+            };
+            script->tables["AVGS"] = {{Column("V", 2, precision, scale), Column("G", 2, 10, 0)},
+                                      {{Number(literal(maximum)), Number("1")},
+                                       {Number(literal(-maximum + 1)), Number("1")},
+                                       {Number(literal(third)), Number("1")},
+                                       {WireValue(), Number("1")}}};
+            script->routes.push_back({"TO_CHAR(SUM(",
+                                      {{Column("C0", 2, 10, 0), Column("C1", 1), Column("C2", 2, 18, 0)},
+                                       {{Number("1"), Text(std::to_string(third + 1)), Number("3")}}}});
+            script->routes.push_back({"CAST(SUM(",
+                                      {{Column("C0", 2, 10, 0), Column("C1", 2, 38, scale), Column("C2", 2, 18, 0)},
+                                       {{Number("1"), Number(literal(third + 1)), Number("3")}}}});
+            auto factory = InstallFake(script);
+            TestDatabase database;
+            database.Run("ATTACH 'ora' AS o(TYPE oracle_scanner);");
+            const auto sql = "SELECT G,avg(V) FROM o.AVGS GROUP BY G;";
+            database.Run("SET oracle_aggregate_pushdown=false;");
+            auto local = database.Query(sql);
+            CHECK(!local->HasError());
+            database.Run("SET oracle_aggregate_pushdown=true;");
+            auto remote = database.Query(sql);
+            if (remote->HasError()) {
+                std::cerr << remote->GetError() << "\n" << script->queries.back() << std::endl;
+            }
+            CHECK(!remote->HasError());
+            CHECK(remote->GetValue(1, 0) == local->GetValue(1, 0));
+            CHECK(script->queries.back().find("SUM(") != std::string::npos);
+            CHECK(script->queries.back().find("COUNT(\"V\")") != std::string::npos);
+            // NULL-only and empty input produce NULL, never division by zero.
+            script->routes.back().second.rows = {{Number("1"), WireValue(), Number("0")}};
+            script->routes[script->routes.size() - 2].second.rows = {{Number("1"), WireValue(), Number("0")}};
+            auto empty = database.Query(sql);
+            CHECK(!empty->HasError() && empty->GetValue(1, 0).IsNull());
+        }
+    }
+}
+
 void TestDistinctCountPushesOnlyEquivalentEquality() {
     for (const auto *comparison : {"BINARY", "LINGUISTIC"}) {
         auto script = std::make_shared<FakeScript>();
@@ -5977,6 +6041,7 @@ int main() {
     TestHeavyColumnsAreReadAfterTheFilter();
     TestAttachedScanReadsInRowidRanges();
     TestTextComparesByTheSessionCollation();
+    TestExactAveragePartialPushdown();
     TestDistinctCountPushesOnlyEquivalentEquality();
     TestSelectiveFiltersReadThroughOneSession();
     TestCallableArgumentsOfTheNewTypes();

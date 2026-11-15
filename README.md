@@ -723,9 +723,16 @@ pushed for exact numbers only (integers arrive as text and are read as `HUGEINT`
 decimals as `DECIMAL(38,s)`, the types DuckDB itself returns); `min`, `max` and group keys for
 numbers, dates and timestamps, and group keys also for `VARCHAR2` columns Oracle compares by
 bytes (grouping needs only equality; see the filters above). Other text keys, `min`/`max` of text,
-`avg`, and floating-point aggregates other than COUNT DISTINCT are left to DuckDB (Oracle may compare text by a collation or
+floating-point aggregates other than COUNT DISTINCT are left to DuckDB (Oracle may compare text by a collation or
 blank-padding and orders it by `NLS_SORT`, and the order of addition changes a floating-point sum). Every filter must have gone to Oracle too, and the scan
 must have no sample and no join filter coming later; otherwise the plan is unchanged.
+For `avg` of exact `NUMBER(p,s)` with `1 <= p <= 18` and `0 <= s <= p`,
+Oracle returns the exact scaled sum and the non-NULL count. DuckDB finalizes the
+average locally using the pinned engine's integer/decimal rounding rules,
+including NULL for empty or all-NULL input. This partial AVG rewrite excludes wider decimals, floating-point input,
+DISTINCT, FILTER, ORDER BY and expressions. DuckDB may independently rewrite an
+average into eligible SUM/COUNT expressions.
+
 `SET oracle_aggregate_pushdown = false` turns it off. 60 random aggregate queries (up to two
 group keys, NULLs, ties, decimals, dates, timestamps, pushed filters) returned the same rows with
 and without it on 19c and 23ai.
