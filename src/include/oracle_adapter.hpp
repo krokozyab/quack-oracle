@@ -18,12 +18,14 @@
 
 #include <cstdint>
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/common/insertion_order_preserving_map.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/planner/table_filter.hpp"
 
 #include <memory>
+#include <mutex>
 #include <atomic>
 #include <optional>
 #include <string>
@@ -328,6 +330,7 @@ struct OracleScanMetrics {
     std::atomic<uint64_t> convert_nanoseconds {0};
     std::atomic<uint64_t> sessions {0};
     std::atomic<uint64_t> chunks_read {0};
+    std::atomic<uint64_t> chunks_completed {0};
     std::atomic<uint64_t> deferred_rows {0};
     void Add(const OracleIoStats &io) {
         bytes_sent += io.bytes_sent;
@@ -363,6 +366,8 @@ struct OracleQueryGlobalState final : GlobalTableFunctionState {
 
     //! What the scan did, for EXPLAIN ANALYZE (see OracleScanMetrics).
     OracleScanMetrics metrics;
+    std::mutex profile_lock;
+    InsertionOrderPreservingMap<string> profile_info;
     //! The statement(s) the scan sent, and the filters it applied itself.
     std::string sent_sql;
     std::string local_filter_text;

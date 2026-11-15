@@ -865,6 +865,10 @@ session acquisition and snapshot/range planning. Fetch time measures subsequent 
 fetches and decoding; conversion time measures writing DuckDB values (included in fetch
 for direct batches). Parallel timings add the durations across readers, so their sum
 can exceed wall time. The last line is every filter Oracle was *not* sent.
+Network counters cover cursor opening and fetching, excluding range-planning queries.
+Global Oracle details for a parallel scan appear after all planned ranges finish.
+If an upstream operator stops the scan early, these details are omitted; DuckDB's
+own operator metrics still describe the rows it consumed.
 
 ---
 
@@ -1370,7 +1374,7 @@ than one query on a remote connection. Compare both settings for the actual work
 ROWID planning reuses the read-session pool (`oracle_session_pool_size`); a failed
 planning exchange discards its session before falling back to a serial scan.
 
-The table is cut into ROWID ranges at its extent boundaries (about four chunks to a
+An unbounded copy is cut into ROWID ranges at its extent boundaries (about four chunks to a
 session, so a thread that finishes early takes another), and every chunk reads
 `AS OF SCN` at one change number taken first, so together they are one snapshot, not several
 moments. On a 2,000,000-row table four sessions took 0.9 s against 2.2 s for one, and eight

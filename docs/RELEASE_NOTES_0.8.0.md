@@ -81,3 +81,7 @@
   `Oracle query open time`, separately from subsequent fetches. Parallel scans
   now charge range opens to this metric instead of fetch time. Durations are
   summed across readers and can exceed wall time.
+
+- Publish parallel scan totals only after all ranges finish, preventing an
+  early worker's snapshot from overwriting final `EXPLAIN ANALYZE` counters.
+  Runtime Oracle details are omitted when an upstream operator stops a parallel scan early.

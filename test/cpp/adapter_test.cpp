@@ -19,6 +19,7 @@
 #include "oracle_scanner/ttc_lob.hpp"
 #include "oracle_scanner/call_registry.hpp"
 #include "oracle_scanner/ttc_execute.hpp"
+#include "duckdb/main/profiler/profiling_node.hpp"
 
 #include "duckdb/common/exception/conversion_exception.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
@@ -3972,6 +3973,10 @@ void TestParallelTopNRanksCandidatesAtOneSnapshot() {
         }
         script->queries.clear();
         script->initial_fetch_rows.clear();
+        if (mode == 2) {
+            script->query_delay_fragment = "WHERE ROWID >= CHARTOROWID('EXTENT9')";
+            script->query_delay = std::chrono::milliseconds(100);
+        }
         const auto suffix = filter + " ORDER BY ID" + direction + null_order + " LIMIT 3 OFFSET 2";
         auto actual = database.Query("SELECT ID FROM o.TOPS" + suffix);
         auto expected = database.Query("SELECT ID FROM expected" + suffix);
@@ -3980,6 +3985,7 @@ void TestParallelTopNRanksCandidatesAtOneSnapshot() {
             CHECK(actual->GetValue(0, row).ToString() == expected->GetValue(0, row).ToString());
         }
         CHECK(ranges_read() == 4);
+        script->query_delay_fragment.clear();
         CHECK(script->initial_fetch_rows.size() == 4);
         for (const auto rows : script->initial_fetch_rows) {
             CHECK(rows == 32);
@@ -4008,6 +4014,45 @@ void TestParallelTopNRanksCandidatesAtOneSnapshot() {
     script->queries.clear();
     CHECK(!database.Query("SELECT ID FROM o.TOPS ORDER BY ID DESC LIMIT 3;")->HasError() && ranges_read() == 0);
     std::cout << "parallel Top-N merges bounded candidates at one SCN and keeps serial fallbacks" << std::endl;
+}
+
+void TestParallelMetricSnapshotsSurviveReverseFlushOrder() {
+    auto script = std::make_shared<FakeScript>();
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    duckdb::OracleQueryGlobalState state(duckdb::OracleSessionHandle(), nullptr, {}, {}, {}, 0);
+    state.parallel = true;
+    state.chunk_sql = {"first range", "second range"};
+    duckdb::OperatorMetrics early, late;
+    early.AddExtraInfo("Function", "ORACLE_ATTACHED_SCAN");
+    state.metrics.rows_fetched = 10;
+    state.metrics.chunks_read = 1;
+    state.metrics.chunks_completed = 1;
+    duckdb::TableFunctionGetMetricsInput early_input(*database.con.context, nullptr, nullptr, &state, early);
+    duckdb::OracleQueryMetrics(early_input);
+    CHECK(early.GetExtraInfo().empty());
+    state.metrics.rows_fetched = 20;
+    state.metrics.chunks_read = 2;
+    state.metrics.chunks_completed = 2;
+    duckdb::TableFunctionGetMetricsInput late_input(*database.con.context, nullptr, nullptr, &state, late);
+    duckdb::OracleQueryMetrics(late_input);
+    // DuckDB's profiler copies nonempty per-worker maps in flush order.
+    // Reversing that order must never replace final totals with an early map.
+    for (bool reverse : {false, true}) {
+        duckdb::OperatorMetrics merged;
+        const auto flush = [&](const duckdb::OperatorMetrics &worker) {
+            if (!worker.GetExtraInfo().empty()) {
+                merged.SetExtraInfo(worker.GetExtraInfo());
+            }
+        };
+        flush(reverse ? late : early);
+        flush(reverse ? early : late);
+        const auto &info = merged.GetExtraInfo();
+        const auto rows = info.find("Oracle rows returned");
+        CHECK(rows != info.end() && rows->second == "20");
+        const auto function = info.find("Function");
+        CHECK(function != info.end() && function->second == "ORACLE_ATTACHED_SCAN");
+    }
 }
 
 void TestCallableArgumentsOfTheNewTypes() {
@@ -6424,6 +6469,7 @@ int main() {
     TestHeavyColumnsAreReadAfterTheFilter();
     TestAttachedScanReadsInRowidRanges();
     TestParallelTopNRanksCandidatesAtOneSnapshot();
+    TestParallelMetricSnapshotsSurviveReverseFlushOrder();
     TestTextComparesByTheSessionCollation();
     TestLargeScalarFetchKeepsRowsAndLocalFilters();
     TestNestedOracleJoinsAndAggregates();

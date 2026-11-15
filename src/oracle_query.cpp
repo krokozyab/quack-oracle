@@ -3240,11 +3240,28 @@ void OracleQueryMetrics(TableFunctionGetMetricsInput &input) {
 	if (!input.global_state) {
 		return;
 	}
-	const auto *state = dynamic_cast<const OracleQueryGlobalState *>(input.global_state.get());
+	auto *state = dynamic_cast<OracleQueryGlobalState *>(input.global_state.get());
 	if (!state) {
 		return;
 	}
 	auto &metrics = input.operator_metrics;
+    if (state->parallel) {
+        // DuckDB flushes nonempty per-worker extra_info maps in arbitrary
+        // order. An early snapshot of shared counters must not overwrite the
+        // final one. Keep the scan's parameters, but publish global totals only
+        // once every range has finished all its fetches and conversions.
+        std::lock_guard<std::mutex> guard(state->profile_lock);
+        if (state->profile_info.empty()) {
+            state->profile_info = metrics.GetExtraInfo();
+        }
+        if (state->metrics.chunks_completed.load() < state->chunk_sql.size()) {
+            metrics.SetExtraInfo({});
+            return;
+        }
+        if (metrics.GetExtraInfo().empty()) {
+            metrics.SetExtraInfo(state->profile_info);
+        }
+    }
 	const auto &counters = state->metrics;
 	const auto seconds = [](uint64_t nanoseconds) {
 		char text[32];
@@ -3578,6 +3595,7 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
         if (local && exhausted) {
             local->cursor->Close();
             local->cursor.reset();
+            state.metrics.chunks_completed++;
         }
         if (state.local_filter && row_count != 0) {
             // The filters Oracle was not sent. A chunk they empty is not the end of
