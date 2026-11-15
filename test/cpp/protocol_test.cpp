@@ -693,6 +693,38 @@ static void TestStatementChannelJoinsFragmentedResponse() {
     CHECK(DecodeOracleNumber(*decoded.rows[0][0]) == "7");
 }
 
+static void TestSinkValueFailureDoesNotRequestAnotherFragment() {
+    struct TruncatedValueSink final : OracleRowSink {
+        void WriteRow(size_t, const std::vector<std::optional<OracleByteView>> &) override {
+            throw ProtocolError(ProtocolErrorKind::TRUNCATED, "synthetic scalar conversion error");
+        }
+    } sink;
+    ByteWriter response;
+    response.WriteByte(TTC_MESSAGE_ROW_DATA).WriteLengthPrefixed(EncodeOracleNumber("7")).WriteByte(29);
+    std::vector<uint8_t> inbound;
+    for (const auto &packet : EncodeTnsDataPackets(response.Data(), true, 512, 0)) {
+        inbound.insert(inbound.end(), packet.begin(), packet.end());
+    }
+    FragmentedStream stream(inbound, 7);
+    TnsPacketStream packets(stream, true, 512);
+    TtcChannel channel(packets, 512, 1U << 20U);
+    OracleStatementRegistry statements;
+    TtcStatementChannel statement_channel(channel, statements);
+    const auto handle = statements.Open(OracleSqlKind::QUERY);
+    statements.BindRemoteCursor(handle, 42);
+    statements.MarkExecuted(handle, true);
+    statements.BeginFetch(handle);
+    bool caught = false;
+    try {
+        statement_channel.ReceiveDecodedFetchResponse(handle, {OracleColumn {"N", 2}}, 6, std::nullopt, false, 1,
+                                                      &sink);
+    } catch (const TtcRowSinkError &error) {
+        caught = true;
+        ExpectError(ProtocolErrorKind::TRUNCATED, [&] { error.Rethrow(); });
+    }
+    CHECK(caught && statements.State(handle) == OracleStatementState::POISONED);
+}
+
 static void TestStatementChannelJoinsFragmentedExecuteResponse() {
     ByteWriter describe;
     describe.WriteByte(16).WriteLengthPrefixed(std::nullopt).WriteUB4(0).WriteUB4(1).WriteByte(0);
@@ -1398,6 +1430,150 @@ static void TestExactScaledNumberCodec() {
     CHECK(!TryDecodeOracleScaledInteger(OracleByteView(one),0,0));
     CHECK(!TryDecodeOracleScaledInteger(OracleByteView(one),39,0));
     CHECK(!TryDecodeOracleScaledInteger(OracleByteView(one),4,5));
+}
+
+class RecordingRowSink final : public OracleRowSink {
+public:
+    void WriteRow(size_t row, const std::vector<std::optional<OracleByteView>> &values) override {
+        CHECK(row == rows.size());
+        TtcRowData owned(values.size());
+        for (size_t i = 0; i < values.size(); i++) {
+            if (values[i]) {
+                owned[i].emplace(values[i]->begin(), values[i]->end());
+            }
+        }
+        rows.push_back(std::move(owned));
+    }
+    std::vector<TtcRowData> rows;
+};
+
+static void TestDirectScalarRowsMatchLegacyAcrossFragments() {
+    const std::vector<OracleColumn> columns {{"N", 2}, {"V", 1}, {"Z", 1}};
+    ByteWriter response;
+    response.WriteByte(TTC_MESSAGE_ROW_DATA)
+        .WriteLengthPrefixed(EncodeOracleNumber("123"))
+        .WriteLengthPrefixed(std::vector<uint8_t>(800, 'x'))
+        .WriteLengthPrefixed(std::nullopt);
+    response.WriteByte(21)
+        .WriteUInt16LE(1)
+        .WriteByte(1)
+        .WriteByte(TTC_MESSAGE_ROW_DATA)
+        .WriteLengthPrefixed(EncodeOracleNumber("-456"));
+    response.WriteByte(21)
+        .WriteUInt16LE(1)
+        .WriteByte(2)
+        .WriteByte(TTC_MESSAGE_ROW_DATA)
+        .WriteLengthPrefixed(std::vector<uint8_t>(600, 'y'));
+    response.WriteByte(21)
+        .WriteUInt16LE(2)
+        .WriteByte(5)
+        .WriteByte(TTC_MESSAGE_ROW_DATA)
+        .WriteLengthPrefixed(std::nullopt)
+        .WriteLengthPrefixed(std::vector<uint8_t> {'z'});
+    response.WriteByte(21).WriteUInt16LE(1).WriteByte(4).WriteByte(TTC_MESSAGE_ROW_DATA).WriteByte(254).WriteUB4(0);
+    response.WriteByte(21)
+        .WriteUInt16LE(1)
+        .WriteByte(4)
+        .WriteByte(TTC_MESSAGE_ROW_DATA)
+        .WriteLengthPrefixed(std::nullopt)
+        .WriteByte(29);
+    const auto expected = DecodeTtcFetchResponse(response.Data(), columns, 6);
+    for (size_t fragment : {size_t(1), size_t(2), size_t(7), size_t(71), size_t(8192)}) {
+        RecordingRowSink sink;
+        TtcFetchResponseDecoder decoder(columns, 6, std::nullopt, false, 6, &sink);
+        for (size_t end = fragment;; end += fragment) {
+            const auto length = (std::min)(end, response.Data().size());
+            try {
+                decoder.Decode(std::vector<uint8_t>(response.Data().begin(), response.Data().begin() + length));
+            } catch (const ProtocolError &error) {
+                CHECK(error.Kind() == ProtocolErrorKind::TRUNCATED);
+            }
+            if (length == response.Data().size()) {
+                break;
+            }
+        }
+        // All input temporaries above have died before Take.
+        auto result = decoder.Take();
+        if (sink.rows != expected.rows || result.last_row != expected.last_row) {
+            std::cerr << "direct fragment=" << fragment << " rows=" << sink.rows.size()
+                      << " expected=" << expected.rows.size() << " last=" << (result.last_row == expected.last_row)
+                      << std::endl;
+            for (size_t i = 0; i < (std::min)(sink.rows.size(), expected.rows.size()); i++) {
+                for (size_t j = 0; j < columns.size(); j++) {
+                    if (sink.rows[i][j] != expected.rows[i][j]) {
+                        std::cerr << "mismatch row=" << i << " col=" << j
+                                  << " actual=" << (sink.rows[i][j] ? std::to_string(sink.rows[i][j]->size()) : "NULL")
+                                  << " expected="
+                                  << (expected.rows[i][j] ? std::to_string(expected.rows[i][j]->size()) : "NULL")
+                                  << std::endl;
+                    }
+                }
+            }
+        }
+        CHECK(sink.rows == expected.rows && result.last_row == expected.last_row);
+        CHECK(result.direct_rows == 6 && result.rows.empty() && !result.packed);
+        ByteWriter next;
+        next.WriteByte(21).WriteUInt16LE(0).WriteByte(0).WriteByte(TTC_MESSAGE_ROW_DATA).WriteByte(29);
+        RecordingRowSink following;
+        TtcFetchResponseDecoder seeded(columns, 6, result.last_row, false, 1, &following);
+        result.last_row.reset();
+        CHECK(seeded.Decode(next.Data()));
+        CHECK(following.rows.size() == 1 && following.rows[0] == expected.rows.back());
+    }
+    RecordingRowSink limited;
+    TtcFetchResponseDecoder decoder(columns, 6, std::nullopt, false, 1, &limited);
+    ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [&] { decoder.Decode(response.Data()); });
+    CHECK(limited.rows.size() == 1);
+    // Header selection of no changed columns repeats the last row too.
+    ByteWriter header;
+    header.WriteByte(6)
+        .WriteByte(0)
+        .WriteUB2(0)
+        .WriteUB4(0)
+        .WriteUB4(0)
+        .WriteUB2(0)
+        .WriteUB4(1)
+        .WriteLengthPrefixed(std::vector<uint8_t> {0})
+        .WriteUB4(0)
+        .WriteByte(TTC_MESSAGE_ROW_DATA)
+        .WriteByte(29);
+    RecordingRowSink repeated;
+    TtcFetchResponseDecoder selected(columns, 6, expected.last_row, false, 1, &repeated);
+    CHECK(selected.Decode(header.Data()));
+    CHECK(repeated.rows.size() == 1 && repeated.rows[0] == expected.rows.back());
+    RecordingRowSink oversized;
+    const std::vector<OracleColumn> scalar {{"V", 1}};
+    ByteWriter too_large;
+    too_large.WriteByte(TTC_MESSAGE_ROW_DATA).WriteByte(254).WriteUB4((16U << 20U) + 1);
+    TtcFetchResponseDecoder bounded(scalar, 6, std::nullopt, false, 1, &oversized);
+    ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [&] { bounded.Decode(too_large.Data()); });
+    CHECK(oversized.rows.empty());
+    auto omitted = columns;
+    omitted[0].omitted_from_row_data = true;
+    ByteWriter full;
+    full.WriteByte(TTC_MESSAGE_ROW_DATA)
+        .WriteLengthPrefixed(std::vector<uint8_t> {'a'})
+        .WriteLengthPrefixed(std::nullopt)
+        .WriteByte(29);
+    RecordingRowSink absent;
+    const TtcRowData seed {EncodeOracleNumber("1"), std::vector<uint8_t> {'b'}, std::nullopt};
+    TtcFetchResponseDecoder missing(omitted, 6, seed, false, 1, &absent);
+    CHECK(missing.Decode(full.Data()));
+    CHECK(absent.rows == DecodeTtcFetchResponse(full.Data(), omitted, 6, seed).rows);
+    class FailingSink final : public OracleRowSink {
+        void WriteRow(size_t, const std::vector<std::optional<OracleByteView>> &) override {
+            throw ProtocolError(ProtocolErrorKind::TRUNCATED, "synthetic scalar failure");
+        }
+    } failing;
+    TtcFetchResponseDecoder failed(columns, 6, std::nullopt, false, 6, &failing);
+    bool wrapped = false;
+    try {
+        failed.Decode(response.Data());
+    } catch (const TtcRowSinkError &error) {
+        wrapped = true;
+        ExpectError(ProtocolErrorKind::TRUNCATED, [&] { error.Rethrow(); });
+    }
+    CHECK(wrapped);
 }
 
 static void TestFetchRejectsRowsBeyondRequest() {
@@ -8921,6 +9097,7 @@ int main() {
     TestTtcChannel();
     TestTtcChannelShortPacketBoundary();
     TestStatementChannelJoinsFragmentedResponse();
+    TestSinkValueFailureDoesNotRequestAnotherFragment();
     TestStatementChannelJoinsFragmentedExecuteResponse();
     TestTtcCancellation();
     TestTtcErrorDiagnostics();
@@ -8960,6 +9137,7 @@ int main() {
     TestTtcErrorNamesTheFailingIteration();
     TestTtcErrorCarriesADmlRowId();
     TestTtcRowDataCodec();
+    TestDirectScalarRowsMatchLegacyAcrossFragments();
     TestFetchRejectsRowsBeyondRequest();
     TestPackedFetchFallsBackWhenDescriptorsExceedBudget();
     TestPackedSeedFallsBackWhenLogicalRowExceedsBudget();

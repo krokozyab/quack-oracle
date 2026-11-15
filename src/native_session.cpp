@@ -189,7 +189,38 @@ public:
     OracleBatch FetchPacked(size_t requested_rows) override {
         return FetchInternal(requested_rows, true);
     }
-    OracleBatch FetchInternal(size_t requested_rows, bool packed_requested) {
+    bool FetchInto(size_t requested_rows, OracleRowSink &sink, OracleFetchResult &result) override {
+        for (const auto &column : columns) {
+            if (TtcFramingForType(column.oracle_type) != TtcColumnFraming::SCALAR || column.xml) {
+                return false;
+            }
+            switch (column.oracle_type) {
+            case 2:
+            case 12:
+            case 100:
+            case 101:
+            case 180:
+            case 252:
+                break;
+            case 1:
+            case 23:
+            case 96:
+                // Broad/unknown text retains the established bounded packed path.
+                if (!column.byte_width || column.byte_width > 253) {
+                    return false;
+                }
+                break;
+            default:
+                return false;
+            }
+        }
+        size_t written = 0;
+        auto batch = FetchInternal(requested_rows, false, &sink, &written);
+        result = {written, batch.exhausted};
+        return true;
+    }
+    OracleBatch FetchInternal(size_t requested_rows, bool packed_requested, OracleRowSink *sink = nullptr,
+                              size_t *written = nullptr) {
         if (closed || !lifetime->open || requested_rows == 0) {
             throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "Oracle cursor is closed or fetch size is zero");
         }
@@ -208,11 +239,24 @@ public:
         // Initial execute rows always retain the old locator representation.
         // Resolve them before DEFINE, separately from prefetched rows.
         ResolveLobs(result,false);
-        if (result.rows.size() < requested_rows && !exhausted) {
+        const auto initial_rows = result.rows.size();
+        if (sink) {
+            std::vector<std::optional<OracleByteView>> views(columns.size());
+            for (size_t row = 0; row < initial_rows; row++) {
+                for (size_t i = 0; i < columns.size(); i++) {
+                    views[i] = result.rows[row][i] ? std::optional<OracleByteView>(OracleByteView(*result.rows[row][i]))
+                                                   : std::nullopt;
+                }
+                sink->WriteRow(row, views);
+            }
+            *written = initial_rows;
+            result.rows.clear();
+        }
+        if (initial_rows < requested_rows && !exhausted) {
             // The fetch and the response that answers it are one call, and a
             // shared session may have another pipeline waiting to make its own.
             const auto call = channel.LockCall();
-            const auto desired=requested_rows-result.rows.size();
+            const auto desired = requested_rows - initial_rows;
             const auto count=prefetch_eligible ? BoundedLobPrefetchRows(columns,desired,prefetch_limits) :
                 inline_eligible ? InlineLobRows(columns,desired) :
                 static_cast<uint32_t>((std::min)(desired,size_t((std::numeric_limits<uint32_t>::max)())));
@@ -237,10 +281,24 @@ public:
             for (const auto &column : columns) {
                 packed_scalars &= TtcFramingForType(column.oracle_type) == TtcColumnFraming::SCALAR;
             }
+            class OffsetSink final : public OracleRowSink {
+            public:
+                OffsetSink(OracleRowSink *target, size_t offset) : target(target), offset(offset) {
+                }
+                void WriteRow(size_t row, const std::vector<std::optional<OracleByteView>> &values) override {
+                    target->WriteRow(row + offset, values);
+                }
+                OracleRowSink *target;
+                size_t offset;
+            } offset_sink(sink, initial_rows);
             auto response = prefetch_active ? channel.ReceiveDecodedLobPrefetchFetchResponse(
                                                   handle, columns, response_limits, server_field_version, previous_row)
                                             : channel.ReceiveDecodedFetchResponse(handle, columns, server_field_version,
-                                                                                  previous_row, packed_scalars, count);
+                                                                                  previous_row, packed_scalars, count,
+                                                                                  sink ? &offset_sink : nullptr);
+            if (sink) {
+                *written += response.direct_rows;
+            }
             previous_row = std::move(response.last_row);
             exhausted = response.exhausted;
             result.packed = std::move(response.packed);
@@ -253,6 +311,17 @@ public:
         result.exhausted = exhausted && pending.empty();
         lifetime->fetch_cancellation.CompleteFetch();
         return result;
+        } catch (const TtcRowSinkError &error) {
+            lifetime->exchange_failed = true;
+            try {
+                error.Rethrow();
+            } catch (const ProtocolError &cause) {
+                lifetime->fetch_cancellation.ObserveError(cause);
+                throw;
+            } catch (...) {
+                lifetime->fetch_cancellation.ObserveUnknownError();
+                throw;
+            }
         } catch (const ProtocolError &error) {
             lifetime->exchange_failed = true;
             lifetime->fetch_cancellation.ObserveError(error);

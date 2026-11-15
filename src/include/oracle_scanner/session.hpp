@@ -119,6 +119,19 @@ struct OracleBind {
     uint8_t lob_content = 0;
 };
 
+// Values are borrowed only during WriteRow. A sink must consume/copy them
+// before returning and must not publish a partially received fetch on error.
+class OracleRowSink {
+public:
+    virtual ~OracleRowSink() = default;
+    virtual void WriteRow(size_t row, const std::vector<std::optional<OracleByteView>> &values) = 0;
+};
+
+struct OracleFetchResult {
+    size_t rows = 0;
+    bool exhausted = false;
+};
+
 class OracleCursor {
 public:
     virtual ~OracleCursor() = default;
@@ -127,6 +140,10 @@ public:
     // Optional zero-per-cell-allocation scalar path; legacy consumers keep Fetch.
     virtual OracleBatch FetchPacked(size_t requested_rows) {
         return Fetch(requested_rows);
+    }
+    // false means unsupported, with no cursor/sink mutation or remote fetch.
+    virtual bool FetchInto(size_t, OracleRowSink &, OracleFetchResult &) {
+        return false;
     }
     virtual void Cancel() = 0;
     virtual void Close() = 0;

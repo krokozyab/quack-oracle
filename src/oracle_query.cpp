@@ -2821,6 +2821,76 @@ unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context,
     return std::move(state);
 }
 
+// Own typed vectors until every output slice has been consumed. The native
+// decoder lends one row's byte views only during WriteRow; no view is retained.
+class OracleTypedSink final : public oracle_scanner::OracleRowSink {
+public:
+    OracleTypedSink(ClientContext &context, const std::vector<OracleColumn> &columns,
+                    const std::vector<LogicalType> &types, std::vector<std::shared_ptr<DataChunk>> &chunks,
+                    size_t maximum_rows)
+        : context(context), columns(columns), types(types.begin(), types.end()), chunks(chunks),
+          maximum_rows(maximum_rows) {
+        chunks.clear();
+        for (const auto &type : types) {
+            chunk_bytes += STANDARD_VECTOR_SIZE * GetTypeIdSize(type.InternalType()) + 4096;
+        }
+    }
+    void WriteRow(size_t row, const std::vector<std::optional<oracle_scanner::OracleByteView>> &values) override {
+        if (row != rows || row >= maximum_rows || values.size() != columns.size()) {
+            throw IOException("Oracle direct row disagrees with the requested shape");
+        }
+        const auto index = row / STANDARD_VECTOR_SIZE;
+        if (index == chunks.size()) {
+            ConsumeBudget(chunk_bytes);
+            auto chunk = std::make_shared<DataChunk>();
+            chunk->Initialize(context, types);
+            chunks.push_back(std::move(chunk));
+        }
+        auto &chunk = *chunks[index];
+        for (idx_t column = 0; column < values.size(); column++) {
+            if (values[column]) {
+                // Conservative allowance for transcoding and string heap slack.
+                if (values[column]->size() > (64U << 20U) / 4) {
+                    throw IOException("Oracle direct scalar value exceeds memory budget");
+                }
+                ConsumeBudget(values[column]->size() * 4);
+            }
+            WriteOracleValueView(chunk.data[column], row % STANDARD_VECTOR_SIZE, columns[column], values[column]);
+        }
+        rows++;
+    }
+    void Finish(size_t count) {
+        if (count != rows) {
+            throw IOException("Oracle direct row count disagrees with sink");
+        }
+        for (size_t i = 0; i < chunks.size(); i++) {
+            chunks[i]->SetChildCardinality(MinValue<size_t>(STANDARD_VECTOR_SIZE, count - i * STANDARD_VECTOR_SIZE));
+        }
+    }
+
+private:
+    void ConsumeBudget(size_t count) {
+        if (count > (64U << 20U) - retained_bytes) {
+            throw IOException("Oracle direct scalar batch exceeds memory budget");
+        }
+        retained_bytes += count;
+    }
+    ClientContext &context;
+    const std::vector<OracleColumn> &columns;
+    vector<LogicalType> types;
+    std::vector<std::shared_ptr<DataChunk>> &chunks;
+    size_t maximum_rows;
+    size_t rows = 0;
+    size_t retained_bytes = 0;
+    size_t chunk_bytes = 0;
+};
+
+static bool OracleDirectScanEnabled(ClientContext &context, const OracleQueryBindData &bind) {
+    Value value;
+    return bind.deferred_scan && !bind.for_update &&
+           (!context.TryGetCurrentSetting("oracle_direct_scan", value) || value.IsNull() || BooleanValue::Get(value));
+}
+
 static size_t OracleScanFetchRows(ClientContext &context, const OracleQueryBindData &bind) {
     if (!bind.deferred_scan || bind.for_update || bind.limit_rows || !bind.top_n.empty() ||
         !bind.sample_clause.empty()) {
@@ -3018,6 +3088,7 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
         state->local_filter = std::move(local_filter);
         state->metrics.Add(described.io);
         state->fetch_rows = OracleScanFetchRows(context, bind);
+        state->direct_scalar = OracleDirectScanEnabled(context, bind);
         state->parallel = true;
         state->thread_count = MinValue<idx_t>(sessions, chunks.size());
         state->chunk_sql = std::move(chunks);
@@ -3107,6 +3178,7 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
     state->local_filter = std::move(local_filter);
     state->deferred = std::move(deferred);
     state->fetch_rows = state->deferred ? STANDARD_VECTOR_SIZE : OracleScanFetchRows(context, bind);
+    state->direct_scalar = !state->deferred && OracleDirectScanEnabled(context, bind);
     state->sent_sql = opened.sql;
     state->local_filter_text = state->local_filter ? state->local_filter->ToString() : std::string();
     state->metrics.Add(opened.io);
@@ -3148,8 +3220,11 @@ void OracleQueryMetrics(TableFunctionGetMetricsInput &input) {
 	                                           StringUtil::BytesToHumanReadableString(counters.bytes_sent.load()) +
 	                                           " sent, " + std::to_string(counters.round_trips.load()) + " round trips");
 	metrics.AddExtraInfo("Oracle fetch time", seconds(counters.fetch_nanoseconds.load()));
-	metrics.AddExtraInfo("Value conversion time", seconds(counters.convert_nanoseconds.load()));
-	if (state->deferred) {
+    metrics.AddExtraInfo("Value conversion time", counters.direct_batches.load()
+                                                      ? "included in fetch for direct batches"
+                                                      : seconds(counters.convert_nanoseconds.load()));
+    metrics.AddExtraInfo("Oracle direct scalar batches", std::to_string(counters.direct_batches.load()));
+    if (state->deferred) {
 		metrics.AddExtraInfo("Columns read after the filter", std::to_string(state->deferred->heavy_columns.size()) +
 		                                                         ", for " + std::to_string(counters.deferred_rows.load()) +
 		                                                         " rows");
@@ -3319,8 +3394,41 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
         const auto fetch_started = clock_now();
         auto &batch = local ? local->buffered : state.buffered;
         auto &position = local ? local->buffer_position : state.buffer_position;
-        if (position == batch.RowCount()) {
+        auto &typed_chunks = local ? local->typed_chunks : state.typed_chunks;
+        auto &typed_rows = local ? local->typed_rows : state.typed_rows;
+        if (position == (typed_chunks.empty() ? batch.RowCount() : typed_rows)) {
+            typed_chunks.clear();
+            typed_rows = 0;
             batch = TranslatingOracleErrors("oracle_query could not fetch from Oracle", [&] {
+                if (state.direct_scalar && state.chunk_columns == state.columns.size()) {
+                    try {
+                        OracleTypedSink sink(context, state.columns, state.types, typed_chunks, state.fetch_rows);
+                        oracle_scanner::OracleFetchResult result;
+                        auto &cursor = local ? local->cursor : state.cursor;
+                        if (cursor->FetchInto(state.fetch_rows, sink, result)) {
+                            sink.Finish(result.rows);
+                            typed_rows = result.rows;
+                            state.metrics.direct_batches++;
+                            oracle_scanner::OracleBatch direct;
+                            direct.exhausted = result.exhausted;
+                            return direct;
+                        }
+                    } catch (...) {
+                        if (local) {
+                            local->session.Poison();
+                        } else {
+                            if (interrupt) {
+                                interrupt->Stop();
+                            }
+                            state.session.Poison();
+                            if (!state.catalog_name.empty()) {
+                                state.cursor.reset();
+                                PoisonTransactionSession(context, state.catalog_name);
+                            }
+                        }
+                        throw;
+                    }
+                }
                 if (local) {
                     try {
                         return local->cursor->FetchPacked(state.fetch_rows);
@@ -3347,13 +3455,14 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
                 }
             });
             state.metrics.fetch_nanoseconds += elapsed(fetch_started);
-            state.metrics.rows_fetched += batch.RowCount();
+            state.metrics.rows_fetched += typed_chunks.empty() ? batch.RowCount() : typed_rows;
             position = 0;
         }
         const auto row_start = position;
-        const auto row_count = MinValue<size_t>(STANDARD_VECTOR_SIZE, batch.RowCount() - position);
+        const auto available = typed_chunks.empty() ? batch.RowCount() : typed_rows;
+        const auto row_count = MinValue<size_t>(STANDARD_VECTOR_SIZE, available - position);
         position += row_count;
-        const bool exhausted = batch.exhausted && position == batch.RowCount();
+        const bool exhausted = batch.exhausted && position == available;
         if (local) {
             const auto io_now = local->session->IoStats();
             state.metrics.Add(io_now - local->last_io);
@@ -3372,25 +3481,31 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
         if (output.ColumnCount() != state.chunk_columns) {
             throw InternalException("oracle_query output chunk does not match its describe metadata");
         }
-        for (idx_t row_index = 0; row_index < row_count; row_index++) {
-            const auto width = batch.packed ? batch.packed->ColumnCount() : batch.rows[row_start + row_index].size();
-            if (width != state.columns.size()) {
-                throw InternalException("oracle_query row has a different column count from its describe metadata");
-            }
-            // A deferred scan fetches only the light columns, then the ROWID.
-            const auto written = state.deferred ? state.deferred->light_vectors.size() : state.chunk_columns;
-            for (idx_t column_index = 0; column_index < written; column_index++) {
-                const auto vector_index = state.deferred ? state.deferred->light_vectors[column_index] : column_index;
-                TranslatingOracleErrors("oracle_query could not convert an Oracle value", [&] {
-                    if (batch.packed) {
-                        WriteOracleValueView(output.data[vector_index], row_index, state.columns[column_index],
-                                             batch.packed->Get(row_start + row_index, column_index));
-                    } else {
-                        WriteOracleValue(output.data[vector_index], row_index, state.columns[column_index],
-                                         batch.rows[row_start + row_index][column_index]);
-                    }
-                    return true;
-                });
+        if (!typed_chunks.empty()) {
+            output.Reference(*typed_chunks[row_start / STANDARD_VECTOR_SIZE]);
+        } else {
+            for (idx_t row_index = 0; row_index < row_count; row_index++) {
+                const auto width =
+                    batch.packed ? batch.packed->ColumnCount() : batch.rows[row_start + row_index].size();
+                if (width != state.columns.size()) {
+                    throw InternalException("oracle_query row has a different column count from its describe metadata");
+                }
+                // A deferred scan fetches only the light columns, then the ROWID.
+                const auto written = state.deferred ? state.deferred->light_vectors.size() : state.chunk_columns;
+                for (idx_t column_index = 0; column_index < written; column_index++) {
+                    const auto vector_index =
+                        state.deferred ? state.deferred->light_vectors[column_index] : column_index;
+                    TranslatingOracleErrors("oracle_query could not convert an Oracle value", [&] {
+                        if (batch.packed) {
+                            WriteOracleValueView(output.data[vector_index], row_index, state.columns[column_index],
+                                                 batch.packed->Get(row_start + row_index, column_index));
+                        } else {
+                            WriteOracleValue(output.data[vector_index], row_index, state.columns[column_index],
+                                             batch.rows[row_start + row_index][column_index]);
+                        }
+                        return true;
+                    });
+                }
             }
         }
         // SetChildCardinality, not SetCardinality. In DuckDB 2.0 every vector

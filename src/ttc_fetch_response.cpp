@@ -5,7 +5,9 @@
 #include "oracle_scanner/ttc_piggyback.hpp"
 #include "oracle_scanner/ttc_parameter.hpp"
 
+#include <algorithm>
 #include <string>
+#include <utility>
 
 namespace oracle_scanner {
 
@@ -77,7 +79,8 @@ struct TtcRowContinuationPrefix {
     size_t bytes_consumed = 0;
 };
 
-TtcRowContinuationPrefix DecodeRowContinuationPrefix(const uint8_t *data, size_t size, size_t column_count) {
+TtcRowContinuationPrefix DecodeRowContinuationPrefix(const uint8_t *data, size_t size, size_t column_count,
+                                                     std::vector<size_t> *reuse = nullptr) {
     ByteReader reader(data, size);
     if (reader.ReadByte() != TTC_MESSAGE_ROW_CONTINUATION) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "expected TTC row continuation marker");
@@ -97,6 +100,10 @@ TtcRowContinuationPrefix DecodeRowContinuationPrefix(const uint8_t *data, size_t
         source.Skip(bitmap_size);
         const auto *bitmap = data + bitmap_at;
         std::vector<size_t> present_columns;
+        if (reuse) {
+            present_columns.swap(*reuse);
+            present_columns.clear();
+        }
         present_columns.reserve(present_count);
         for (size_t column = 0; column < column_count; column++) {
             if ((bitmap[column / 8U] & static_cast<uint8_t>(1U << (column % 8U))) != 0) {
@@ -104,21 +111,24 @@ TtcRowContinuationPrefix DecodeRowContinuationPrefix(const uint8_t *data, size_t
             }
         }
         if (present_columns.size() != present_count) {
+            if (reuse) {
+                present_columns.swap(*reuse);
+            }
             return std::nullopt;
         }
         return TtcRowContinuationPrefix {std::move(present_columns), source.Position()};
     };
 
     const auto little_endian_count = reader.ReadUInt16LE();
-    if (const auto decoded = decode(reader, little_endian_count)) {
-        return *decoded;
+    if (auto decoded = decode(reader, little_endian_count)) {
+        return std::move(*decoded);
     }
 
     ByteReader universal_reader(data, size);
     universal_reader.ReadByte();
     const auto universal_count = universal_reader.ReadUB2();
-    if (const auto decoded = decode(universal_reader, universal_count)) {
-        return *decoded;
+    if (auto decoded = decode(universal_reader, universal_count)) {
+        return std::move(*decoded);
     }
     throw ProtocolError(ProtocolErrorKind::MALFORMED,
                         "TTC row continuation count and bitmap disagree with " + std::to_string(column_count) +
@@ -268,14 +278,44 @@ size_t DecodePackedRow(const uint8_t *data, size_t size, const std::vector<size_
 TtcFetchResponseDecoder::TtcFetchResponseDecoder(const std::vector<OracleColumn> &columns_p,
                                                  uint8_t ttc_field_version_p,
                                                  const std::optional<TtcRowData> &preceding_row_p, bool packed_scalars,
-                                                 size_t reserve_rows)
-    : columns(columns_p), ttc_field_version(ttc_field_version_p), maximum_rows(reserve_rows ? reserve_rows : 65536),
-      preceding_row(preceding_row_p) {
+                                                 size_t reserve_rows, OracleRowSink *sink_p)
+    : sink(sink_p), columns(columns_p), ttc_field_version(ttc_field_version_p),
+      maximum_rows(reserve_rows ? reserve_rows : 65536), preceding_row(sink_p ? std::nullopt : preceding_row_p) {
     if (columns.empty() || columns.size() > 4096) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC fetch response has an invalid cursor column count");
     }
     row_columns = WireCarryingColumns(columns, std::nullopt);
     row_framing = ColumnFraming(columns, row_columns);
+    if (sink) {
+        for (const auto framing : row_framing) {
+            if (framing != TtcColumnFraming::SCALAR) {
+                throw ProtocolError(ProtocolErrorKind::UNSUPPORTED, "direct fetch requires scalar framing");
+            }
+        }
+        locations.resize(columns.size());
+        chunked_cells.resize(columns.size());
+        direct_views.resize(columns.size());
+        if (preceding_row_p) {
+            if (preceding_row_p->size() != columns.size()) {
+                throw ProtocolError(ProtocolErrorKind::MALFORMED, "direct preceding row disagrees with cursor columns");
+            }
+            size_t bytes = 0;
+            for (size_t i = 0; i < columns.size(); i++) {
+                if ((*preceding_row_p)[i]) {
+                    const auto size = (*preceding_row_p)[i]->size();
+                    if (size > (64U << 20U) - bytes) {
+                        throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED,
+                                            "direct preceding row exceeds memory limit");
+                    }
+                    bytes += size;
+                    locations[i] = {CellLocation::SEED, 0, size};
+                }
+            }
+            preceding_row = preceding_row_p;
+            direct_previous = true;
+        }
+        return;
+    }
     if (packed_scalars) {
         for (const auto framing : row_framing) {
             if (framing != TtcColumnFraming::SCALAR) {
@@ -339,7 +379,98 @@ bool TtcFetchResponseDecoder::Decode(const std::vector<uint8_t> &message) {
     }
 }
 
+void TtcFetchResponseDecoder::RefreshDirectViews() {
+    for (size_t i = 0; i < locations.size(); i++) {
+        const auto &cell = locations[i];
+        switch (cell.kind) {
+        case CellLocation::NULL_CELL:
+            direct_views[i].reset();
+            break;
+        case CellLocation::MESSAGE:
+            direct_views[i] = OracleByteView(direct_message->data() + cell.offset, cell.size);
+            break;
+        case CellLocation::SEED:
+            direct_views[i] = OracleByteView(*(*preceding_row)[i]);
+            break;
+        case CellLocation::CHUNKED:
+            direct_views[i] = OracleByteView(chunked_cells[i]);
+            break;
+        }
+    }
+}
+
+size_t TtcFetchResponseDecoder::DecodeDirectRow(const std::vector<uint8_t> &message, size_t offset,
+                                                const std::vector<size_t> &selected, bool continued) {
+    if (continued && !direct_previous) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "direct row continuation appeared before a complete row");
+    }
+    ByteReader reader(message.data() + offset, message.size() - offset);
+    if (reader.ReadByte() != TTC_MESSAGE_ROW_DATA) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "expected direct ROW_DATA after row continuation");
+    }
+    if (!continued) {
+        for (size_t i = 0; i < columns.size(); i++) {
+            if (columns[i].omitted_from_row_data) {
+                locations[i] = {};
+            }
+        }
+    }
+    // A partial cell updates its location only after its complete bytes arrive.
+    // Retrying the same immutable prefix overwrites changed cells; unselected
+    // cells continue to name their last complete value.
+    for (const auto column : selected) {
+        const auto first = reader.ReadByte();
+        if (!first || first == TNS_NULL_LENGTH_INDICATOR) {
+            locations[column] = {};
+        } else if (first != TNS_LONG_LENGTH_INDICATOR) {
+            const auto at = offset + reader.Position();
+            reader.Skip(first);
+            locations[column] = {CellLocation::MESSAGE, at, first};
+        } else {
+            auto &bytes = chunked_cells[column];
+            bytes.clear();
+            for (;;) {
+                const auto count = reader.ReadUB4();
+                if (!count) {
+                    break;
+                }
+                if (count > (16U << 20U) - bytes.size()) {
+                    throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED,
+                                        "chunked TTC value exceeds configured limit");
+                }
+                const auto at = offset + reader.Position();
+                reader.Skip(count);
+                const auto required = bytes.size() + count;
+                if (required > bytes.capacity()) {
+                    const auto old = bytes.capacity();
+                    if (required - old > (64U << 20U) - chunked_capacity) {
+                        throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED,
+                                            "direct chunk buffers exceed memory limit");
+                    }
+                    bytes.reserve(required);
+                    chunked_capacity += bytes.capacity() - old;
+                }
+                bytes.insert(bytes.end(), message.data() + at, message.data() + at + count);
+            }
+            locations[column] = bytes.empty() ? CellLocation {} : CellLocation {CellLocation::CHUNKED, 0, bytes.size()};
+        }
+    }
+    direct_message = &message;
+    RefreshDirectViews();
+    try {
+        sink->WriteRow(result.direct_rows, direct_views);
+    } catch (...) {
+        throw TtcRowSinkError(std::current_exception());
+    }
+    result.direct_rows++;
+    direct_previous = true;
+    return reader.Position();
+}
+
 bool TtcFetchResponseDecoder::DecodeInternal(const std::vector<uint8_t> &message) {
+    if (sink) {
+        direct_message = &message;
+    }
     if (message.size() < resume_offset) {
         throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "TTC fetch response is shorter than what was decoded");
     }
@@ -386,7 +517,9 @@ bool TtcFetchResponseDecoder::DecodeInternal(const std::vector<uint8_t> &message
         // Check before decoding/materializing a row, including compressed repeats
         // and the legacy fallback. A packed preceding-row seed is not a reply row.
         if (*at == TTC_MESSAGE_ROW_DATA || *at == TTC_MESSAGE_ROW_CONTINUATION) {
-            const auto rows = result.packed ? result.packed->RowCount() - size_t(packed_seed) : result.rows.size();
+            const auto rows = sink            ? result.direct_rows
+                              : result.packed ? result.packed->RowCount() - size_t(packed_seed)
+                                              : result.rows.size();
             if (rows >= maximum_rows) {
                 throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle fetch response exceeds requested row count");
             }
@@ -405,12 +538,24 @@ bool TtcFetchResponseDecoder::DecodeInternal(const std::vector<uint8_t> &message
             std::vector<TtcColumnFraming> selected_framing;
             if (row_header_present_columns) {
                 selected_columns = WireCarryingColumns(columns, row_header_present_columns);
-                if (!result.packed) {
+                if (!result.packed && !sink) {
                     selected_framing = ColumnFraming(columns, selected_columns);
                 }
             }
             const auto &wire_columns = row_header_present_columns ? selected_columns : row_columns;
             const auto &framing = row_header_present_columns ? selected_framing : row_framing;
+            if (sink) {
+                const bool continued = row_header_present_columns.has_value();
+                offset += DecodeDirectRow(message, offset, wire_columns, continued);
+                if (continued) {
+                    result.used_row_header_selection = true;
+                    row_header_present_columns.reset();
+                }
+                resume_offset = offset;
+                kept_row_header_selection = result.used_row_header_selection;
+                kept_row_continuation = result.used_row_continuation;
+                break;
+            }
             if (result.packed) {
                 const bool continued = row_header_present_columns.has_value();
                 offset += DecodePackedRow(at, remaining, wire_columns, *result.packed, continued);
@@ -449,6 +594,26 @@ bool TtcFetchResponseDecoder::DecodeInternal(const std::vector<uint8_t> &message
             break;
         }
         case TTC_MESSAGE_ROW_CONTINUATION: {
+            if (sink) {
+                auto continuation = DecodeRowContinuationPrefix(at, remaining, columns.size(), &direct_selection);
+                auto &selected = continuation.present_columns;
+                selected.erase(std::remove_if(selected.begin(), selected.end(),
+                                              [&](size_t i) { return columns[i].omitted_from_row_data; }),
+                               selected.end());
+                offset += continuation.bytes_consumed;
+                try {
+                    offset += DecodeDirectRow(message, offset, selected, true);
+                } catch (...) {
+                    direct_selection.swap(selected);
+                    throw;
+                }
+                direct_selection.swap(selected);
+                result.used_row_continuation = true;
+                resume_offset = offset;
+                kept_row_header_selection = result.used_row_header_selection;
+                kept_row_continuation = result.used_row_continuation;
+                break;
+            }
             if (result.packed) {
                 const auto continuation = DecodeRowContinuationPrefix(at, remaining, columns.size());
                 const auto selected = WireCarryingColumns(columns, continuation.present_columns);
@@ -528,10 +693,35 @@ bool TtcFetchResponseDecoder::DecodeInternal(const std::vector<uint8_t> &message
         }
     }
     result.bytes_consumed = offset;
+    if (result.completed && sink && direct_previous) {
+        RefreshDirectViews();
+        size_t total = 0;
+        for (const auto &view : direct_views) {
+            if (view) {
+                if (view->size() > (64U << 20U) - total) {
+                    throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "direct last row exceeds memory limit");
+                }
+                total += view->size();
+            }
+        }
+        TtcRowData last(columns.size());
+        for (size_t i = 0; i < columns.size(); i++) {
+            if (direct_views[i]) {
+                last[i].emplace();
+                if (!direct_views[i]->empty()) {
+                    last[i]->assign(direct_views[i]->begin(), direct_views[i]->end());
+                }
+            }
+        }
+        result.last_row = std::move(last);
+    }
     return result.completed;
 }
 
 TtcFetchResponse TtcFetchResponseDecoder::Take() {
+    if (sink) {
+        return std::move(result);
+    }
     if (result.packed) {
         if (result.packed->RowCount()) {
             result.last_row = result.packed->MaterializeRow(result.packed->RowCount() - 1);

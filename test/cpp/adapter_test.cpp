@@ -134,6 +134,8 @@ struct FakeScript {
     bool two_batch_fetch = false;
     bool packed_fetch = false;
     size_t packed_fetches = 0;
+    bool direct_fetch = false;
+    size_t direct_fetches = 0;
     // A parallel scan drives several sessions at once, all of them recording
     // into this one script. Unsynchronised, the recording loses entries and the
     // test that reads them back becomes a coin flip — which is how this was
@@ -360,6 +362,29 @@ public:
             batch.rows.clear();
         }
         return batch;
+    }
+
+    bool FetchInto(size_t count, oracle_scanner::OracleRowSink &sink,
+                   oracle_scanner::OracleFetchResult &result) override {
+        if (!script->direct_fetch || answer->rows.size() > count) {
+            return false;
+        }
+        auto batch = Fetch(count);
+        {
+            std::lock_guard<std::mutex> guard(script->record_lock);
+            script->direct_fetches++;
+        }
+        std::vector<std::optional<oracle_scanner::OracleByteView>> views(batch.columns.size());
+        for (size_t row = 0; row < batch.rows.size(); row++) {
+            for (size_t col = 0; col < views.size(); col++) {
+                views[col] = batch.rows[row][col] ? std::optional<oracle_scanner::OracleByteView>(
+                                                        oracle_scanner::OracleByteView(*batch.rows[row][col]))
+                                                  : std::nullopt;
+            }
+            sink.WriteRow(row, views);
+        }
+        result = {batch.rows.size(), batch.exhausted};
+        return true;
     }
 
     void Cancel() override {
@@ -3362,7 +3387,8 @@ void TestTextComparesByTheSessionCollation() {
 
 // DISTINCT counts need the equality of decoded values to match Oracle.
 void TestLargeScalarFetchKeepsRowsAndLocalFilters() {
-    for (bool packed : {false, true}) {
+    for (int mode : {0, 1, 2}) {
+        const bool packed = mode == 1;
         auto script = std::make_shared<FakeScript>();
         script->routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
         script->routes.push_back({"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("LINKS")}}}});
@@ -3374,6 +3400,7 @@ void TestLargeScalarFetchKeepsRowsAndLocalFilters() {
               {{Text("LINKS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("Y")}}}});
         script->routes.push_back({"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}});
         script->packed_fetch = packed;
+        script->direct_fetch = mode == 2;
         auto &table = script->tables["LINKS"];
         table.columns = {Column("ID", 2, 10, 0)};
         int64_t count = 0, sum = 0;
@@ -3402,6 +3429,21 @@ void TestLargeScalarFetchKeepsRowsAndLocalFilters() {
             CHECK(database.Query("SELECT * FROM o.LINKS;")->HasError());
         }
         CHECK(!database.Query("SELECT 42;")->HasError());
+        CHECK((script->direct_fetches != 0) == (mode == 2));
+        if (mode == 2) {
+            database.Run("SET oracle_fetch_rows=16384;");
+            const auto saved = table.rows[5000][0];
+            table.rows[5000][0] = std::vector<uint8_t> {193};
+            auto failed = database.Query("CREATE TEMP TABLE broken_direct AS SELECT * FROM o.LINKS;");
+            CHECK(failed->HasError());
+            table.rows[5000][0] = saved;
+            auto recovered = database.Query("SELECT count(*) FROM o.LINKS;");
+            CHECK(!recovered->HasError() && recovered->GetValue(0, 0).GetValue<int64_t>() == 10003);
+            const auto calls = script->direct_fetches;
+            database.Run("SET oracle_fetch_rows=16384; SET oracle_direct_scan=false;");
+            CHECK(!database.Query("SELECT * FROM o.LINKS;")->HasError());
+            CHECK(script->direct_fetches == calls);
+        }
     }
 }
 

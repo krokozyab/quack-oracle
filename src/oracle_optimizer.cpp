@@ -1224,6 +1224,9 @@ void OptimizeOraclePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperat
 } // namespace
 
 void RegisterOracleOptimizer(DatabaseInstance &db) {
+    DBConfig::GetConfig(db).AddExtensionOption("oracle_direct_scan",
+                                               "Decode supported attached scalar rows into typed vectors during fetch.",
+                                               LogicalType::BOOLEAN, Value::BOOLEAN(true));
     DBConfig::GetConfig(db).AddExtensionOption(
         "oracle_fetch_rows", "Maximum scalar attached-scan fetch rows (1..65536); output vectors remain 2048 rows.",
         LogicalType::BIGINT, Value::BIGINT(16384));

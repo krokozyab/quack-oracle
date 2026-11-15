@@ -300,6 +300,7 @@ struct OracleQueryBindData final : TableFunctionData {
 //! parallel scan add to them together.
 struct OracleScanMetrics {
     std::atomic<uint64_t> rows_fetched {0};
+    std::atomic<uint64_t> direct_batches {0};
     std::atomic<uint64_t> bytes_received {0};
     std::atomic<uint64_t> bytes_sent {0};
     std::atomic<uint64_t> round_trips {0};
@@ -349,12 +350,15 @@ struct OracleQueryGlobalState final : GlobalTableFunctionState {
     OracleIoStats last_io;
     oracle_scanner::OracleBatch buffered;
     size_t buffer_position = 0;
+    std::vector<std::shared_ptr<DataChunk>> typed_chunks;
+    size_t typed_rows = 0;
     //! Set when heavy columns are fetched for the rows that pass the local filter only.
     std::unique_ptr<OracleDeferredColumns> deferred;
 
     //! A table read in chunks through several sessions: each thread takes the next
     //! statement and reads it on a session of its own. The session and cursor above
     //! are then unused.
+    bool direct_scalar = false;
     size_t fetch_rows = STANDARD_VECTOR_SIZE;
     bool parallel = false;
     std::vector<std::string> chunk_sql;
@@ -376,6 +380,8 @@ struct OracleQueryLocalState final : LocalTableFunctionState {
     OracleIoStats last_io;
     oracle_scanner::OracleBatch buffered;
     size_t buffer_position = 0;
+    std::vector<std::shared_ptr<DataChunk>> typed_chunks;
+    size_t typed_rows = 0;
     //! The ROWID range the cursor reads, which is the batch its rows belong to.
     idx_t batch_index = 0;
 };

@@ -29,3 +29,13 @@
   estimate. This estimate is not a hard limit on all scan memory.
 - A positive `oracle_parallel_scan` is a maximum: known small tables and
   selective filters stay sequential.
+
+- Decode eligible scalar scans into typed vectors during fetch, avoiding a
+  batched intermediate wire-cell arena. NUMBER, dates/timestamps, binary floats,
+  BOOLEAN and short text/RAW are eligible; wider text, LOB and deferred paths
+  retain their existing implementation. `oracle_direct_scan=false` selects the
+  previous path. Output types are unchanged.
+- Direct batches use a conservative 64 MiB retained-data budget. Borrowed wire
+  values are consumed synchronously; the last-row snapshot survives fetches.
+  Value-conversion failures poison the active read handle and retain their
+  original exception, without being mistaken for incomplete network framing.

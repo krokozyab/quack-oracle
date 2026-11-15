@@ -6,16 +6,36 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <optional>
 #include <vector>
+#include <utility>
 
 namespace oracle_scanner {
+
+// Keep value-conversion failures distinct from incomplete wire framing. In
+// particular, a sink's TRUNCATED must never request another network fragment.
+class TtcRowSinkError final : public std::exception {
+public:
+    explicit TtcRowSinkError(std::exception_ptr cause) : cause(std::move(cause)) {
+    }
+    const char *what() const noexcept override {
+        return "Oracle row sink failed";
+    }
+    [[noreturn]] void Rethrow() const {
+        std::rethrow_exception(cause);
+    }
+
+private:
+    std::exception_ptr cause;
+};
 
 struct TtcFetchResponse {
     std::vector<TtcRowData> rows;
     std::optional<OraclePackedBatch> packed;
     std::optional<TtcRowData> last_row;
     std::optional<TtcErrorInfo> completion;
+    size_t direct_rows = 0;
     bool exhausted = false;
     bool completed = false;
     bool used_row_header_selection = false;
@@ -46,7 +66,7 @@ class TtcFetchResponseDecoder {
 public:
     TtcFetchResponseDecoder(const std::vector<OracleColumn> &columns, uint8_t ttc_field_version,
                             const std::optional<TtcRowData> &preceding_row, bool packed_scalars = false,
-                            size_t reserve_rows = 0);
+                            size_t reserve_rows = 0, OracleRowSink *sink = nullptr);
     // A nonzero reserve_rows is also the requested response row limit.
 
     // True once the response is complete. Throws TRUNCATED, as
@@ -62,6 +82,22 @@ private:
     const TtcRowData *PreviousRow() const;
     bool DecodeInternal(const std::vector<uint8_t> &message);
 
+    size_t DecodeDirectRow(const std::vector<uint8_t> &message, size_t offset, const std::vector<size_t> &selected,
+                           bool continued);
+    void RefreshDirectViews();
+    struct CellLocation {
+        enum Kind { NULL_CELL, MESSAGE, SEED, CHUNKED } kind = NULL_CELL;
+        size_t offset = 0;
+        size_t size = 0;
+    };
+    OracleRowSink *sink;
+    const std::vector<uint8_t> *direct_message = nullptr;
+    std::vector<size_t> direct_selection;
+    std::vector<CellLocation> locations;
+    std::vector<std::vector<uint8_t>> chunked_cells;
+    std::vector<std::optional<OracleByteView>> direct_views;
+    bool direct_previous = false;
+    size_t chunked_capacity = 0;
     const std::vector<OracleColumn> &columns;
     uint8_t ttc_field_version;
     size_t maximum_rows;

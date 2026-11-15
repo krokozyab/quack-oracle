@@ -1412,6 +1412,13 @@ the `k` from a subset.
 ---
 
 
+Eligible scalar scans fill typed vectors during fetch without retaining every
+wire cell. Output types and SQL NULL semantics are unchanged. Short text/RAW
+columns have a declared byte width up to 253; wider, LOB and deferred columns
+keep the established fetch path. Direct batches have a conservative 64 MiB
+retained-data budget. For direct batches, EXPLAIN ANALYZE includes value conversion
+in fetch time and reports the number of direct scalar batches.
+
 Scalar fetch responses are bounded by the number of rows requested, before
 materializing repeated rows, including the legacy decoding fallback. A server
 response exceeding that count is rejected.
@@ -1428,6 +1435,7 @@ response exceeding that count is rejected.
 | `oracle_aggregate_pushdown` | `true` | Let Oracle compute `count` (including eligible `DISTINCT`), `sum`, partial `avg`, `min`, `max` and `GROUP BY` over number, date and timestamp keys. See [Aggregates](#aggregates). |
 | `oracle_join_pushdown` | `true` | Let Oracle join attached tables of one database (an inner join on number, date or timestamp columns). See [Joining two attached tables](#joining-two-attached-tables). |
 | `oracle_deferred_columns` | `true` | Read LOB, JSON, VECTOR and XML columns only for the rows that pass a filter DuckDB applies itself. See [Heavy columns after the filter](#heavy-columns-after-the-filter). |
+| `oracle_direct_scan` | `true` | Decode eligible attached scalar scans directly into typed vectors. NUMBER, DATE/TIMESTAMP, binary floats, BOOLEAN and short VARCHAR2/CHAR/RAW are supported; other columns retain the existing path. Set `false` for comparisons or troubleshooting. |
 | `oracle_fetch_rows` | `16384` | Maximum scalar attached-scan fetch rows, 1..65536. Output vectors remain 2048 rows. Declared row widths reduce the request toward an 8 MiB estimate; deferred, locked and short-limit scans retain the smaller path. |
 | `oracle_parallel_scan` | `-1` | Maximum sessions one scan of an attached table may read through at once: `-1` chooses (DuckDB's thread count, up to 8, for a table of 500,000 rows or more), `0` or `1` is one session. Small tables and selective filters stay sequential even with a positive maximum. See [section 7](#7-read-a-big-table-faster). |
 | `oracle_consistent_read` | `false` | Read every attached table of a statement `AS OF` one SCN. See [One moment for a whole statement](#one-moment-for-a-whole-statement). |
