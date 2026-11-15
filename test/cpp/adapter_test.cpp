@@ -3465,10 +3465,17 @@ void TestExactAveragePartialPushdown() {
             CHECK(remote->GetValue(1, 0) == local->GetValue(1, 0));
             CHECK(script->queries.back().find("SUM(") != std::string::npos);
             CHECK(script->queries.back().find("COUNT(\"V\")") != std::string::npos);
+            if (precision == 4 && scale == 2) {
+                script->routes[script->routes.size() - 2].second.rows = {
+                    {Number("1"), Text("0"), Number("922337203685478")}};
+                auto unsafe = database.Query(sql);
+                CHECK(unsafe->HasError() && unsafe->GetError().find("accumulator bound") != std::string::npos);
+            }
             // NULL-only and empty input produce NULL, never division by zero.
             script->routes.back().second.rows = {{Number("1"), WireValue(), Number("0")}};
             script->routes[script->routes.size() - 2].second.rows = {{Number("1"), WireValue(), Number("0")}};
             auto empty = database.Query(sql);
+            if (empty->HasError()) { std::cerr << empty->GetError() << std::endl; }
             CHECK(!empty->HasError() && empty->GetValue(1, 0).IsNull());
         }
     }

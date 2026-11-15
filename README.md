@@ -730,7 +730,9 @@ must have no sample and no join filter coming later; otherwise the plan is uncha
 For `avg` of exact `NUMBER(p,s)` with `1 <= p <= 18` and `0 <= s <= p`,
 Oracle returns the exact scaled sum and the non-NULL count. DuckDB finalizes the
 average locally using the pinned engine's integer/decimal rounding rules,
-including NULL for empty or all-NULL input. This partial AVG rewrite excludes wider decimals, floating-point input,
+including NULL for empty or all-NULL input. For DECIMAL widths up to four,
+counts above 922337203685477 are refused to bound DuckDB's INT64 accumulator.
+This partial AVG rewrite excludes wider decimals, floating-point input,
 DISTINCT, FILTER, ORDER BY and expressions. DuckDB may independently rewrite an
 average into eligible SUM/COUNT expressions.
 

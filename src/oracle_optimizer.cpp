@@ -389,6 +389,12 @@ void FinalizeOracleAverage(DataChunk &input, ExpressionState &, Vector &result) 
         const auto sum = input.GetValue(0, row).GetValue<hugeint_t>();
         const auto scale = input.GetValue(2, row).GetValue<double>();
         const auto narrow = input.GetValue(3, row).GetValue<bool>();
+        // DECIMAL widths <=4 use an INT64 accumulator in DuckDB. Bounding
+        // count by the largest possible scaled input also bounds every partial
+        // sum, including cancellation, rather than just the final Oracle SUM.
+        if (narrow && count > 922337203685477LL) {
+            throw OutOfRangeException("Oracle partial AVG count exceeds the safe DECIMAL accumulator bound");
+        }
         const auto value = narrow ? Hugeint::Cast<double>(sum) / (double(count) * scale)
                                   : double(Hugeint::Cast<Extended>(sum) / (Extended(count) * Extended(scale)));
         result.SetValue(row, Value::DOUBLE(value));
@@ -468,6 +474,7 @@ void PushAggregate(ClientContext &context, unique_ptr<LogicalOperator> &op, Colu
                 {LogicalType::HUGEINT, LogicalType::BIGINT, LogicalType::DOUBLE, LogicalType::BOOLEAN},
                 LogicalType::DOUBLE, FinalizeOracleAverage);
             function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+            function.SetFallible();
             reference =
                 make_uniq<BoundFunctionExpression>(BoundScalarFunction(function), std::move(arguments), nullptr);
         }

@@ -16,3 +16,6 @@
 - Eligible AVG queries can return groups instead of all input rows. An
   oversized remote COUNT or invalid sum fails instead of silently rounding.
   `oracle_aggregate_pushdown = false` retains local execution.
+
+- Partial AVG of DECIMAL widths <=4 refuses counts above 922337203685477,
+  ensuring every partial sum fits the pinned DuckDB INT64 accumulator.
