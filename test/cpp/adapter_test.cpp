@@ -3548,9 +3548,9 @@ void TestSelectiveFiltersReadThroughOneSession() {
     database.Run("SET threads = 1;");
     CHECK(!read_in_ranges("ID > 1000", "ID"));              // row work respects DuckDB's thread cap
     database.Run("SET threads = 4;");
-    // A positive maximum still avoids selective reads.
+    // An explicit reader count overrides the selectivity heuristic.
     database.Run("SET oracle_parallel_scan = 4;");
-    CHECK(!read_in_ranges("ID = 7"));
+    CHECK(read_in_ranges("ID = 7"));
     std::cout << "a selective filter reads through one session" << std::endl;
 }
 
