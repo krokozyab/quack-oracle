@@ -869,6 +869,32 @@ fetches and decoding; conversion time measures writing DuckDB values (included i
 for direct batches). Parallel timings add the durations across readers, so their sum
 can exceed wall time. The last line is every filter Oracle was *not* sent.
 Network counters cover cursor opening and fetching, excluding range-planning queries.
+Checks of source columns for pushed aggregates and JOINs share one empty SELECT,
+including checks of NUMBER precision and scale. It
+uses the same connection as the query, including the connection pinned by your
+write transaction. The check uses the cursor cache and still detects external
+DDL on repeated execution. A plan reduced to an empty result sends no check.
+
+For these queries, `Oracle schema check: 1 round trip (included in Oracle network)`
+shows the check's exchanges separately. They are already included in the bytes
+and round trips on the `Oracle network` line; do not add them a second time.
+Previously these checks ran once per source table and were absent from that
+line. The check runs before the aggregate or JOIN; an incompatible source schema
+fails with instructions to DETACH and ATTACH again. Query-open time continues to
+measure the main query rather than the schema check.
+
+On Free and 19c, the same three-group queries showed these counts (cold and
+repeated executions agreed):
+
+| Query | Check exchanges before → after | EXPLAIN network before → after |
+| --- | --- | --- |
+| GROUP BY with AVG/SUM | 1 → 1 | 2 → 3 |
+| Three-table JOIN with AVG/SUM | 3 → 1 | 2 → 3 |
+
+The previous network total omitted checks. Including that hidden work, the total
+was 3 → 3 exchanges for GROUP BY and 5 → 3 for the JOIN. `V$SQL` confirmed one
+check execution per pushed query after the change; three repeated executions
+used one parse. These are exchange counts for those queries, not a speed claim.
 Global Oracle details for a parallel scan appear after all planned ranges finish.
 If an upstream operator stops the scan early, these details are omitted; DuckDB's
 own operator metrics still describe the rows it consumed.

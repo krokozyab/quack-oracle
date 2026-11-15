@@ -21,6 +21,16 @@ remains 0.7.0 until a release is approved.
 
 ## Faster repeated reads and copies
 
+- **One query for source-schema checks.** GROUP BY and JOIN use one empty
+  SELECT for all their source tables, on the connection used by the query. A
+  write transaction uses its own connection. Repeated checks reuse cursors and
+  still refuse stale precision/scale after external DDL. Empty plans skip the
+  check. EXPLAIN ANALYZE includes its traffic in `Oracle network` and also shows
+  it as `Oracle schema check`; the separate line is part of the total.
+  On Free and 19c, checks for a three-table JOIN fell from three exchanges to
+  one; GROUP BY kept one. Including previously hidden checks, those complete
+  queries used 5 → 3 and 3 → 3 exchanges respectively. No speedup is claimed.
+
 - Repeated parallel scans reuse checked range plans and pooled connections.
   Each execution still obtains a new snapshot and checks table identity and
   access. `oracle_scan_plan_cache = false` disables plan reuse for comparisons.
