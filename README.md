@@ -1693,6 +1693,20 @@ and codec layers, and `oracle_scanner_adapter_test`, which drives the DuckDB
 adapter against a fake Oracle session and so needs no database, network, or
 credentials.
 
+To compare loadable builds, disable the built-in copy before compiling:
+
+```sh
+make release EXT_RELEASE_FLAGS="-DORACLE_SCANNER_STATIC_LINK=OFF"
+scripts/check_explicit_extension_load.sh ./build/release/duckdb \
+  "$PWD/build/release/extension/oracle_scanner/oracle_scanner.duckdb_extension"
+```
+
+The CLI normally loads linked extensions at startup. Once `oracle_scanner` is
+loaded, a later `LOAD` of another file does not switch its implementation. Run
+each measured build in a fresh process after this check; use absolute paths for
+`LOAD`. The guard rejects a CLI with an already loaded copy. On DuckDB versions
+that link every built extension, use a separate CLI without this extension.
+
 For a fast protocol-only check that does not build DuckDB at all — seconds
 rather than tens of minutes:
 

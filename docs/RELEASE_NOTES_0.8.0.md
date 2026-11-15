@@ -53,3 +53,6 @@
 - Reuse pooled read sessions for ROWID planning instead of authenticating a new
   dictionary session for each parallel scan. Failed planning exchanges discard
   the lease before serial fallback.
+
+- Add `ORACLE_SCANNER_STATIC_LINK=OFF` for measuring loadable builds and a guard
+  that rejects an already loaded built-in copy before explicit loading.
