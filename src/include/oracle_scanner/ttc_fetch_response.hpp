@@ -13,6 +13,18 @@
 
 namespace oracle_scanner {
 
+// A fully decoded reexecute failure before any row. Only this condition can
+// request a fresh parse; ordinary fetches and partially delivered results cannot.
+class TtcQueryInvalidated final : public ProtocolError {
+public:
+    explicit TtcQueryInvalidated(const TtcErrorInfo &completion)
+        : ProtocolError(ProtocolErrorKind::INVALID_STATE, completion.message, completion.error_number),
+          cursor_id(completion.cursor_id) {}
+    uint32_t CursorId() const { return cursor_id; }
+private:
+    uint32_t cursor_id;
+};
+
 // Keep value-conversion failures distinct from incomplete wire framing. In
 // particular, a sink's TRUNCATED must never request another network fragment.
 class TtcRowSinkError final : public std::exception {
@@ -66,7 +78,7 @@ class TtcFetchResponseDecoder {
 public:
     TtcFetchResponseDecoder(const std::vector<OracleColumn> &columns, uint8_t ttc_field_version,
                             const std::optional<TtcRowData> &preceding_row, bool packed_scalars = false,
-                            size_t reserve_rows = 0, OracleRowSink *sink = nullptr);
+                            size_t reserve_rows = 0, OracleRowSink *sink = nullptr, bool allow_reparse = false);
     // A nonzero reserve_rows is also the requested response row limit.
 
     // True once the response is complete. Throws TRUNCATED, as
@@ -119,6 +131,7 @@ private:
     bool packed_seed = false;
     bool kept_row_header_selection = false;
     bool kept_row_continuation = false;
+    bool allow_reparse;
 };
 
 } // namespace oracle_scanner

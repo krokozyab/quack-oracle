@@ -25,6 +25,7 @@ public:
 
     OracleStatementHandle Open(OracleSqlKind kind);
     void BindRemoteCursor(OracleStatementHandle handle, uint32_t remote_cursor_id);
+    void RebindRemoteCursor(OracleStatementHandle handle, uint32_t remote_cursor_id);
     uint32_t RemoteCursorId(OracleStatementHandle handle) const;
     std::optional<uint32_t> TryRemoteCursorId(OracleStatementHandle handle) const;
     void MarkExecuted(OracleStatementHandle handle, bool has_rows);

@@ -618,47 +618,14 @@ std::unique_ptr<OracleCursor> NativeOracleSession::OpenQuery(const std::string &
         InvalidateQueries();
     }
     const auto key = lifetime->cache_queries && !lifetime->exchange_failed ? QueryCacheKey(sql, ordered_binds) : std::string();
-    if (!key.empty()) {
-        if (auto cached = lifetime->queries.Take(key)) {
-            channel->ReexecuteQuery(cached->handle, NextSequence(), static_cast<uint32_t>(initial_rows), ordered_binds);
-            auto response = channel->ReceiveReexecuteResponse(cached->handle, cached->columns,
-                                                              connection->TtcFieldVersion(),
-                                                              connection->TtcServerFieldVersion(),
-                                                              static_cast<uint32_t>(initial_rows));
-            if (!response.completion || !response.completion->cursor_id) {
-                statements.Poison(cached->handle);
-                throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle query reexecute has no cursor completion");
-            }
-            channel->CompleteExecute(cached->handle, true, response.completion->cursor_id);
-            return std::make_unique<NativeOracleCursor>(*channel, next_sequence, lifetime, cached->handle,
-                std::move(response.columns), std::move(response.rows), response.exhausted,
-                connection->TtcServerFieldVersion(), connection->TtcFieldVersion(), false, key);
-        }
-    }
-    // Idle cached statements must never reduce the pre-existing active-cursor
-    // limit. Evict one when a different query needs its registry slot.
-    if (statements.OpenCount() >= 64 && lifetime->queries.Size()) {
+    auto cached = key.empty() ? std::optional<OraclePreparedQuery>() : lifetime->queries.Take(key);
+    if (!cached && statements.OpenCount() >= 64 && lifetime->queries.Size()) {
         lifetime->queries.Evict([&](OracleStatementHandle evicted) { channel->Close(evicted); });
     }
-    const auto handle = statements.Open(OracleSqlKind::QUERY);
-    if (ordered_binds.empty()) {
-        TtcExecuteNoBindsRequest request;
-        request.sequence = NextSequence();
-        request.sql = sql;
-        request.is_query = true;
-        request.prefetch_rows = static_cast<uint32_t>(initial_rows);
-        channel->ExecuteNoBinds(handle, request);
-    } else {
-        TtcExecuteBindsRequest request;
-        request.sequence = NextSequence();
-        request.sql = sql;
-        request.binds = ordered_binds;
-        request.is_query = true;
-        request.prefetch_rows = static_cast<uint32_t>(initial_rows);
-        channel->ExecuteBinds(handle, request);
-    }
-    const auto response = channel->ReceiveDecodedExecuteResponse(handle, connection->TtcFieldVersion(),
-                                                                  connection->TtcServerFieldVersion(), initial_rows);
+    auto handle = cached ? cached->handle : statements.Open(OracleSqlKind::QUERY);
+    const auto response = channel->ExecuteQuery(handle, sql, ordered_binds, static_cast<uint32_t>(initial_rows),
+        connection->TtcFieldVersion(), connection->TtcServerFieldVersion(), [this] { return NextSequence(); },
+        cached ? &cached->columns : nullptr, [this] { return lifetime->fetch_cancellation.CanUseConnection(); });
     if (!response.completion || response.completion->cursor_id == 0) {
         statements.Poison(handle);
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle query response has no cursor completion");

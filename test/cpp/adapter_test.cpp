@@ -16,6 +16,7 @@
 #include "oracle_scanner_extension.hpp"
 #include "core_functions_extension.hpp"
 #include "oracle_adapter.hpp"
+#include "query_retry_fixture.hpp"
 #include "oracle_scanner/ttc_lob.hpp"
 #include "oracle_scanner/call_registry.hpp"
 #include "oracle_scanner/ttc_execute.hpp"
@@ -143,6 +144,7 @@ struct FakeScript {
     bool two_batch_fetch = false;
     bool reject_fetch_after_exhaustion = false;
     std::string query_delay_fragment;
+    std::function<void(const std::string &)> query_hook;
     std::chrono::milliseconds query_delay {0};
     bool top_n_cost_model = false;
     std::chrono::milliseconds top_n_network_delay {0};
@@ -457,6 +459,7 @@ public:
 
     std::unique_ptr<OracleCursor> Query(const std::string &sql, const std::vector<OracleBind> &binds) override {
         ++io_queries;
+        if (script->query_hook) { script->query_hook(sql); }
         if (script->top_n_cost_model) {
             std::this_thread::sleep_for(script->top_n_network_delay);
             if (sql.find(" ORDER BY \"ID\"") != std::string::npos) {
@@ -2251,6 +2254,43 @@ void TestAttachedScanRefusesChangedTemporalAndCharacterShape() {
         CHECK(result->HasError() && result->GetError().find("DETACH and ATTACH") != std::string::npos);
         CHECK(database.Query("SELECT 42")->GetValue(0, 0).ToString() == "42");
     }
+}
+
+void TestPreparedQueryRecoveryKeepsWriteSessionUsable() {
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {Column("V", 2, 10, 0)};
+    script->rows = {{Number("7")}};
+    script->affected_rows = 1;
+    script->routes = {
+        {"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}},
+        {"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("REPARSE")}}}},
+        {"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}},
+        {"FROM user_tab_columns", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1),
+         Column("DATA_LENGTH", 2), Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+         {{Text("REPARSE"), Text("V"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("Y")}}}},
+        {"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}}};
+    script->tables["REPARSE"] = {{Column("V", 2, 10, 0)}, {{Number("7")}}};
+    oracle_scanner_test::QueryExchange exchange;
+    exchange.stream.Append(oracle_scanner_test::QueryReply(42, 1007, false, false));
+    exchange.stream.Append(oracle_scanner_test::QueryReply(43, 0, true, true));
+    bool recovered = false;
+    script->query_hook = [&](const std::string &sql) {
+        if (sql == "SELECT V FROM REPARSE" && !recovered) {
+            const auto result = exchange.Run();
+            CHECK(result.rows.size() == 1 && exchange.sequence == 2);
+            recovered = true;
+        }
+    };
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS o(TYPE oracle_scanner);BEGIN;INSERT INTO o.REPARSE VALUES (8)");
+    const auto opened = script->sessions_opened;
+    const auto result = database.Query("SELECT * FROM oracle_query_transaction('o','SELECT V FROM REPARSE')");
+    CHECK(!result->HasError() && recovered && result->GetValue(0, 0).ToString() == "7");
+    CHECK(!database.Query("SELECT * FROM oracle_query_transaction('o','SELECT V FROM REPARSE')")->HasError());
+    CHECK(script->sessions_opened == opened);
+    CHECK(!database.Query("SELECT V FROM o.REPARSE")->HasError());
+    database.Run("ROLLBACK");
 }
 
 void TestStatementCacheSettingKeepsSessionPoolBounded() {
@@ -7048,6 +7088,7 @@ int main() {
     TestScanReleasesItsSession();
     TestReadSessionsArePooledPerConnection();
     TestStatementCacheSettingKeepsSessionPoolBounded();
+    TestPreparedQueryRecoveryKeepsWriteSessionUsable();
     TestAttachedCatalogAgainstAFakeSession();
     TestAttachedScanRefusesChangedWireTypes();
     TestAttachedScanRefusesChangedNumericShape();

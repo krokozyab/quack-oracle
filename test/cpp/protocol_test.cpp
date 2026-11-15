@@ -30,6 +30,7 @@
 #include <type_traits>
 
 #include "oracle_scanner/byte_buffer.hpp"
+#include "query_retry_fixture.hpp"
 #include "oracle_scanner/byte_stream.hpp"
 #include "oracle_scanner/auth_crypto.hpp"
 #include "oracle_scanner/call_registry.hpp"
@@ -3146,6 +3147,56 @@ static void TestTransientSnapshotAndRowIdQueriesBypassCursorCache() {
     }
 }
 
+static void TestPreparedQueryReparsesOnlySafeInvalidations() {
+    using namespace oracle_scanner_test;
+    const std::vector<OracleBind> binds = {{"n", 2, BindDirection::BIND_IN, EncodeOracleNumber("7"), 22}};
+    for (const auto code : {1007U, 932U}) {
+        for (const bool described : {false, true}) {
+            QueryExchange exchange;
+            exchange.stream.Append(QueryReply(42, code, described, false));
+            exchange.stream.Append(QueryReply(43, 0, true, true));
+            const auto result = exchange.Run(binds);
+            CHECK(exchange.sequence == 2 && result.rows.size() == 1);
+            CHECK(DecodeOracleNumber(*result.rows[0][0]) == "7");
+            CHECK(exchange.registry.RemoteCursorId(exchange.handle) == 43);
+            CHECK(exchange.registry.OpenCount() == 1);
+            TtcExecuteBindsRequest fresh;
+            fresh.sequence = 2;
+            fresh.sql = "SELECT :n V FROM dual";
+            fresh.binds = binds;
+            fresh.is_query = true;
+            fresh.prefetch_rows = 2;
+            const auto bytes = EncodeTtcExecuteBindsRequest(fresh);
+            CHECK(std::search(exchange.stream.output.begin(), exchange.stream.output.end(), bytes.begin(), bytes.end()) !=
+                  exchange.stream.output.end());
+        }
+    }
+    for (const auto code : {942U, 1013U, 1007U, 932U}) {
+        QueryExchange exchange;
+        // Even invalidation codes cannot replay a response that already had rows.
+        const bool row = code == 1007 || code == 932;
+        exchange.stream.Append(QueryReply(42, code, false, row));
+        bool caught = false;
+        try { exchange.Run(binds); }
+        catch (const ProtocolError &error) { caught = true; CHECK(error.OracleCode() == code); }
+        CHECK(caught && exchange.sequence == 1);
+        CHECK(exchange.registry.State(exchange.handle) == OracleStatementState::POISONED);
+    }
+    QueryExchange cancelled;
+    cancelled.allow_retry = false;
+    cancelled.stream.Append(QueryReply(42, 1007, false, false));
+    ExpectError(ProtocolErrorKind::INVALID_STATE, [&] { cancelled.Run(binds); });
+    CHECK(cancelled.sequence == 1 && cancelled.registry.State(cancelled.handle) == OracleStatementState::POISONED);
+    QueryExchange repeated;
+    repeated.stream.Append(QueryReply(42, 1007, false, false));
+    repeated.stream.Append(QueryReply(43, 932, false, false));
+    bool caught = false;
+    try { repeated.Run(binds); }
+    catch (const ProtocolError &error) { caught = true; CHECK(error.OracleCode() == 932); }
+    CHECK(caught && repeated.sequence == 2);
+    CHECK(repeated.registry.State(repeated.handle) == OracleStatementState::POISONED);
+}
+
 static void TestPreparedQueryReexecuteWireAndState() {
     CHECK(EncodeTtcReexecuteQuery(7, 42, 2) == std::vector<uint8_t>({3, 78, 7, 1, 42, 1, 2, 1, 32, 0}));
     const std::vector<OracleBind> binds = {{"n", 2, BindDirection::BIND_IN, EncodeOracleNumber("7")}};
@@ -3178,10 +3229,26 @@ static void TestPreparedQueryReexecuteWireAndState() {
     CHECK(registry.State(handle) == OracleStatementState::EXECUTED);
     channel.MarkFetchExhausted(handle);
     channel.ReexecuteQuery(handle, 8, 2, binds);
-    ExpectError(ProtocolErrorKind::MALFORMED, [&] { channel.CompleteExecute(handle, true, 43); });
+    channel.CompleteExecute(handle, true, 43);
+    CHECK(registry.RemoteCursorId(handle) == 43);
+    channel.MarkFetchExhausted(handle);
+    channel.ReexecuteQuery(handle, 9, 2, binds);
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { channel.CompleteExecute(handle, true, 0); });
     CHECK(registry.State(handle) == OracleStatementState::POISONED);
     ExpectError(ProtocolErrorKind::INVALID_STATE, [&] { registry.RestartQuery(handle); });
     CHECK(channel.Close(handle) && registry.OpenCount() == 0);
+    const auto other = registry.Open(OracleSqlKind::QUERY);
+    channel.CompleteExecute(other, true, 60);
+    const auto replacement = registry.Open(OracleSqlKind::QUERY);
+    channel.CompleteExecute(replacement, true, 61);
+    channel.MarkFetchExhausted(replacement);
+    channel.ReexecuteQuery(replacement, 10, 2, binds);
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { channel.CompleteExecute(replacement, true, 60); });
+    CHECK(registry.State(replacement) == OracleStatementState::POISONED);
+    CHECK(registry.RemoteCursorId(other) == 60 && registry.State(other) == OracleStatementState::EXECUTED);
+    channel.Close(replacement);
+    channel.Close(other);
+
 }
 
 static void TestStatementRegistry() {
@@ -3639,6 +3706,54 @@ static void TestLiveTnsNegotiation() {
         const auto committed = connection->Ttc().Commit(3);
         const auto rolled_back = connection->Ttc().Rollback(4);
         CHECK(committed.call_status != 0 && rolled_back.call_status != 0);
+    }
+    if (stage && std::string(stage) == "review_reexecute") {
+        auto native = NativeOracleSession::Connect(config, RequiredEnvironment("ORA19C_PASSWORD"));
+        auto external = NativeOracleSession::Connect(config, RequiredEnvironment("ORA19C_PASSWORD"));
+        native->ExecuteAdmin("CREATE TABLE RV_RETRY (N NUMBER(10))");
+        native->Execute("INSERT INTO RV_RETRY VALUES (7)", {});
+        native->Commit();
+        const auto read = [&](size_t columns, size_t expected_rows, bool decimal) {
+            auto cursor = native->Query("SELECT * FROM RV_RETRY", {});
+            CHECK(cursor->Columns().size() == columns);
+            if (decimal) {
+                CHECK(cursor->Columns()[0].precision == 12 && cursor->Columns()[0].scale == 2);
+            }
+            size_t rows = 0;
+            bool positive = false, negative = false;
+            for (;;) {
+                auto batch = cursor->Fetch(100);
+                for (const auto &row : batch.rows) {
+                    if (row[0]) {
+                        const auto value = DecodeOracleNumber(*row[0]);
+                        positive |= value == "1.25";
+                        negative |= value == "-99.99";
+                    }
+                }
+                rows += batch.rows.size();
+                if (batch.exhausted) { break; }
+            }
+            cursor->Close();
+            CHECK(rows == expected_rows);
+            if (decimal) { CHECK(positive && negative); }
+        };
+        read(1, 1, false);
+        read(1, 1, false);
+        external->ExecuteAdmin("ALTER TABLE RV_RETRY ADD (V VARCHAR2(20))");
+        read(2, 1, false);
+        external->Execute("UPDATE RV_RETRY SET N=NULL", {});
+        external->Commit();
+        external->ExecuteAdmin("ALTER TABLE RV_RETRY MODIFY N NUMBER(12,2)");
+        external->Execute("INSERT INTO RV_RETRY(N) SELECT 1.25 FROM DUAL UNION ALL SELECT -99.99 FROM DUAL", {});
+        external->Commit();
+        read(2, 3, true);
+        native->Execute("UPDATE RV_RETRY SET V='own' WHERE N IS NULL", {});
+        native->Rollback();
+        read(2, 3, true);
+        native->Close();
+        external->ExecuteAdmin("DROP TABLE RV_RETRY PURGE");
+        external->Close();
+        std::cout << "reexecute survives external ADD/MODIFY and preserves decimal values; Oracle may revalidate without an error" << std::endl;
     }
     if (stage && std::string(stage) == "prepared_cache") {
         config.io_deadline_binding = std::make_shared<OracleIoDeadlineBinding>();
@@ -9657,6 +9772,7 @@ int main() {
     TestPreparedQueryCacheOwnershipAndBounds();
     TestTransientSnapshotAndRowIdQueriesBypassCursorCache();
     TestPreparedQueryReexecuteWireAndState();
+    TestPreparedQueryReparsesOnlySafeInvalidations();
     TestTtcStatementChannel();
     TestTtcCursorClosePiggyback();
     TestTtcTransactionCodec();

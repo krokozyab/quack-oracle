@@ -40,6 +40,11 @@ public:
 
     void ExecuteNoBinds(OracleStatementHandle handle, const TtcExecuteNoBindsRequest &request);
     void ExecuteBinds(OracleStatementHandle handle, const TtcExecuteBindsRequest &request);
+    TtcExecuteResponse ExecuteQuery(OracleStatementHandle &handle, const std::string &sql,
+                                    const std::vector<OracleBind> &binds, uint32_t rows, uint8_t field_version,
+                                    uint8_t server_field_version, const std::function<uint8_t()> &sequence,
+                                    const std::vector<OracleColumn> *cached_columns = nullptr,
+                                    const std::function<bool()> &can_retry = {});
     void ReexecuteQuery(OracleStatementHandle handle, uint8_t sequence, uint32_t rows,
                         const std::vector<OracleBind> &binds);
     TtcExecuteResponse ReceiveReexecuteResponse(OracleStatementHandle handle, const std::vector<OracleColumn> &columns,

@@ -279,9 +279,10 @@ size_t DecodePackedRow(const uint8_t *data, size_t size, const std::vector<size_
 TtcFetchResponseDecoder::TtcFetchResponseDecoder(const std::vector<OracleColumn> &columns_p,
                                                  uint8_t ttc_field_version_p,
                                                  const std::optional<TtcRowData> &preceding_row_p, bool packed_scalars,
-                                                 size_t reserve_rows, OracleRowSink *sink_p)
+                                                 size_t reserve_rows, OracleRowSink *sink_p, bool allow_reparse_p)
     : sink(sink_p), columns(columns_p), ttc_field_version(ttc_field_version_p),
-      maximum_rows(reserve_rows ? reserve_rows : 65536), preceding_row(sink_p ? std::nullopt : preceding_row_p) {
+      maximum_rows(reserve_rows ? reserve_rows : 65536), preceding_row(sink_p ? std::nullopt : preceding_row_p),
+      allow_reparse(allow_reparse_p) {
     if (columns.empty() || columns.size() > 4096) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC fetch response has an invalid cursor column count");
     }
@@ -689,6 +690,11 @@ bool TtcFetchResponseDecoder::DecodeInternal(const std::vector<uint8_t> &message
             result.exhausted = completion.error_number == 1403;
             result.completion = completion;
             if (completion.error_number != 0 && !result.exhausted) {
+                if (allow_reparse && (completion.error_number == 1007 || completion.error_number == 932) &&
+                    result.rows.empty() && result.direct_rows == 0 &&
+                    (!result.packed || result.packed->RowCount() == 0) && completion.bytes_consumed == remaining) {
+                    throw TtcQueryInvalidated(completion);
+                }
                 throw ProtocolError(ProtocolErrorKind::INVALID_STATE,
                                     completion.message.empty() ? "Oracle returned a TTC fetch error" : completion.message,
                                     completion.error_number);

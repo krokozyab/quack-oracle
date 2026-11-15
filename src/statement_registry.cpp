@@ -55,6 +55,20 @@ uint32_t OracleStatementRegistry::RemoteCursorId(OracleStatementHandle handle) c
     return found->second.remote_cursor_id;
 }
 
+void OracleStatementRegistry::RebindRemoteCursor(OracleStatementHandle handle, uint32_t remote_cursor_id) {
+    std::lock_guard<std::mutex> guard(mutex);
+    auto &record = RequireOpen(handle);
+    if (!remote_cursor_id || !record.remote_cursor_id || record.state != OracleStatementState::OPEN) {
+        throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle replacement cursor id is invalid");
+    }
+    for (const auto &entry : statements) {
+        if (entry.first != handle.statement_id && entry.second.remote_cursor_id == remote_cursor_id) {
+            throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle replacement cursor id is already in use");
+        }
+    }
+    record.remote_cursor_id = remote_cursor_id;
+}
+
 std::optional<uint32_t> OracleStatementRegistry::TryRemoteCursorId(OracleStatementHandle handle) const {
     std::lock_guard<std::mutex> guard(mutex);
     if (handle.statement_id == 0) {

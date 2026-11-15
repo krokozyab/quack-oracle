@@ -167,6 +167,48 @@ void TtcStatementChannel::ReexecuteQuery(OracleStatementHandle handle, uint8_t s
     }
 }
 
+TtcExecuteResponse TtcStatementChannel::ExecuteQuery(OracleStatementHandle &handle, const std::string &sql,
+    const std::vector<OracleBind> &binds, uint32_t rows, uint8_t field_version, uint8_t server_field_version,
+    const std::function<uint8_t()> &sequence, const std::vector<OracleColumn> *cached_columns,
+    const std::function<bool()> &can_retry) {
+    if (cached_columns) {
+        ReexecuteQuery(handle, sequence(), rows, binds);
+        try {
+            return ReceiveReexecuteResponse(handle, *cached_columns, field_version, server_field_version, rows);
+        } catch (const TtcQueryInvalidated &error) {
+            if (can_retry && !can_retry()) {
+                statements.Poison(handle);
+                throw;
+            }
+            if (error.CursorId()) {
+                statements.RebindRemoteCursor(handle, error.CursorId());
+            }
+            Close(handle);
+            handle = statements.Open(OracleSqlKind::QUERY);
+        }
+    }
+    // Exactly one full execution. Errors here are never retried.
+    if (binds.empty()) {
+        TtcExecuteNoBindsRequest request;
+        request.sequence = sequence();
+        request.sql = sql;
+        request.is_query = true;
+        request.prefetch_rows = rows;
+        request.ttc_field_version = field_version;
+        ExecuteNoBinds(handle, request);
+    } else {
+        TtcExecuteBindsRequest request;
+        request.sequence = sequence();
+        request.sql = sql;
+        request.binds = binds;
+        request.is_query = true;
+        request.prefetch_rows = rows;
+        request.ttc_field_version = field_version;
+        ExecuteBinds(handle, request);
+    }
+    return ReceiveDecodedExecuteResponse(handle, field_version, server_field_version, rows);
+}
+
 TtcExecuteResponse TtcStatementChannel::ReceiveReexecuteResponse(OracleStatementHandle handle,
                                                                const std::vector<OracleColumn> &columns,
                                                                uint8_t ttc_field_version, uint8_t server_field_version,
@@ -189,10 +231,11 @@ TtcExecuteResponse TtcStatementChannel::ReceiveReexecuteResponse(OracleStatement
             // and no preceding row from its previous execution.
             if (offset < message.size() && message[offset] == 16) {
                 const std::vector<uint8_t> described(message.begin() + static_cast<std::ptrdiff_t>(offset), message.end());
-                decoded = DecodeTtcExecuteResponse(described, ttc_field_version, server_field_version, maximum_rows);
+                decoded = DecodeTtcExecuteResponse(described, ttc_field_version, server_field_version, maximum_rows, true);
                 decoded->bytes_consumed += offset;
             } else {
-                TtcFetchResponseDecoder decoder(columns, server_field_version, std::nullopt, false, maximum_rows);
+                TtcFetchResponseDecoder decoder(columns, server_field_version, std::nullopt, false, maximum_rows,
+                                                nullptr, true);
                 decoder.Decode(message);
                 auto fetch = decoder.Take();
                 TtcExecuteResponse response;
@@ -210,6 +253,8 @@ TtcExecuteResponse TtcStatementChannel::ReceiveReexecuteResponse(OracleStatement
             return decoded->completed;
         });
         return std::move(*decoded);
+    } catch (const TtcQueryInvalidated &) {
+        throw;
     } catch (...) {
         statements.Poison(handle);
         throw;
@@ -319,9 +364,17 @@ TtcCallResponse TtcStatementChannel::ReceiveCallResponse(OracleStatementHandle h
 void TtcStatementChannel::CompleteExecute(OracleStatementHandle handle, bool is_query, uint32_t remote_cursor_id) {
     const auto previous = statements.TryRemoteCursorId(handle);
     if (previous) {
-        if (!is_query || remote_cursor_id != *previous) {
+        if (!is_query || !remote_cursor_id) {
             statements.Poison(handle);
             throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle reexecute changed its server cursor id");
+        }
+        if (remote_cursor_id != *previous) {
+            try {
+                statements.RebindRemoteCursor(handle, remote_cursor_id);
+            } catch (...) {
+                statements.Poison(handle);
+                throw;
+            }
         }
         statements.MarkExecuted(handle, true);
         return;
