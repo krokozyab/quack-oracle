@@ -1347,8 +1347,9 @@ several sessions when Oracle's statistics say it has 500,000 rows or more. The d
 roughly 16 MiB or 250,000 returned rows per reader, whichever calls for more readers,
 up to eight and DuckDB's thread count. The row estimate accounts for framing and decoding
 even with a narrow projection. These are heuristics; the best count depends on the server
-and connection. To set a maximum yourself, or use one
-session with `0`:
+and connection. A positive value requests that many readers, bypassing statistics-based size
+and selectivity estimates; thread limits, available ranges, privileges and write
+transaction safeguards still apply. Use one session with `0` or `1`:
 
 ```sql
 SET oracle_parallel_scan = 8;
@@ -1369,7 +1370,7 @@ SELECT order_id, amount FROM o.ORDERS ORDER BY amount DESC, order_id LIMIT 10;
 Each range uses the same SCN and returns its best `limit + offset` candidates;
 DuckDB's Top-N chooses the final rows. This targets roughly one range per reader.
 It requires an eligible pushed ordering and all its filters to be pushed, plus
-the ordinary parallel-scan privileges and table-size safeguards. Plain LIMIT,
+the ordinary parallel-scan privileges and snapshot safeguards. Plain LIMIT,
 samples and reads pinned to a write transaction retain their existing paths.
 Without range-planning privileges it falls back to one ranked read.
 
@@ -1402,8 +1403,8 @@ Oracle counts each range at the same SCN; DuckDB sums the partial counts and
 checks the BIGINT result for overflow. NULL values are excluded by COUNT(column),
 and an empty input returns zero. Each range must return exactly one row of
 nonnegative, non-NULL counts. This mode requires aggregate pushdown, a heap table
-with statistics of at least 500,000 rows, and the ordinary range-planning and
-flashback privileges. Automatic reader sizing uses the table's row count, capped
+and the ordinary range-planning and flashback privileges. Automatic mode also
+requires statistics of at least 500,000 rows. Reader sizing uses the row count, capped
 at eight and DuckDB's threads; a positive `oracle_parallel_scan` caps readers.
 Missing privileges or a write-pinned transaction use one scalar COUNT instead.
 DISTINCT, GROUP BY, mixed aggregates, samples and local predicates retain their
@@ -1413,7 +1414,7 @@ slower than one Oracle count, especially when Oracle can use an index.
 ROWID planning reuses the read-session pool (`oracle_session_pool_size`); a failed
 planning exchange discards its session before falling back to a serial scan.
 
-`oracle_statement_cache = true` keeps up to 32 idle parsed scalar queries per
+`oracle_statement_cache = true` keeps up to 20 idle parsed scalar queries per
 native session, with a 2 MiB accounting budget for keys and column metadata.
 Repeated executions reuse the server cursor and description, sending current
 scalar IN bind values. The key includes exact SQL and bind type, character form
@@ -1421,14 +1422,18 @@ and buffer width; bind values and result rows are not retained. Each execution
 reads current data under the usual transaction or explicit SCN semantics.
 
 Only fully fetched scalar queries enter this cache. LOB, LONG, ROWID, callable
-result cursors, large SQL/bind sets and unfinished queries keep their existing
-paths. Writes, administrative DDL and PL/SQL on the session invalidate idle
+result cursors, SQL containing `AS OF SCN` or ROWID ranges, large SQL/bind sets
+and unfinished queries keep their existing paths. Writes, administrative DDL and PL/SQL on the session invalidate idle
 queries; cursors opened before invalidation cannot return to the cache.
-External DDL is handled by Oracle's cursor revalidation: a fresh describe
-replaces cached metadata, while an Oracle invalidation error fails the query
-and discards the pooled session. Failed statements are never replayed.
+External DDL can return an updated description. ORA-01007 or ORA-00932 from a
+cached read, before any rows are returned, causes one full execution with the
+current SQL and binds. Other errors, cancellation, errors after rows, and a
+failed full execution are not retried. Writes are not replayed. Different
+literal filters occupy different entries; prefer binds for repeated SQL.
 External changes to an attached table still require DETACH/ATTACH to refresh
-DuckDB's catalog schema.
+DuckDB's catalog schema. Reads and pushed aggregates reject changed NUMBER
+precision/scale, timestamp/interval scale and text character form before using
+cached types; refresh the attachment rather than continuing with stale types.
 
 Set `oracle_statement_cache = false` to release idle cursors and compare the
 ordinary parse/describe path. Switching modes preserves authenticated sessions
@@ -1439,7 +1444,7 @@ remain enabled for independent read statements to benefit across queries.
 `oracle_scan_plan_cache = true` also reuses range boundaries and projected wire
 descriptions, with at most 32 entries and an 8 MiB accounting budget per DuckDB
 connection. Each execution still checks the table's object ID, data object ID,
-DDL timestamp and heap kind, obtains a fresh SCN, and checks flashback access.
+DDL timestamp and table organization, obtains a fresh SCN, and checks flashback access.
 DDL through ATTACH changes a shared epoch across its schemas. Snapshots, rows,
 filters, ordering and open cursors are never cached. New extents remain covered
 by the open-ended ranges; stale cuts can affect balance, not coverage.
@@ -1468,7 +1473,7 @@ session reads them in (that follows the order the extents were allocated); witho
 Oracle promises neither.
 
 It reads one stream instead, and says nothing, when: the setting is 0 or 1; the setting is left
-automatic or a positive maximum, and the filters Oracle is sent are estimated from its
+automatic, and the filters Oracle is sent are estimated from its
 statistics to leave fewer than 100,000 rows (`NUM_DISTINCT` for `=` and `IN`, `LOW_VALUE`/`HIGH_VALUE` for a range on a number, date
 or timestamp; one customer's 50 orders of a million then take 0.02 s instead of 0.18 s, an estimate
 thrown off by skewed data only picks the slower of the two ways to read, never another result);
@@ -1538,19 +1543,22 @@ the `k` from a subset.
 ---
 
 
-Eligible scalar scans fill typed vectors during fetch without retaining every
-wire cell. Output types and SQL NULL semantics are unchanged. Short text/RAW
-columns have a declared byte width up to 253; wider, LOB and deferred columns
-keep the established fetch path. Direct batches have a conservative 64 MiB
-retained-data budget. For direct batches, EXPLAIN ANALYZE includes value conversion
-in fetch time and reports the number of direct scalar batches.
+Eligible scalar scans convert values directly while fetching. Output types and
+NULL semantics are unchanged. Short text/RAW columns have a declared byte width
+up to 253; wider, LOB and deferred columns use the buffered path. Wide results
+also select that path before fetching if the direct batch would exceed its
+64 MiB estimate. `oracle_direct_scan = false` selects the buffered path for
+comparison. EXPLAIN ANALYZE includes direct conversion in fetch time.
 
-The remaining native row paths, including execute-prefetched rows and ROWID/LOB
-scans, store bytes in a response-owned arena with offset and NULL descriptors.
-Repeated values share their byte ranges; the last-row snapshot is copied into
-independent storage before the next fetch. Consumers read borrowed byte views.
-LOB I/O can still use temporary content buffers. SQL types and existing value,
-response and LOB-prefetch limits are unchanged; this is not a query-wide memory cap.
+Other native fetch paths avoid allocating a separate byte buffer per value,
+including initial rows and ROWID/LOB reads. LOB I/O can still use temporary
+content buffers. Existing value and response limits remain; this is not a limit
+on total query memory. A conversion error after a fully consumed response leaves
+the session usable; incomplete or malformed responses discard it.
+
+An upstream operator stopping a parallel scan early can leave Oracle runtime
+details and the scan's parameter map absent from EXPLAIN ANALYZE. Completed scans
+retain final counters regardless of worker completion order.
 
 Scalar fetch responses are bounded by the number of rows requested, before
 materializing repeated rows, including the legacy decoding fallback. A server
@@ -1561,7 +1569,7 @@ response exceeding that count is rejected.
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `oracle_session_pool_size` | `4` | How many authenticated Oracle sessions to keep and reuse for reads, per DuckDB connection per secret. `0` opens a fresh one every time. |
-| `oracle_statement_cache` | `true` | Reuse up to 32 fully fetched scalar query cursors per native session, within a 2 MiB accounting budget. False releases idle cursors and restores parse/describe on each execution. |
+| `oracle_statement_cache` | `true` | Reuse up to 20 fully fetched scalar query cursors per native session, within a 2 MiB accounting budget. False releases idle cursors and restores parse/describe on each execution. |
 | `oracle_transaction_pool_size` | `2` | How many idle sessions an attached catalog keeps between its transactions, so the next transaction need not connect and authenticate. Read at `ATTACH`; `0` opens a session per transaction. |
 | `oracle_unconstrained_number` | `'varchar'` | What a `NUMBER` with no declared precision becomes: `'varchar'`, `'double'` or `'decimal(38,9)'`-style. Set it before the query or the table's first use. See [section 9](#9-which-oracle-types-work). |
 | `oracle_filter_pushdown` | `true` | Send `WHERE` clauses on attached tables to Oracle, and narrow JSON path tests. See [Pushing filters down](#pushing-filters-down-to-oracle). |
@@ -1570,8 +1578,8 @@ response exceeding that count is rejected.
 | `oracle_join_pushdown` | `true` | Let Oracle join attached tables of one database (an inner join on number, date or timestamp columns). See [Joining two attached tables](#joining-two-attached-tables). |
 | `oracle_deferred_columns` | `true` | Read LOB, JSON, VECTOR and XML columns only for the rows that pass a filter DuckDB applies itself. See [Heavy columns after the filter](#heavy-columns-after-the-filter). |
 | `oracle_direct_scan` | `true` | Decode eligible attached scalar scans directly into typed vectors. NUMBER, DATE/TIMESTAMP, binary floats, BOOLEAN and short VARCHAR2/CHAR/RAW are supported; other columns retain the existing path. Set `false` for comparisons or troubleshooting. |
-| `oracle_fetch_rows` | `16384` | Maximum scalar attached-scan fetch rows, 1..65536. Output vectors remain 2048 rows. Declared row widths reduce the request toward an 8 MiB estimate; deferred, locked and short-limit scans retain the smaller path. |
-| `oracle_parallel_scan` | `-1` | Maximum sessions one scan of an attached table may read through at once: `-1` chooses (up to 8 and DuckDB's thread count, for a table of 500,000 rows or more; roughly 16 MiB or 250,000 filtered rows per reader), `0` or `1` is one session. Small tables and selective filters stay sequential even with a positive maximum. See [section 7](#7-read-a-big-table-faster). |
+| `oracle_fetch_rows` | `16384` | Maximum scalar attached-scan fetch rows, 1..65536; invalid values and NULL fail at SET. Output vectors remain 2048 rows. Selected column widths reduce the request toward an 8 MiB estimate; deferred, locked and short-limit scans retain the smaller path. |
+| `oracle_parallel_scan` | `-1` | Maximum sessions one scan of an attached table may read through at once: `-1` chooses (up to 8 and DuckDB's thread count, for a table of 500,000 rows or more; roughly 16 MiB or 250,000 filtered rows per reader), `0` or `1` is one session. A positive count above one bypasses size/selectivity estimates; range, thread, privilege and transaction safeguards remain. See [section 7](#7-read-a-big-table-faster). |
 | `oracle_parallel_top_n` | `auto` | VARCHAR mode: learn serial work and compare planning, network and candidate costs before using ROWID Top-N. `true`/`parallel` forces eligible ranges, `false`/`serial` forces one ranked read. Reader/thread/pool caps and snapshot/privilege safeguards apply. Plain LIMIT retains its path. |
 | `oracle_parallel_count` | `false` | Compute eligible scalar COUNT(*) and COUNT(column) per ROWID range at one SCN, then sum in DuckDB. Uses the reader/thread caps and serial privilege/write fallback; DISTINCT and grouped or mixed aggregates retain their existing paths. Multiple counts may be slower than one indexed count. |
 | `oracle_scan_plan_cache` | `true` | Reuse checked ROWID boundaries and projected wire descriptions (32 entries, 8 MiB accounting budget per connection). Each execution checks identity and flashback access and takes a fresh SCN. Set false for comparisons. |

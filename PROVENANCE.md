@@ -121,7 +121,21 @@ Only protocol invariants were used. The byte expectations in
 The native path was exercised against Oracle 19c and Free, including changed
 binds, repeated/empty results, eviction, and external table/type/precision DDL.
 External revalidation can return a new describe; it must replace the saved
-shape before row decoding. No failed statement is replayed.
+shape before row decoding. Review of `messages/base.pyx` at the same revision
+(lines around 1344 and 1365) also established two invariants: a nonzero returned
+cursor ID supersedes the old ID, and ORA-01007/ORA-00932 before returned rows can
+request a full parse. The sibling `orawire/execute.go` reference was checked for
+the cursor field layout. The native registry accepts a replacement only if it
+is nonzero and does not collide with another active cursor.
+
+`query_retry_fixture.hpp` creates all reexecute/error/describe replies in code;
+none is a captured packet. Tests permit exactly one full query execution with
+current SQL and binds after a completely consumed ORA-01007 or ORA-00932 reply
+with no rows. They reject retries after rows, cancellation, any other error or
+a failed retry. Protocol and adapter tests exercise the production helper and
+transaction-session reuse. Live external ADD/MODIFY checks on Free and 19c
+returned fresh descriptions rather than these invalidation errors; the error
+branches are therefore covered synthetically, not claimed as live reproductions.
 
 The multi-address and redirect tests in `test/cpp/protocol_test.cpp` build
 their REDIRECT, REFUSE, ACCEPT and DATA packets in the test from the field

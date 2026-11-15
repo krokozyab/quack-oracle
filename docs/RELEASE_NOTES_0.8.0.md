@@ -1,119 +1,89 @@
-# 0.8.0 (draft)
+# oracle_scanner 0.8.0 (draft)
 
-## Added
+Built for DuckDB v2.0.0. This is an unpublished draft; the extension version
+remains 0.7.0 until a release is approved.
 
-- Bounded range-plan cache (`oracle_scan_plan_cache`, default true): reuse
-  ROWID boundaries and projected wire descriptions after checking table
-  identity, heap kind and the attachment's DDL epoch. Every execution takes
-  a fresh SCN and checks flashback access. Worker descriptions are validated
-  before decoding. Planning time, round trips and cache hits appear separately
-  in EXPLAIN ANALYZE. Cold planning combines metadata and describe exchanges.
+## More of the query runs in Oracle
 
-- Opt-in `oracle_parallel_count`: compute scalar COUNT(*) and COUNT(column)
-  over disjoint ROWID ranges at one SCN and sum them in DuckDB with a checked
-  BIGINT result. Empty inputs return zero. Uses reader/thread caps and falls
-  back to one count for missing privileges or write-pinned reads. DISTINCT,
-  grouping, mixed aggregates, samples and local filters retain their paths.
-  Defaults to false because range planning and multiple counts can be slower
-  than one Oracle count. Invalid or missing partial replies fail the query.
+- **AVG of exact numbers.** For `NUMBER(p,s)` with `p <= 18` and
+  `0 <= s <= p`, Oracle returns a sum and a non-NULL count; DuckDB performs the
+  final division using its decimal rounding rules. Other inputs stay local.
+  An empty input returns NULL. Invalid or overflowing partial results fail.
+- **More joins in one query.** Eligible inner joins across three or more
+  tables in one attachment, including tables from different Oracle schemas,
+  can run in Oracle with an aggregate above them. Filters and reads of your
+  transaction's own writes retain their usual visibility.
+- **Parallel COUNT, when requested.** `SET oracle_parallel_count = true` lets
+  eligible `COUNT(*)` and `COUNT(column)` use readers at one snapshot. DuckDB
+  combines their counts with overflow checks. This is off by default: one
+  Oracle count, particularly through an index, can be faster. Missing privileges
+  or an active write transaction use one reader.
 
-- Automatic `oracle_parallel_top_n`: learn serial execution cost and choose
-  ranked ROWID ranges using planning latency, scan/candidate volume and observed
-  parallel work. DuckDB retains the global Top-N, OFFSET and NULL ordering.
-  Cost observations are bounded; snapshot, reader and privilege guards remain.
-  Explicit true/parallel and false/serial overrides are supported.
+## Faster repeated reads and copies
 
-- Partial AVG pushdown for exact NUMBER(p,s), p <= 18 and 0 <= s <= p:
-  Oracle computes the scaled sum and non-NULL count; DuckDB finalizes the
-  result with the pinned engine's integer/decimal rounding rules. Other AVG
-  inputs retain local execution.
-
-- Compose eligible inner joins across three or more attached tables in one
-  Oracle catalog, and push eligible aggregates over their result. Each base
-  table keeps its owner, filters and transaction snapshot.
+- Repeated parallel scans reuse checked range plans and pooled connections.
+  Each execution still obtains a new snapshot and checks table identity and
+  access. `oracle_scan_plan_cache = false` disables plan reuse for comparisons.
+- Scalar scans request up to **16,384 rows** at a time, returning DuckDB vectors
+  of at most 2,048 rows. Wide selected columns reduce the request. A LOB you do
+  not select no longer reduces it. Small bounded reads can return their first
+  rows with the initial query response.
+- Number, date, timestamp, binary float, BOOLEAN and short text/RAW scans can
+  convert values directly while fetching. Wide results choose the previous
+  buffered path before reading, rather than failing partway through a response.
+  `oracle_direct_scan = false` selects that buffered path for comparisons.
+- Other fetch paths avoid a separate byte allocation for every value. SQL types
+  and NULL semantics are unchanged. These changes do not impose a query-wide
+  memory limit.
+- `EXPLAIN ANALYZE` separates query-open time, subsequent fetch time and range
+  planning. Parallel times are summed across readers and can exceed wall time.
+  Final parallel counters are published only after every range finishes.
 
 ## Behaviour changes
 
-- Reuse bounded native scalar query cursors by default (`oracle_statement_cache`).
-  Repeat executions avoid resending SQL and bind metadata, retain no result rows
-  or bind values, and preserve transaction visibility. Writes, DDL and PL/SQL
-  invalidate idle entries. External DDL can supply a fresh describe or fail with
-  an Oracle invalidation error; failed statements are not replayed. Set false
-  to retain ordinary parse/describe behavior without disabling session pooling.
+- **Positive reader counts override size estimates.** `oracle_parallel_scan = -1`
+  chooses automatically, targeting roughly 16 MiB or 250,000 returned rows per
+  reader, up to eight readers and DuckDB's thread count. A positive value above
+  one requests that many readers even with stale or selective statistics;
+  thread limits, available ranges, privileges and transaction safeguards still
+  apply. `0` and `1` select one reader. A 600,000-row test with statistics claiming
+  1,000 rows used four readers with `4` and one with `-1` on both supported lanes.
+- **Automatic ranked reads.** `oracle_parallel_top_n` is now a VARCHAR setting
+  with default `auto`. It starts with two serial measurements before comparing
+  serial and parallel costs. Existing `true`/`false` values still force a choice;
+  reported values are `auto`, `true`, `false`. Calibration can make the first
+  executions slower. Ordinary LIMIT keeps its separate path.
+- **Cursor reuse is on by default.** `oracle_statement_cache` retains at most
+  **20** idle scalar query cursors per session. Snapshot SQL (`AS OF SCN`) and
+  ROWID ranges are not cached. Different filter literals remain different keys;
+  use binds for repeated SQL. Writes and administrative statements invalidate
+  idle entries. Set the setting to false to disable reuse without disabling
+  connection pooling.
+- A cached read receiving ORA-01007 or ORA-00932 before returning any rows is
+  reparsed and executed once with its current binds. There is no retry after
+  returned rows, cancellation or another error, and no second retry if the full
+  execution fails. This does not replay writes. Oracle may instead return an
+  updated description directly.
+- **External schema changes fail safely.** A changed Oracle type, NUMBER
+  precision/scale, timestamp/interval scale or text character form is refused
+  before values or pushed aggregates use the old attached schema. DETACH and
+  ATTACH again to refresh it. This prevents fractional NUMBER values being
+  silently truncated after external DDL.
+- `SET oracle_fetch_rows` immediately rejects NULL and values outside
+  **1..65,536**. Responses returning more rows than requested are rejected
+  before decoding extra rows, including rows in the initial query response.
+- A direct-path value outside DuckDB's representable range reports a conversion
+  error. If the complete Oracle response was consumed, the connection remains
+  usable. Incomplete or malformed responses still discard it.
+- Partial AVG of DECIMAL widths up to four rejects counts above
+  922,337,203,685,477 so its sum stays within DuckDB's accumulator range.
 
-- `oracle_parallel_top_n` changes from BOOLEAN default false to VARCHAR default
-  `auto`. Existing `SET ... = true/false` remains valid as a forced choice; the
-  reported canonical values are `auto`, `true`, `false`. Auto starts with two
-  serial samples and can pay an initial planning/session calibration cost.
+## Limitations
 
-- Reject attached scans when Oracle's wire type no longer matches the cached
-  table schema. An external NUMBER-to-VARCHAR2 change could previously decode
-  text as a number. DETACH and ATTACH refresh the schema before another read.
-
-- Eligible AVG queries can return groups instead of all input rows. An
-  oversized remote COUNT or invalid sum fails instead of silently rounding.
-  `oracle_aggregate_pushdown = false` retains local execution.
-
-- Partial AVG of DECIMAL widths <=4 refuses counts above 922337203685477,
-  ensuring every partial sum fits the pinned DuckDB INT64 accumulator.
-
-- Reject scalar fetch responses exceeding the requested row count before
-  materializing them, including compressed repeats and legacy fallback.
-
-- Scalar attached scans fetch up to 16384 rows and retain unread rows while
-  returning DuckDB vectors of at most 2048 rows. `oracle_fetch_rows` controls
-  the maximum (1..65536); declared widths reduce the request toward an 8 MiB
-  estimate. This estimate is not a hard limit on all scan memory.
-- A positive `oracle_parallel_scan` is a maximum: known small tables and
-  selective filters stay sequential.
-
-- Decode eligible scalar scans into typed vectors during fetch, avoiding a
-  batched intermediate wire-cell arena. NUMBER, dates/timestamps, binary floats,
-  BOOLEAN and short text/RAW are eligible; wider text, LOB and deferred paths
-  retain their existing implementation. `oracle_direct_scan=false` selects the
-  previous path. Output types are unchanged.
-- Direct batches use a conservative 64 MiB retained-data budget. Borrowed wire
-  values are consumed synchronously; the last-row snapshot survives fetches.
-  Value-conversion failures poison the active read handle and retain their
-  original exception, without being mistaken for incomplete network framing.
-- Auto parallelism estimates the selected columns and filtered row count,
-  targeting approximately 16 MiB or 250,000 returned rows per reader, up to
-  eight readers and DuckDB's thread count. The row budget accounts for framing
-  and decoding work even when the selected columns are narrow. Existing small
-  table and selective-filter guards still apply.
-
-- Native result rows now use a response-owned byte arena with offset/NULL
-  descriptors, including execute prefetch, ROWID and LOB paths. Row continuations
-  share unchanged bytes, incomplete rows roll back arena appends, and fetch
-  snapshots use independent storage. Converters consume byte views without
-  materializing temporary wire-cell vectors. SQL result types are unchanged;
-  LOB I/O may still allocate temporary content buffers.
-
-- Reuse pooled read sessions for ROWID planning instead of authenticating a new
-  dictionary session for each parallel scan. Failed planning exchanges discard
-  the lease before serial fallback.
-
-- Add `ORACLE_SCANNER_STATIC_LINK=OFF` for measuring loadable builds and a guard
-  that rejects an already loaded built-in copy before explicit loading.
-
-- Prefetch up to 32 rows for known narrow bounded scalar reads and aggregates,
-  using an 8 KiB estimated initial payload budget. Small results can finish in
-  one exchange; wide/unknown values, LOB and write-locked scans retain their
-  ordinary initial query fetch. Exact AVG still finishes in DuckDB.
-
-- Resume incomplete short scalar rows without exception unwinding in the direct
-  decoder. Rows are emitted only when complete; existing malformed-input and
-  size checks remain in force. Chunked values retain their existing parser.
-
-- Finish sequential scans after consuming an exhausted batch, avoiding an extra
-  cursor fetch and interrupt watcher. Buffered rows and parallel ROWID ranges
-  retain their normal traversal.
-
-- `EXPLAIN ANALYZE` reports cursor execution and initial-row latency as
-  `Oracle query open time`, separately from subsequent fetches. Parallel scans
-  now charge range opens to this metric instead of fetch time. Durations are
-  summed across readers and can exceed wall time.
-
-- Publish parallel scan totals only after all ranges finish, preventing an
-  early worker's snapshot from overwriting final `EXPLAIN ANALYZE` counters.
-  Runtime Oracle details are omitted when an upstream operator stops a parallel scan early.
+- An upstream operator stopping a parallel scan early can leave runtime Oracle
+  details, including the scan's parameter map, absent from `EXPLAIN ANALYZE`.
+  Completed scans retain final totals regardless of worker completion order.
+- Reader selection is a heuristic. Compare explicit reader counts and serial
+  execution on your server; these notes make no universal speedup claim.
+- LOB reads can still allocate temporary content buffers. Fetch sizing and the
+  cursor cache have separate bounds; neither is a limit on total query memory.
