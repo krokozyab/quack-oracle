@@ -2126,6 +2126,35 @@ void TestAutomaticCallBindsFromTheSignature() {
 // round trip, so a statement that can reuse one should. The fake counts them,
 // which is the only thing that distinguishes a pool that works from one that
 // quietly opens a session every time anyway.
+void TestAttachedScanRefusesChangedWireTypes() {
+    auto script = std::make_shared<FakeScript>();
+    script->routes = {
+        {"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}},
+        {"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("WIRE_CHANGE")}}}},
+        {"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}},
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {{Text("WIRE_CHANGE"), Text("V"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("Y")}}}},
+        {"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}}};
+    script->tables["WIRE_CHANGE"] = {{Column("V", 2, 10, 0)}, {{Number("7")}}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS o(TYPE oracle_scanner); SET oracle_parallel_scan=1;");
+    const auto query = "SELECT V FROM o.WIRE_CHANGE";
+    CHECK(database.Query(query)->GetValue(0, 0).ToString() == "7");
+    script->tables["WIRE_CHANGE"] = {{Column("V", 1)}, {{Text("aa")}}};
+    auto changed = database.Query(query);
+    CHECK(changed->HasError());
+    CHECK(changed->GetError().find("wire type changed") != std::string::npos);
+    CHECK(changed->GetError().find("DETACH and ATTACH") != std::string::npos);
+    // A failed schema check leaves the connection usable and owns no cursor.
+    CHECK(database.Query("SELECT 42")->GetValue(0, 0).ToString() == "42");
+    script->tables["WIRE_CHANGE"] = {{Column("V", 2, 10, 0)}, {{Number("42")}}};
+    CHECK(database.Query(query)->GetValue(0, 0).ToString() == "42");
+    std::cout << "an attached scan refuses a changed wire type before decoding values" << std::endl;
+}
+
 void TestReadSessionsArePooledPerConnection() {
     auto script = std::make_shared<FakeScript>();
     script->columns = {Column("label", 1)};
@@ -6585,6 +6614,7 @@ int main() {
     TestScanReleasesItsSession();
     TestReadSessionsArePooledPerConnection();
     TestAttachedCatalogAgainstAFakeSession();
+    TestAttachedScanRefusesChangedWireTypes();
     TestAttachedDdlRefreshesAndCompensates();
     TestAttachedUpsertsUseOracleMerge();
     TestAttachedMergesRefuseUnsafeKeyEquality();

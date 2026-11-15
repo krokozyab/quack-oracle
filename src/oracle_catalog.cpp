@@ -2792,6 +2792,10 @@ void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const 
             continue;
         }
         const auto &dictionary_column = bind.columns[selected[index]];
+        if (dictionary_column.oracle_type != 0 && columns[index].oracle_type != dictionary_column.oracle_type) {
+            throw IOException("Oracle ATTACH table '%s' column '%s' wire type changed; DETACH and ATTACH to refresh its schema",
+                              bind.object_name, dictionary_column.name);
+        }
         if (columns[index].name != dictionary_column.name) {
             throw IOException("Oracle ATTACH table '%s' returned column '%s' where '%s' was selected",
                               bind.object_name, columns[index].name, dictionary_column.name);

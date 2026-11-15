@@ -610,6 +610,9 @@ DML; it does not run a remote Oracle SELECT.
 
 For other DDL use `oracle_execute_admin`. Changes made through that API or
 outside the extension still require DETACH/ATTACH to refresh this catalog.
+If a scan finds a wire type that differs from the attached schema, it refuses
+the read and asks for that refresh. This prevents an external type change, such
+as NUMBER to VARCHAR2, from interpreting the new value with the old decoder.
 [Section 5](#5-write-data) lists the administrative API's accepted statements.
 
 ### Pushing filters down to Oracle

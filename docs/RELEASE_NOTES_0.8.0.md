@@ -26,6 +26,10 @@
 
 ## Behaviour changes
 
+- Reject attached scans when Oracle's wire type no longer matches the cached
+  table schema. An external NUMBER-to-VARCHAR2 change could previously decode
+  text as a number. DETACH and ATTACH refresh the schema before another read.
+
 - Eligible AVG queries can return groups instead of all input rows. An
   oversized remote COUNT or invalid sum fails instead of silently rounding.
   `oracle_aggregate_pushdown = false` retains local execution.
