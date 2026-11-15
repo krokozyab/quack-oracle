@@ -117,6 +117,14 @@ struct FakeResponse {
     std::vector<WireRow> rows;
 };
 
+// A dictionary fixture for the combined heap/identity/SCN planning exchange.
+FakeResponse RangeIdentity(const std::string &scn = "424242", const std::string &object = "100",
+                           const std::string &data_object = "101", const std::string &ddl = "20261115000000") {
+    return {{Column("IOT_TYPE", 1), Column("TEMPORARY", 1), Column("CLUSTER_NAME", 1), Column("OBJECT_ID", 2),
+             Column("DATA_OBJECT_ID", 2), Column("DDL", 1), Column("SCN", 2)},
+            {{std::nullopt, Text("N"), std::nullopt, Number(object), Number(data_object), Text(ddl), Number(scn)}}};
+}
+
 // A scripted table, so the fake can answer any projection of it rather than one
 // fixed select list. The attached catalog decides the select list itself — a
 // scan of two columns, an UPDATE's scan of one column and the ROWID — and a
@@ -3388,8 +3396,10 @@ void TestSelectiveFiltersReadThroughOneSession() {
            {Text("FACTS"), Text("KIND"), Text("NUMBER"), Number("22"), Number("1"), Number("0"), Text("N")}}}});
     script->routes.push_back({"FROM user_constraints", {text_columns({"TABLE_NAME", "COLUMN_NAME"}), {}}});
     script->tables["FACTS"] = {{Column("ID", 2, 10, 0), Column("KIND", 2, 1, 0)}, {{Number("7"), Number("1")}}};
+    script->routes.insert(script->routes.begin(), {"oracle_scanner_range_identity", RangeIdentity()});
     auto factory = InstallFake(script);
     TestDatabase database;
+    database.Run("SET oracle_scan_plan_cache=false;");
     database.Run("SET threads = 4;");
     database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner);");
     const auto read_in_ranges = [&](const std::string &where, const std::string &projection = "ID, KIND") {
@@ -3826,8 +3836,10 @@ void TestAttachedScanReadsInRowidRanges() {
          {dictionary, {{Text("FACTS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("N")}}}});
     script->routes.push_back({"FROM user_constraints", {text_columns({"TABLE_NAME", "COLUMN_NAME"}), {}}});
     script->tables["FACTS"] = {{Column("ID", 2, 10, 0)}, {{Number("1")}}};
+    script->routes.insert(script->routes.begin(), {"oracle_scanner_range_identity", RangeIdentity()});
     auto factory = InstallFake(script);
     TestDatabase database;
+    database.Run("SET oracle_scan_plan_cache=false;");
     database.Run("SET oracle_session_pool_size = 1;");
     database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner);");
 
@@ -3946,8 +3958,10 @@ void TestParallelTopNRanksCandidatesAtOneSnapshot() {
         table.rows.push_back({Number(std::to_string(i))});
     }
     table.rows.insert(table.rows.end(), 4, {std::nullopt});
+    script->routes.insert(script->routes.begin(), {"oracle_scanner_range_identity", RangeIdentity()});
     auto factory = InstallFake(script);
     TestDatabase database;
+    database.Run("SET oracle_scan_plan_cache=false;");
     database.Run("ATTACH 'ora' AS o(TYPE oracle_scanner); SET threads=4; SET oracle_parallel_scan=4;");
     database.Run("CREATE TEMP TABLE expected AS SELECT i::BIGINT AS ID FROM range(40) r(i) UNION ALL "
                  "SELECT NULL::BIGINT FROM range(4);");
@@ -4073,8 +4087,10 @@ void TestParallelCountsCombineOneSnapshot() {
     script->routes.insert(script->routes.begin(), {select, {columns, {{Number("44"), Number("26")}}}});
     script->tables["COUNTS"] = {{Column("ID", 2, 10, 0), Column("V", 2, 10, 0)},
                                  {{Number("1"), Number("2")}, {Number("2"), std::nullopt}}};
+    script->routes.insert(script->routes.begin(), {"oracle_scanner_range_identity", RangeIdentity()});
     auto factory = InstallFake(script);
     TestDatabase database;
+    database.Run("SET oracle_scan_plan_cache=false;");
     database.Run("ATTACH 'ora' AS o(TYPE oracle_scanner); SET threads=4; SET oracle_parallel_scan=4; SET oracle_aggregate_pushdown=true;");
     const auto query = "SELECT count(*), count(V) FROM o.COUNTS";
     const auto ranges_read = [&] {
@@ -4174,6 +4190,112 @@ void TestParallelCountsCombineOneSnapshot() {
     CHECK(!database.Query("SELECT count(*) FROM o.COUNTS WHERE ID % 2 = 0")->HasError());
     CHECK(ranges_read() == 0);
     std::cout << "partial COUNT combines ranges at one SCN and validates every scalar reply" << std::endl;
+}
+
+void TestParallelPlanCacheChecksIdentityAndEveryCursor() {
+    auto script = std::make_shared<FakeScript>();
+    script->routes = {
+        {"oracle_scanner_range_identity", RangeIdentity()},
+        {"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}},
+        {"num_rows IS NOT NULL", {{Column("TABLE_NAME", 1), Column("NUM_ROWS", 2)},
+                                   {{Text("CACHED"), Number("1000000")}}}},
+        {"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("CACHED")}}}},
+        {"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}},
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {{Text("CACHED"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("Y")}}}},
+        {"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}}};
+    FakeResponse extents {{Column("LOW", 1), Column("BLOCKS", 2)}, {}};
+    for (int i = 0; i < 10; i++) {
+        extents.rows.push_back({Text("EXTENT" + std::to_string(i)), Number("1000")});
+    }
+    script->routes.insert(script->routes.begin() + 1, {"dba_extents", extents});
+    script->tables["CACHED"] = {{Column("ID", 2, 10, 0)}, {{Number("1")}}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS o(TYPE oracle_scanner); SET threads=4; SET oracle_parallel_scan=4; "
+                 "SET oracle_parallel_top_n=true;");
+    const std::string query = "SELECT ID FROM o.CACHED ORDER BY ID DESC LIMIT 1";
+    const auto calls = [&](const std::string &fragment) {
+        size_t count = 0;
+        for (const auto &sql : script->queries) {
+            count += sql.find(fragment) != std::string::npos;
+        }
+        return count;
+    };
+    const auto run = [&](bool hit, const std::string &scn, int value) {
+        script->queries.clear();
+        const auto result = database.Query(query);
+        CHECK(!result->HasError() && result->RowCount() == 1);
+        CHECK(result->GetValue(0, 0).GetValue<int64_t>() == value);
+        CHECK(calls("oracle_scanner_range_identity") == 1);
+        CHECK(calls("dba_extents") == size_t(hit ? 0 : 1));
+        CHECK(calls("WHERE ROWID") == 4);
+        CHECK(calls("SELECT 1 FROM \"CACHED\" AS OF SCN") == size_t(hit ? 1 : 0));
+        CHECK(calls("SELECT \"ID\" FROM \"CACHED\" AS OF SCN " + scn + " WHERE 1 = 0") == size_t(hit ? 0 : 1));
+        for (const auto &sql : script->queries) {
+            if (sql.find("WHERE ROWID") != std::string::npos) {
+                CHECK(sql.find("AS OF SCN " + scn) != std::string::npos);
+            }
+        }
+    };
+    run(false, "424242", 1);
+    script->routes[0].second = RangeIdentity("424243");
+    script->tables["CACHED"].rows = {{Number("2")}};
+    run(true, "424243", 2); // cached boundaries, new snapshot and new data
+    // Each component of the identity invalidates the old plan independently.
+    script->routes[0].second = RangeIdentity("424244", "200");
+    run(false, "424244", 2);
+    script->routes[0].second = RangeIdentity("424245", "200", "201");
+    run(false, "424245", 2);
+    script->routes[0].second = RangeIdentity("424246", "200", "201", "20261115000001");
+    run(false, "424246", 2);
+    run(true, "424246", 2);
+    // A worker's descriptor can change after the identity check, even within
+    // one dictionary timestamp tick. Detect it before interpreting its bytes.
+    script->tables["CACHED"].columns[0].oracle_type = 100;
+    CHECK(database.Query(query)->HasError());
+    script->tables["CACHED"].columns[0].oracle_type = 2;
+    run(false, "424246", 2);
+    // A failed worker discards the plan too, rather than retaining its shape.
+    script->query_failure_fragment = "WHERE ROWID";
+    CHECK(database.Query(query)->HasError());
+    script->query_failure_fragment.clear();
+    run(false, "424246", 2);
+    // A revoked flashback privilege on a warm plan still falls back to serial.
+    script->query_failure_fragment = "SELECT 1 FROM \"CACHED\" AS OF SCN";
+    script->queries.clear();
+    CHECK(!database.Query(query)->HasError() && calls("WHERE ROWID") == 0);
+    script->query_failure_fragment.clear();
+    run(false, "424246", 2);
+    // An attachment with the same secret and object has its own DDL epoch.
+    database.Run("ATTACH 'ora' AS p(TYPE oracle_scanner);");
+    script->queries.clear();
+    CHECK(!database.Query("SELECT ID FROM p.CACHED ORDER BY ID DESC LIMIT 1")->HasError());
+    CHECK(calls("dba_extents") == 1);
+    // Our own DDL invalidates across the attachment, even if the dictionary
+    // timestamp and object numbers happen not to change.
+    database.Run("ALTER TABLE o.CACHED ADD COLUMN X BIGINT;");
+    run(false, "424246", 2);
+    database.Run("SET oracle_scan_plan_cache=false;");
+    run(false, "424246", 2);
+    run(false, "424246", 2);
+    database.Run("SET oracle_scan_plan_cache=true;");
+    // Exercise actual LRU eviction through SQL, without exposing a test-only
+    // cache API. Varying the reader cap changes the boundary-plan key.
+    for (int readers = 2; readers <= 34; readers++) {
+        database.Run("SET oracle_parallel_scan=" + std::to_string(readers));
+        CHECK(!database.Query(query)->HasError());
+    }
+    database.Run("SET oracle_parallel_scan=2;");
+    script->queries.clear();
+    CHECK(!database.Query(query)->HasError() && calls("dba_extents") == 1);
+    // Malformed/oversized metadata cannot enter the cache or form an SCN SQL.
+    script->routes[0].second.rows[0][6] = Text("not-a-number");
+    script->queries.clear();
+    CHECK(!database.Query(query)->HasError() && calls("WHERE ROWID") == 0);
+    std::cout << "range plan cache validates identity, fresh SCNs, DDL epochs, worker shapes and eviction" << std::endl;
 }
 
 void TestParallelMetricSnapshotsSurviveReverseFlushOrder() {
@@ -6631,6 +6753,7 @@ int main() {
     TestAttachedScanReadsInRowidRanges();
     TestParallelTopNRanksCandidatesAtOneSnapshot();
     TestParallelCountsCombineOneSnapshot();
+    TestParallelPlanCacheChecksIdentityAndEveryCursor();
     TestParallelMetricSnapshotsSurviveReverseFlushOrder();
     TestTextComparesByTheSessionCollation();
     TestLargeScalarFetchKeepsRowsAndLocalFilters();

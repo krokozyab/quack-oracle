@@ -2779,7 +2779,8 @@ unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context,
             sessions = count < 0 ? automatic : static_cast<idx_t>(MinValue<int64_t>(64, count));
             sessions = MinValue<idx_t>(sessions, TaskScheduler::GetScheduler(context).NumberOfThreads());
         }
-        auto chunks = PlanParallelAttachedScan(context, source, {}, sessions, bind.count_select_list);
+        auto plan = PlanParallelAttachedScan(context, source, {}, sessions, bind.count_select_list);
+        auto &chunks = plan.statements;
         if (!chunks.empty()) {
             auto state = make_uniq<OracleQueryGlobalState>(OracleSessionHandle(), nullptr, bind.columns, bind.types,
                                                            std::move(input.column_ids), bind.columns.size());
@@ -2787,6 +2788,11 @@ unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context,
             state->scalar_count = true;
             state->thread_count = MinValue<idx_t>(sessions, chunks.size());
             state->chunk_sql = std::move(chunks);
+            state->expected_wire_columns = std::move(plan.wire_columns);
+            state->plan_cache_key = std::move(plan.cache_key);
+            state->planning_nanoseconds = plan.planning_nanoseconds;
+            state->planning_io = plan.planning_io;
+            state->plan_cache_hit = plan.cache_hit;
             state->secret_name = bind.secret_name;
             state->config = bind.config;
             state->password = bind.password;
@@ -3145,13 +3151,10 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
                 MinValue<idx_t>(readers, static_cast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads()));
         }
     }
-    auto chunks = PlanParallelAttachedScan(context, bind, selected, sessions);
+    auto plan = PlanParallelAttachedScan(context, bind, selected, sessions);
+    auto &chunks = plan.statements;
     if (!chunks.empty()) {
-        // Described once, with no row read: the chunks all have this shape.
-        OracleScanOpening described;
-        OpenProjectedScan(context, bind, selected, session, cursor, columns, true, &described);
-        cursor->Close();
-        cursor.reset();
+        columns = std::move(plan.columns);
         std::vector<LogicalType> chunk_types;
         chunk_types.reserve(columns.size());
         for (const auto &column : columns) {
@@ -3160,14 +3163,17 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
         auto state = make_uniq<OracleQueryGlobalState>(OracleSessionHandle(), nullptr, std::move(columns),
                                                        std::move(chunk_types), std::move(input.column_ids), chunk_columns);
         state->local_filter = std::move(local_filter);
-        state->metrics.Add(described.io);
-        state->metrics.query_nanoseconds += described.query_nanoseconds;
         state->fetch_rows = OracleScanFetchRows(context, bind);
         state->direct_scalar = OracleDirectScanEnabled(context, bind);
         state->parallel = true;
         state->parallel_top_n = !bind.order_clause.empty();
         state->thread_count = MinValue<idx_t>(sessions, chunks.size());
         state->chunk_sql = std::move(chunks);
+        state->expected_wire_columns = std::move(plan.wire_columns);
+        state->plan_cache_key = std::move(plan.cache_key);
+        state->planning_nanoseconds = plan.planning_nanoseconds;
+        state->planning_io = plan.planning_io;
+        state->plan_cache_hit = plan.cache_hit;
         state->secret_name = bind.secret_name;
         state->config = bind.config;
         state->password = bind.password;
@@ -3307,6 +3313,10 @@ void OracleQueryMetrics(TableFunctionGetMetricsInput &input) {
 	if (state->parallel) {
 		metrics.AddExtraInfo("Oracle ROWID ranges", std::to_string(counters.chunks_read.load()) + " read of " +
 		                                                std::to_string(state->chunk_sql.size()));
+        metrics.AddExtraInfo("Oracle plan cache", state->plan_cache_hit ? "hit" : "miss or disabled");
+        metrics.AddExtraInfo("Oracle planning time", seconds(state->planning_nanoseconds));
+        metrics.AddExtraInfo("Oracle planning network",
+                             std::to_string(state->planning_io.round_trips) + " round trips");
 	}
 	metrics.AddExtraInfo("Oracle rows returned", std::to_string(counters.rows_fetched.load()));
 	metrics.AddExtraInfo("Oracle network", StringUtil::BytesToHumanReadableString(counters.bytes_received.load()) +
@@ -3490,6 +3500,9 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
                                     ? OpenOracleScalarRead(local->session.Get(), state.chunk_sql[chunk], state.columns)
                                     : local->session->Query(state.chunk_sql[chunk], {});
                 local->count_rows = 0;
+                if (!OracleScanDescribeMatches(state.expected_wire_columns, local->cursor->Columns())) {
+                    throw IOException("Oracle parallel scan describe changed; execute the query again to replan");
+                }
                 if (state.scalar_count) {
                     const auto &columns = local->cursor->Columns();
                     if (columns.size() != state.columns.size() ||
@@ -3506,6 +3519,7 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
                 local->last_io = io_now;
             } catch (const std::exception &error) {
                 local->session.Poison();
+                InvalidateOracleScanPlan(context, state.plan_cache_key);
                 throw IOException("Oracle ATTACH could not open a chunk of the table: %s", error.what());
             }
         }
@@ -3534,6 +3548,7 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
                     } catch (...) {
                         if (local) {
                             local->session.Poison();
+                            InvalidateOracleScanPlan(context, state.plan_cache_key);
                         } else {
                             if (interrupt) {
                                 interrupt->Stop();
@@ -3552,6 +3567,7 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
                         return local->cursor->FetchPacked(state.fetch_rows);
                     } catch (...) {
                         local->session.Poison();
+                        InvalidateOracleScanPlan(context, state.plan_cache_key);
                         throw;
                     }
                 }

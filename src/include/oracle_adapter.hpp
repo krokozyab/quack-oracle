@@ -394,6 +394,11 @@ struct OracleQueryGlobalState final : GlobalTableFunctionState {
     bool scalar_count = false;
     size_t count_rows = 0;
     std::vector<std::string> chunk_sql;
+    std::vector<OracleColumn> expected_wire_columns;
+    std::string plan_cache_key;
+    uint64_t planning_nanoseconds = 0;
+    OracleIoStats planning_io;
+    bool plan_cache_hit = false;
     std::atomic<idx_t> next_chunk {0};
     idx_t thread_count = 1;
     std::string secret_name;
@@ -609,7 +614,8 @@ void OverlayDictionaryColumn(OracleColumn &described, const OracleColumn &dictio
 //! The change number to read a heap table at, or empty when it cannot be pinned
 //! (a view, an index-organized, clustered or temporary table, or no flashback).
 //! The change number every scan of this statement reads at when oracle_consistent_read is on, else empty.
-std::string OracleQuerySnapshot(ClientContext &context, const OracleQueryBindData &bind);
+std::string OracleQuerySnapshot(ClientContext &context, const OracleQueryBindData &bind,
+                                OracleIoStats *opening_io = nullptr);
 std::string OracleSnapshotOfHeapTable(ClientContext &context, const OracleQueryBindData &bind);
 
 void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const std::vector<column_t> &selected,
@@ -620,9 +626,20 @@ void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const 
 //! The statements, one per chunk of the table, that read an attached table through
 //! several sessions at one SCN, cut into ROWID ranges at extent boundaries; empty
 //! when the scan should be one stream (see the implementation for the reasons).
-std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const OracleQueryBindData &bind,
-                                                  const std::vector<column_t> &selected, idx_t sessions,
-                                                  const std::string &aggregate_select = std::string());
+struct OracleParallelPlan {
+    std::vector<std::string> statements;
+    std::vector<OracleColumn> columns;
+    std::vector<OracleColumn> wire_columns;
+    std::string cache_key;
+    uint64_t planning_nanoseconds = 0;
+    OracleIoStats planning_io;
+    bool cache_hit = false;
+};
+OracleParallelPlan PlanParallelAttachedScan(ClientContext &context, const OracleQueryBindData &bind,
+                                           const std::vector<column_t> &selected, idx_t sessions,
+                                           const std::string &aggregate_select = std::string());
+void InvalidateOracleScanPlan(ClientContext &context, const std::string &key);
+bool OracleScanDescribeMatches(const std::vector<OracleColumn> &expected, const std::vector<OracleColumn> &actual);
 
 unique_ptr<LogicalOperator> MakeOracleMergePlan(TableCatalogEntry &table, TableIndex table_index,
                                                 OracleWriteTarget target, std::string sql,

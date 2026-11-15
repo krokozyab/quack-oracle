@@ -2,6 +2,13 @@
 
 ## Added
 
+- Bounded range-plan cache (`oracle_scan_plan_cache`, default true): reuse
+  ROWID boundaries and projected wire descriptions after checking table
+  identity, heap kind and the attachment's DDL epoch. Every execution takes
+  a fresh SCN and checks flashback access. Worker descriptions are validated
+  before decoding. Planning time, round trips and cache hits appear separately
+  in EXPLAIN ANALYZE. Cold planning combines metadata and describe exchanges.
+
 - Opt-in `oracle_parallel_count`: compute scalar COUNT(*) and COUNT(column)
   over disjoint ROWID ranges at one SCN and sum them in DuckDB with a checked
   BIGINT result. Empty inputs return zero. Uses reader/thread caps and falls

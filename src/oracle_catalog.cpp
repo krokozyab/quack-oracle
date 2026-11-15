@@ -51,6 +51,7 @@
 #include <map>
 #include <mutex>
 #include <unordered_map>
+#include <limits>
 
 namespace duckdb {
 
@@ -122,9 +123,11 @@ private:
 
 // Owners have independent metadata caches, but one attachment shares its DDL
 // epoch, DDL lock and transaction-session pool across every schema alias.
+std::atomic<uint64_t> next_attachment_id {0};
 struct OracleAttachedEpoch {
     std::mutex ddl_lock;
     std::atomic<idx_t> version {0};
+    const uint64_t identity = ++next_attachment_id;
 };
 
 struct OracleAttachedState {
@@ -1183,6 +1186,10 @@ public:
     // DuckDB 2.0 leaves the columns to the entry, as DuckTableEntry keeps its own.
     const ColumnList &GetColumns() const override {
         return columns;
+    }
+
+    std::pair<uint64_t, uint64_t> PlanEpoch() const {
+        return {state->epoch->identity, state->epoch->version.load()};
     }
 
     static unique_ptr<OracleAttachedTableEntry> Create(ClientContext &context, Catalog &catalog,
@@ -2459,6 +2466,9 @@ std::vector<std::vector<std::string>> TextRows(OracleSession &session, const std
     for (;;) {
         const auto batch = cursor->Fetch(STANDARD_VECTOR_SIZE);
         for (const auto &row : batch.rows) {
+            if (rows.size() >= 65536 || row.size() != columns.size()) {
+                throw IOException("Oracle range metadata exceeds its row or column bound");
+            }
             std::vector<std::string> text;
             for (size_t index = 0; index < row.size(); index++) {
                 if (!row[index]) {
@@ -2514,7 +2524,7 @@ std::string OracleCurrentScn(ClientContext &context, const std::string &catalog_
     return rows[0][0];
 }
 
-std::string OracleQuerySnapshot(ClientContext &context, const OracleQueryBindData &bind) {
+std::string OracleQuerySnapshot(ClientContext &context, const OracleQueryBindData &bind, OracleIoStats *opening_io) {
     Value setting;
     if (!bind.catalog_name.empty()) {
         auto pinned = context.registered_state->GetOrCreate<OracleQuerySnapshotState>("oracle_scanner.query_snapshot");
@@ -2542,11 +2552,15 @@ std::string OracleQuerySnapshot(ClientContext &context, const OracleQueryBindDat
     // change number cannot honor it, and saying so beats reading several moments.
     try {
         auto session = AcquireOracleReadSession(context, bind.secret_name, bind.catalog_name, bind.config, bind.password);
+        const auto before = session->IoStats();
         const auto rows = TextRows(session.Get(), "SELECT dbms_flashback.get_system_change_number FROM dual");
         if (rows.size() != 1 || rows[0].size() != 1 || rows[0][0].empty()) {
             throw IOException("Oracle returned no change number");
         }
         state->scn_by_catalog[bind.catalog_name] = rows[0][0];
+        if (opening_io) {
+            *opening_io += session->IoStats() - before;
+        }
         return rows[0][0];
     } catch (const std::exception &error) {
         throw IOException("oracle_consistent_read could not take a change number: %s", error.what());
@@ -2581,125 +2595,300 @@ std::string OracleSnapshotOfHeapTable(ClientContext &context, const OracleQueryB
     }
 }
 
-std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const OracleQueryBindData &bind,
-                                                  const std::vector<column_t> &selected, idx_t sessions,
-                                                  const std::string &aggregate_select) {
-    // Only a plain read of a table as it is now: a sample would be taken once per
-    // chunk, and a transaction that has written already holds the one session that
-    // can see its rows. A scan that feeds an UPDATE or DELETE has pinned that session
-    // already, to lock the rows it names, so it never reaches here in parallel.
-    if (sessions < 2 || !bind.sample_clause.empty() ||
-        TryTransactionSession(context, bind.catalog_name)) {
+namespace {
+
+struct OracleCachedRangePlan {
+    std::string identity;
+    std::vector<std::string> cuts;
+    std::vector<OracleColumn> wire_columns;
+    uint64_t age = 0;
+    size_t bytes = 0;
+};
+
+// Per DuckDB connection, bounded by both entries and retained bytes. No SCN,
+// rows, session, password or cursor is retained here.
+struct OracleScanPlanCache final : ClientContextState {
+    static constexpr size_t MAX_ENTRIES = 32;
+    static constexpr size_t MAX_BYTES = 8U << 20U;
+    std::mutex lock;
+    std::map<std::string, OracleCachedRangePlan> plans;
+    uint64_t clock = 0;
+    size_t bytes = 0;
+
+    void RemoveLocked(const std::string &key) {
+        const auto found = plans.find(key);
+        if (found != plans.end()) {
+            bytes -= found->second.bytes;
+            plans.erase(found);
+        }
+    }
+    bool Lookup(const std::string &key, const std::string &identity, OracleCachedRangePlan &result) {
+        std::lock_guard<std::mutex> guard(lock);
+        const auto found = plans.find(key);
+        if (found == plans.end()) {
+            return false;
+        }
+        if (found->second.identity != identity) {
+            RemoveLocked(key);
+            return false;
+        }
+        found->second.age = ++clock;
+        result = found->second;
+        return true;
+    }
+    void Store(const std::string &key, OracleCachedRangePlan plan) {
+        plan.bytes = sizeof(OracleCachedRangePlan) + 256 + 2 * key.capacity() + plan.identity.capacity() + 1 +
+                     plan.cuts.capacity() * sizeof(std::string) + plan.wire_columns.capacity() * sizeof(OracleColumn);
+        for (const auto &cut : plan.cuts) {
+            plan.bytes += cut.capacity() + 1;
+        }
+        for (const auto &column : plan.wire_columns) {
+            plan.bytes += column.name.capacity() + 1;
+        }
+        std::lock_guard<std::mutex> guard(lock);
+        RemoveLocked(key);
+        if (plan.bytes > MAX_BYTES) {
+            return;
+        }
+        while (plans.size() >= MAX_ENTRIES || bytes > MAX_BYTES - plan.bytes) {
+            auto oldest = plans.begin();
+            for (auto it = plans.begin(); it != plans.end(); ++it) {
+                if (it->second.age < oldest->second.age) {
+                    oldest = it;
+                }
+            }
+            RemoveLocked(oldest->first);
+        }
+        plan.age = ++clock;
+        bytes += plan.bytes;
+        plans.emplace(key, std::move(plan));
+    }
+};
+
+std::string PlanKeyField(const std::string &field) {
+    return std::to_string(field.size()) + ":" + field;
+}
+
+uint64_t UnsignedPlanNumber(const std::string &text) {
+    uint64_t value = 0;
+    if (text.empty() || text.size() > 20) {
+        throw IOException("Oracle range metadata contains an invalid number");
+    }
+    for (const auto character : text) {
+        if (character < '0' || character > '9' ||
+            value > ((std::numeric_limits<uint64_t>::max)() - uint64_t(character - '0')) / 10) {
+            throw IOException("Oracle range metadata contains an invalid number");
+        }
+        value = value * 10 + uint64_t(character - '0');
+    }
+    return value;
+}
+
+std::vector<OracleColumn> ProjectedDescribe(const OracleQueryBindData &bind, const std::vector<column_t> &selected,
+                                           std::vector<OracleColumn> columns) {
+    if (columns.size() != selected.size()) {
+        throw IOException("Oracle ATTACH table '%s' described %llu columns for a %llu column select list",
+                          bind.object_name, static_cast<uint64_t>(columns.size()),
+                          static_cast<uint64_t>(selected.size()));
+    }
+    for (idx_t index = 0; index < columns.size(); index++) {
+        if (selected[index] == COLUMN_IDENTIFIER_ROW_ID) {
+            columns[index] = OracleRowIdColumn();
+            continue;
+        }
+        const auto &dictionary = bind.columns[selected[index]];
+        if (dictionary.oracle_type != 0 && columns[index].oracle_type != dictionary.oracle_type) {
+            throw IOException("Oracle ATTACH table '%s' column '%s' wire type changed; DETACH and ATTACH to refresh its schema",
+                              bind.object_name, dictionary.name);
+        }
+        if (columns[index].name != dictionary.name) {
+            throw IOException("Oracle ATTACH table '%s' returned column '%s' where '%s' was selected",
+                              bind.object_name, columns[index].name, dictionary.name);
+        }
+        OverlayDictionaryColumn(columns[index], dictionary);
+        (void)TypeFor(columns[index]);
+    }
+    return columns;
+}
+
+} // namespace
+
+void InvalidateOracleScanPlan(ClientContext &context, const std::string &key) {
+    if (key.empty()) {
+        return;
+    }
+    auto cache = context.registered_state->GetOrCreate<OracleScanPlanCache>("oracle_scanner.scan_plan_cache");
+    std::lock_guard<std::mutex> guard(cache->lock);
+    cache->RemoveLocked(key);
+}
+
+bool OracleScanDescribeMatches(const std::vector<OracleColumn> &expected, const std::vector<OracleColumn> &actual) {
+    if (expected.size() != actual.size()) {
+        return false;
+    }
+    for (size_t index = 0; index < expected.size(); index++) {
+        const auto &a = expected[index];
+        const auto &b = actual[index];
+        if (a.name != b.name || a.oracle_type != b.oracle_type || a.byte_width != b.byte_width ||
+            a.precision != b.precision || a.scale != b.scale || a.character_set_form != b.character_set_form ||
+            a.omitted_from_row_data != b.omitted_from_row_data || a.inline_lob_cells != b.inline_lob_cells ||
+            a.database_zone_minutes != b.database_zone_minutes || a.database_zone_is_region != b.database_zone_is_region ||
+            a.vector_dimensions != b.vector_dimensions || a.vector_format != b.vector_format ||
+            a.vector_flags != b.vector_flags) {
+            return false;
+        }
+    }
+    return true;
+}
+
+OracleParallelPlan PlanParallelAttachedScan(ClientContext &context, const OracleQueryBindData &bind,
+                                           const std::vector<column_t> &selected, idx_t sessions,
+                                           const std::string &aggregate_select) {
+    // Samples and write-pinned transactions cannot be split across sessions.
+    if (sessions < 2 || !bind.sample_clause.empty() || TryTransactionSession(context, bind.catalog_name)) {
         return {};
     }
     const bool bounded = !bind.order_clause.empty();
     if (bounded) {
         Value enabled;
-        // Only ranked candidates can be merged by the retained DuckDB Top-N.
-        // Plain LIMIT stays on its one-query path, even with the opt-in set.
         if (bind.top_n.empty() || !context.TryGetCurrentSetting("oracle_parallel_top_n", enabled) ||
             enabled.IsNull() || !BooleanValue::Get(enabled)) {
             return {};
         }
     }
     OracleSessionHandle session;
+    std::string cache_key;
+    const auto started = std::chrono::steady_clock::now();
     try {
         session = AcquireOracleReadSession(context, bind.secret_name, std::string(), bind.config, bind.password);
-        // One snapshot for every chunk, taken before any of them reads. Without
-        // a change number the chunks would be several moments, so no change
-        // number means one stream.
-        std::string scn = OracleQuerySnapshot(context, bind);
+        const auto before = session->IoStats();
+        const auto name = TextLiteral(bind.object_name);
+        const auto owner = bind.schema_name.empty() ? std::string("USER") : TextLiteral(bind.schema_name);
+        const auto reference = OracleObjectReference(bind.schema_name, bind.object_name);
+        // Always check the current object and heap kind, and obtain a NEW SCN.
+        // A cached range plan is never evidence of the table's current identity.
+        const auto metadata = TextRows(session.Get(),
+            "SELECT /* oracle_scanner_range_identity */ t.iot_type, t.temporary, t.cluster_name, "
+            "o.object_id, o.data_object_id, TO_CHAR(o.last_ddl_time, 'YYYYMMDDHH24MISS'), "
+            "DBMS_FLASHBACK.GET_SYSTEM_CHANGE_NUMBER FROM all_tables t JOIN all_objects o "
+            "ON o.owner=t.owner AND o.object_name=t.table_name AND o.object_type='TABLE' "
+            "AND o.subobject_name IS NULL WHERE t.owner=" + owner + " AND t.table_name=" + name);
+        if (metadata.size() != 1 || metadata[0].size() != 7 || !metadata[0][0].empty() ||
+            metadata[0][1] != "N" || !metadata[0][2].empty()) {
+            return {};
+        }
+        const auto &row = metadata[0];
+        if (!UnsignedPlanNumber(row[3]) || row[5].size() != 14 || !UnsignedPlanNumber(row[5]) ||
+            !UnsignedPlanNumber(row[6])) {
+            return {};
+        }
+        if (!row[4].empty()) {
+            (void)UnsignedPlanNumber(row[4]);
+        }
+        const auto identity = PlanKeyField(row[3]) + PlanKeyField(row[4]) + PlanKeyField(row[5]);
+        OracleIoStats snapshot_io;
+        auto scn = OracleQuerySnapshot(context, bind, &snapshot_io);
         if (scn.empty()) {
-            const auto scn_rows = TextRows(session.Get(), "SELECT dbms_flashback.get_system_change_number FROM dual");
-            if (scn_rows.size() != 1 || scn_rows[0].size() != 1 || scn_rows[0][0].empty()) {
+            scn = row[6];
+        }
+        (void)UnsignedPlanNumber(scn);
+        const auto select_list = aggregate_select.empty() ? ProjectedSelectList(bind, selected) : aggregate_select;
+        Value enabled;
+        const auto *entry = bind.table_entry ? dynamic_cast<const OracleAttachedTableEntry *>(bind.table_entry.get()) : nullptr;
+        const bool caching = entry && context.TryGetCurrentSetting("oracle_scan_plan_cache", enabled) &&
+                             !enabled.IsNull() && BooleanValue::Get(enabled);
+        if (caching) {
+            const auto epoch = entry->PlanEpoch();
+            cache_key = PlanKeyField(bind.secret_name) + PlanKeyField(oracle_scanner::ConnectionTargetKey(bind.config)) +
+                        PlanKeyField(bind.config.user) + PlanKeyField(bind.schema_name) + PlanKeyField(bind.object_name) +
+                        PlanKeyField(std::to_string(epoch.first)) + PlanKeyField(std::to_string(epoch.second)) +
+                        PlanKeyField(std::to_string(sessions)) + PlanKeyField(bounded || !aggregate_select.empty() ? "1" : "4") +
+                        PlanKeyField(select_list);
+        }
+        auto cache = context.registered_state->GetOrCreate<OracleScanPlanCache>("oracle_scanner.scan_plan_cache");
+        OracleCachedRangePlan saved;
+        const bool hit = caching && cache->Lookup(cache_key, identity, saved);
+        if (!hit) {
+            const auto extents = TextRows(session.Get(),
+                "SELECT ROWIDTOCHAR(DBMS_ROWID.ROWID_CREATE(1, o.data_object_id, e.relative_fno, e.block_id, 0)), "
+                "e.blocks FROM dba_extents e JOIN all_objects o ON o.owner=e.owner AND o.object_name=e.segment_name "
+                "AND (o.subobject_name=e.partition_name OR (o.subobject_name IS NULL AND e.partition_name IS NULL)) "
+                "WHERE e.owner=" + owner + " AND e.segment_name=" + name +
+                " AND e.segment_type LIKE 'TABLE%' AND o.object_type LIKE 'TABLE%' "
+                "ORDER BY o.data_object_id, e.relative_fno, e.block_id");
+            uint64_t total_blocks = 0;
+            for (const auto &extent : extents) {
+                if (extent.size() != 2 || extent[0].empty() || extent[0].size() > 128) {
+                    throw IOException("Oracle returned invalid extent metadata");
+                }
+                const auto blocks = UnsignedPlanNumber(extent[1]);
+                if (blocks > (std::numeric_limits<uint64_t>::max)() - total_blocks) {
+                    throw IOException("Oracle extent block count overflow");
+                }
+                total_blocks += blocks;
+            }
+            if (extents.empty() || total_blocks < 2048) {
                 return {};
             }
-            scn = scn_rows[0][0];
-        }
-        const bool own = bind.schema_name.empty();
-        const auto name = TextLiteral(bind.object_name);
-        const auto owner = TextLiteral(bind.schema_name);
-        // A heap table only: an index-organized, clustered or temporary table
-        // has no ROWID ranges to cut.
-        const auto kind = TextRows(session.Get(), std::string("SELECT iot_type, temporary, cluster_name FROM ") +
-                                                 (own ? "user_tables" : "all_tables") + " WHERE table_name = " + name +
-                                                 (own ? std::string() : " AND owner = " + owner));
-        if (kind.size() != 1 || !kind[0][0].empty() || kind[0][1] != "N" || !kind[0][2].empty()) {
-            return {};
-        }
-        // The extents of the table, in ROWID order, each with the first ROWID it
-        // can hold. ROWIDs sort by object, file, block, row, so a run of
-        // consecutive extents is one ROWID range, and ranges cut between extents
-        // neither overlap nor leave a gap. This reads DBA_EXTENTS, which not every
-        // user may; without it the table is read with one session, because the
-        // alternatives (a sample of its blocks, which comes back in a few clumps
-        // and cut a 2,000,000-row table 99 to 1; USER_EXTENTS, which does not say
-        // where an extent starts) do not divide it evenly. The object number comes from
-        // ALL_OBJECTS, which shows every table the user can read, so DBA_EXTENTS is the
-        // one dictionary view that needs a grant.
-        const auto reference = OracleObjectReference(bind.schema_name, bind.object_name);
-        const auto extents = TextRows(
-            session.Get(),
-            std::string("SELECT ROWIDTOCHAR(DBMS_ROWID.ROWID_CREATE(1, o.data_object_id, e.relative_fno, e.block_id, 0)), "
-                        "e.blocks FROM dba_extents e JOIN all_objects o ON o.owner = e.owner AND o.object_name = "
-                        "e.segment_name AND (o.subobject_name = e.partition_name OR (o.subobject_name IS NULL AND "
-                        "e.partition_name IS NULL)) WHERE e.owner = ") +
-                (own ? std::string("USER") : owner) + " AND e.segment_name = " + name +
-                " AND e.segment_type LIKE 'TABLE%' AND o.object_type LIKE 'TABLE%' ORDER BY o.data_object_id, "
-                "e.relative_fno, e.block_id");
-        uint64_t total_blocks = 0;
-        for (const auto &extent : extents) {
-            total_blocks += std::stoull(extent[1]);
-        }
-        // A table this small is quicker read by one session than cut up.
-        constexpr uint64_t MINIMUM_BLOCKS = 2048;
-        if (extents.empty() || total_blocks < MINIMUM_BLOCKS) {
-            return {};
-        }
-        // Unbounded copies use about four chunks per reader for balancing.
-        // Ranked reads use one: each extra range costs another bounded query.
-        const uint64_t chunks =
-            MinValue<uint64_t>(MinValue<uint64_t>(sessions * (bounded || !aggregate_select.empty() ? 1 : 4), 64),
-                               total_blocks / 256);
-        const uint64_t target = (total_blocks + chunks - 1) / chunks;
-        std::vector<std::string> cuts;
-        uint64_t accumulated = 0;
-        for (size_t index = 0; index + 1 < extents.size(); index++) {
-            accumulated += std::stoull(extents[index][1]);
-            if (accumulated >= target) {
-                cuts.push_back(extents[index + 1][0]);
-                accumulated = 0;
+            const uint64_t chunks = MinValue<uint64_t>(MinValue<uint64_t>(sessions *
+                (bounded || !aggregate_select.empty() ? 1 : 4), 64), total_blocks / 256);
+            const uint64_t target = total_blocks / chunks + (total_blocks % chunks != 0);
+            uint64_t accumulated = 0;
+            for (size_t index = 0; index + 1 < extents.size(); index++) {
+                accumulated += UnsignedPlanNumber(extents[index][1]);
+                if (accumulated >= target && saved.cuts.size() < 63) {
+                    saved.cuts.push_back(extents[index + 1][0]);
+                    accumulated = 0;
+                }
             }
-        }
-        if (cuts.empty()) {
-            return {};
+            if (saved.cuts.empty()) {
+                return {};
+            }
+            saved.identity = identity;
         }
         const auto as_of = reference + " AS OF SCN " + scn;
-        // The snapshot must be readable, which needs FLASHBACK on the table.
-        (void)TextRows(session.Get(), "SELECT 1 FROM " + as_of + " WHERE 1 = 0");
-        session = OracleSessionHandle();
-
-        const auto select_list = aggregate_select.empty() ? ProjectedSelectList(bind, selected) : aggregate_select;
+        // Also on cache hits: revoked FLASHBACK or a changed table must retain
+        // the ordinary serial fallback. On misses this same exchange describes
+        // the projected wire columns, avoiding a second schema-only query.
+        auto probe = session->Query("SELECT " + (hit ? std::string("1") : select_list) + " FROM " + as_of +
+                                    " WHERE 1 = 0", {});
+        if (!hit) {
+            saved.wire_columns = probe->Columns();
+        }
+        probe->Close();
+        OracleParallelPlan result;
+        result.wire_columns = saved.wire_columns;
+        if (aggregate_select.empty()) {
+            result.columns = ProjectedDescribe(bind, selected, saved.wire_columns);
+        }
+        if (caching && !hit) {
+            cache->Store(cache_key, saved);
+        }
         const auto where = bind.where_clause.empty() ? std::string() : " AND (" + bind.where_clause + ")";
-        // Half-open ranges between consecutive cut points, open at both ends, so
-        // every ROWID belongs to exactly one chunk.
-        std::vector<std::string> statements;
-        for (size_t index = 0; index <= cuts.size(); index++) {
+        // Open-ended half-open ranges cover every current ROWID even when new
+        // extents were allocated after the boundaries were cached.
+        for (size_t index = 0; index <= saved.cuts.size(); index++) {
             std::string range;
             if (index > 0) {
-                range = "ROWID >= CHARTOROWID(" + TextLiteral(cuts[index - 1]) + ")";
+                range = "ROWID >= CHARTOROWID(" + TextLiteral(saved.cuts[index - 1]) + ")";
             }
-            if (index < cuts.size()) {
-                range += (range.empty() ? "" : " AND ") + std::string("ROWID < CHARTOROWID(") + TextLiteral(cuts[index]) + ")";
+            if (index < saved.cuts.size()) {
+                range += (range.empty() ? "" : " AND ") + std::string("ROWID < CHARTOROWID(") +
+                         TextLiteral(saved.cuts[index]) + ")";
             }
-            statements.push_back("SELECT " + select_list + " FROM " + as_of + " WHERE " + range + where +
-                                 bind.order_clause);
+            result.statements.push_back("SELECT " + select_list + " FROM " + as_of + " WHERE " + range + where +
+                                        bind.order_clause);
         }
-        return statements.size() >= 2 ? statements : std::vector<std::string>();
+        result.cache_key = cache_key;
+        result.cache_hit = hit;
+        result.planning_io = session->IoStats() - before;
+        result.planning_io += snapshot_io;
+        result.planning_nanoseconds = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count());
+        return result;
     } catch (const std::exception &) {
         session.Poison();
-        // Anything the dictionary or the privileges will not give is a reason to
-        // read the table the ordinary way, not to fail a query that would work.
+        InvalidateOracleScanPlan(context, cache_key);
         return {};
     }
 }
@@ -2778,31 +2967,7 @@ void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const 
         session.Poison();
         throw IOException("Oracle ATTACH could not open table '%s': %s", bind.object_name, error.what());
     }
-    columns = cursor->Columns();
-    if (columns.size() != selected.size()) {
-        throw IOException("Oracle ATTACH table '%s' described %llu columns for a %llu column select list",
-                          bind.object_name, static_cast<uint64_t>(columns.size()),
-                          static_cast<uint64_t>(selected.size()));
-    }
-    for (idx_t index = 0; index < columns.size(); index++) {
-        if (selected[index] == COLUMN_IDENTIFIER_ROW_ID) {
-            // Described by Oracle under the expression's own name; the dictionary
-            // has no entry for a pseudo-column, so the synthetic one stands.
-            columns[index] = OracleRowIdColumn();
-            continue;
-        }
-        const auto &dictionary_column = bind.columns[selected[index]];
-        if (dictionary_column.oracle_type != 0 && columns[index].oracle_type != dictionary_column.oracle_type) {
-            throw IOException("Oracle ATTACH table '%s' column '%s' wire type changed; DETACH and ATTACH to refresh its schema",
-                              bind.object_name, dictionary_column.name);
-        }
-        if (columns[index].name != dictionary_column.name) {
-            throw IOException("Oracle ATTACH table '%s' returned column '%s' where '%s' was selected",
-                              bind.object_name, columns[index].name, dictionary_column.name);
-        }
-        OverlayDictionaryColumn(columns[index], dictionary_column);
-        (void)TypeFor(columns[index]);
-    }
+    columns = ProjectedDescribe(bind, selected, cursor->Columns());
 }
 
 void ApplyUnconstrainedNumberSetting(ClientContext &context, std::vector<OracleColumn> &columns) {

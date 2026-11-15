@@ -457,6 +457,7 @@ void PushAggregate(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &
         auto source = make_uniq<OracleQueryBindData>();
         source->columns = bind->columns;
         source->estimated_rows = bind->estimated_rows;
+        source->table_entry = bind->table_entry;
         source->config = bind->config;
         source->password = bind->password;
         source->secret_name = bind->secret_name;
@@ -1278,6 +1279,9 @@ void OptimizeOraclePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperat
 } // namespace
 
 void RegisterOracleOptimizer(DatabaseInstance &db) {
+    DBConfig::GetConfig(db).AddExtensionOption(
+        "oracle_scan_plan_cache", "Cache checked ROWID boundaries and wire descriptions, never snapshots or rows.",
+        LogicalType::BOOLEAN, Value::BOOLEAN(true));
     DBConfig::GetConfig(db).AddExtensionOption(
         "oracle_parallel_count", "Count ROWID ranges at one SCN and sum their counts in DuckDB.",
         LogicalType::BOOLEAN, Value::BOOLEAN(false));

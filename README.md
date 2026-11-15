@@ -1397,6 +1397,23 @@ slower than one Oracle count, especially when Oracle can use an index.
 ROWID planning reuses the read-session pool (`oracle_session_pool_size`); a failed
 planning exchange discards its session before falling back to a serial scan.
 
+`oracle_scan_plan_cache = true` also reuses range boundaries and projected wire
+descriptions, with at most 32 entries and an 8 MiB accounting budget per DuckDB
+connection. Each execution still checks the table's object ID, data object ID,
+DDL timestamp and heap kind, obtains a fresh SCN, and checks flashback access.
+DDL through ATTACH changes a shared epoch across its schemas. Snapshots, rows,
+filters, ordering and open cursors are never cached. New extents remain covered
+by the open-ended ranges; stale cuts can affect balance, not coverage.
+
+A cold plan combines the snapshot/identity query and uses the flashback probe
+to describe projected columns. A warm plan skips the extents and projected
+describe queries, normally needing two planning round trips. Each reader's own
+describe must still match before values are decoded; a mismatch or reader error
+discards the cached plan. External schema changes still require DETACH/ATTACH
+to refresh the table schema. Set `oracle_scan_plan_cache = false` to compare the
+uncached path. EXPLAIN ANALYZE reports the cache hit, planning time and planning
+round trips separately from the scan's network counters.
+
 An unbounded copy is cut into ROWID ranges at its extent boundaries (about four chunks to a
 session, so a thread that finishes early takes another), and every chunk reads
 `AS OF SCN` at one change number taken first, so together they are one snapshot, not several
@@ -1517,6 +1534,7 @@ response exceeding that count is rejected.
 | `oracle_parallel_scan` | `-1` | Maximum sessions one scan of an attached table may read through at once: `-1` chooses (up to 8 and DuckDB's thread count, for a table of 500,000 rows or more; roughly 16 MiB or 250,000 filtered rows per reader), `0` or `1` is one session. Small tables and selective filters stay sequential even with a positive maximum. See [section 7](#7-read-a-big-table-faster). |
 | `oracle_parallel_top_n` | `false` | Allow eligible Top-N reads to rank candidates per ROWID range at one SCN and merge them in DuckDB. Uses `oracle_parallel_scan` and the thread cap; adds exchanges and can be slower on a remote connection. Plain LIMIT stays on one read. |
 | `oracle_parallel_count` | `false` | Compute eligible scalar COUNT(*) and COUNT(column) per ROWID range at one SCN, then sum in DuckDB. Uses the reader/thread caps and serial privilege/write fallback; DISTINCT and grouped or mixed aggregates retain their existing paths. Multiple counts may be slower than one indexed count. |
+| `oracle_scan_plan_cache` | `true` | Reuse checked ROWID boundaries and projected wire descriptions (32 entries, 8 MiB accounting budget per connection). Each execution checks identity and flashback access and takes a fresh SCN. Set false for comparisons. |
 | `oracle_consistent_read` | `false` | Read every attached table of a statement `AS OF` one SCN. See [One moment for a whole statement](#one-moment-for-a-whole-statement). |
 
 Pooling matters more than it looks. Opening a session costs a TCP connect, a TLS
