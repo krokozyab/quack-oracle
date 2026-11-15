@@ -4016,6 +4016,137 @@ void TestParallelTopNRanksCandidatesAtOneSnapshot() {
     std::cout << "parallel Top-N merges bounded candidates at one SCN and keeps serial fallbacks" << std::endl;
 }
 
+void TestParallelCountsCombineOneSnapshot() {
+    auto script = std::make_shared<FakeScript>();
+    script->routes = {
+        {"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}},
+        {"dbms_flashback", {{Column("SCN", 2)}, {{Number("424242")}}}},
+        {"iot_type", {{Column("IOT_TYPE", 1), Column("TEMPORARY", 1), Column("CLUSTER_NAME", 1)},
+                       {{std::nullopt, Text("N"), std::nullopt}}}},
+        {"num_rows IS NOT NULL", {{Column("TABLE_NAME", 1), Column("NUM_ROWS", 2)},
+                                   {{Text("COUNTS"), Number("1000000")}}}},
+        {"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("COUNTS")}}}},
+        {"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}},
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {{Text("COUNTS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("Y")},
+           {Text("COUNTS"), Text("V"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("Y")}}}},
+        {"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}}};
+    FakeResponse extents {{Column("LOW", 1), Column("BLOCKS", 2)}, {}};
+    for (int i = 0; i < 10; i++) {
+        extents.rows.push_back({Text("EXTENT" + std::to_string(i)), Number("1000")});
+    }
+    script->routes.insert(script->routes.begin(), {"dba_extents", extents});
+    const std::vector<OracleColumn> columns {Column("C0", 2, 18, 0), Column("C1", 2, 18, 0)};
+    const std::string select = "SELECT CAST(COUNT(*) AS NUMBER(18,0)) \"C0\", "
+                               "CAST(COUNT(\"V\") AS NUMBER(18,0)) \"C1\" FROM \"COUNTS\"";
+    script->routes.insert(script->routes.begin(), {select, {columns, {{Number("44"), Number("26")}}}});
+    script->tables["COUNTS"] = {{Column("ID", 2, 10, 0), Column("V", 2, 10, 0)},
+                                 {{Number("1"), Number("2")}, {Number("2"), std::nullopt}}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS o(TYPE oracle_scanner); SET threads=4; SET oracle_parallel_scan=4; SET oracle_aggregate_pushdown=true;");
+    const auto query = "SELECT count(*), count(V) FROM o.COUNTS";
+    const auto ranges_read = [&] {
+        size_t count = 0;
+        for (const auto &sql : script->queries) {
+            count += sql.find("WHERE ROWID") != std::string::npos && sql.find("COUNT(") != std::string::npos;
+        }
+        return count;
+    };
+    CHECK(!database.Query(query)->HasError() && ranges_read() == 0);
+    database.Run("SET oracle_parallel_count=true;");
+    for (const int readers : {1, 2, 4}) {
+        database.Run("SET oracle_parallel_scan=" + std::to_string(readers));
+        for (const bool empty : {false, true}) {
+            const int parts = readers == 1 ? 0 : readers;
+            for (int range = 0; range < parts; range++) {
+                const int step = readers == 2 ? 5 : 3;
+                std::string where;
+                if (range > 0) {
+                    where = "ROWID >= CHARTOROWID('EXTENT" + std::to_string(range * step) + "')";
+                }
+                if (range + 1 < parts) {
+                    where += (where.empty() ? "" : " AND ") + std::string("ROWID < CHARTOROWID('EXTENT") +
+                             std::to_string((range + 1) * step) + "')";
+                }
+                if (empty) {
+                    where += " AND (\"ID\" < 0)";
+                }
+                const auto sql = select + " AS OF SCN 424242 WHERE " + where;
+                const auto nonnull = readers == 2 ? 13 : (range % 2 ? 6 : 7);
+                script->routes.insert(script->routes.begin(),
+                                      {sql, {columns, {{Number(empty ? "0" : std::to_string(44 / readers)),
+                                                        Number(empty ? "0" : std::to_string(nonnull))}}}});
+            }
+            if (empty) {
+                script->routes.insert(script->routes.begin() + parts,
+                                      {select + " WHERE \"ID\" < 0", {columns, {{Number("0"), Number("0")}}}});
+            }
+            script->queries.clear();
+            const auto result = database.Query(std::string(query) + (empty ? " WHERE ID < 0" : ""));
+            CHECK(!result->HasError() && result->RowCount() == 1);
+            CHECK(result->GetTypes()[0] == duckdb::LogicalType::BIGINT);
+            CHECK(result->GetValue(0, 0).GetValue<int64_t>() == (empty ? 0 : 44));
+            CHECK(result->GetValue(1, 0).GetValue<int64_t>() == (empty ? 0 : 26));
+            CHECK(ranges_read() == size_t(parts));
+            for (const auto &sql : script->queries) {
+                if (sql.find("WHERE ROWID") != std::string::npos) {
+                    CHECK(sql.find("AS OF SCN 424242") != std::string::npos);
+                    CHECK(sql.find("COUNT(\"V\")") != std::string::npos);
+                }
+            }
+            script->routes.erase(script->routes.begin(), script->routes.begin() + parts + (empty ? 1 : 0));
+        }
+    }
+    // A missing/NULL/negative/extra partial must fail instead of silently
+    // summing an incomplete or malformed server result.
+    for (int malformed = 0; malformed < 5; malformed++) {
+        FakeResponse answer {columns, {{Number("1"), Number("1")}}};
+        if (malformed == 0) {
+            answer.rows.clear();
+        } else if (malformed == 1) {
+            answer.rows[0][0] = std::nullopt;
+        } else if (malformed == 2) {
+            answer.rows[0][0] = Number("-1");
+        } else if (malformed == 3) {
+            answer.rows.push_back(answer.rows[0]);
+        } else {
+            answer.columns[0].oracle_type = 1;
+        }
+        script->routes.insert(script->routes.begin(), {select + " AS OF SCN", std::move(answer)});
+        CHECK(database.Query(query)->HasError());
+        script->routes.erase(script->routes.begin());
+        CHECK(!database.Query("SELECT 42")->HasError());
+    }
+    database.Run("SET threads=16; SET oracle_parallel_scan=16;");
+    script->routes.insert(script->routes.begin(),
+                          {select + " AS OF SCN", {columns, {{Number("999999999999999999"), Number("0")}}}});
+    CHECK(database.Query(query)->HasError()); // exact SUM does not wrap a BIGINT
+    script->routes.erase(script->routes.begin());
+    database.Run("SET threads=4; SET oracle_parallel_scan=4;");
+    script->routes.insert(script->routes.begin(),
+                          {"CAST(COUNT(DISTINCT \"ID\")", {{columns[0]}, {{Number("40")}}}});
+    script->queries.clear();
+    CHECK(!database.Query("SELECT count(DISTINCT ID) FROM o.COUNTS")->HasError() && ranges_read() == 0);
+    script->routes.erase(script->routes.begin());
+    // Pinned writes and missing range privileges use a single scalar COUNT.
+    database.Run("BEGIN; INSERT INTO o.COUNTS VALUES (100, 200);");
+    script->queries.clear();
+    CHECK(!database.Query(query)->HasError() && ranges_read() == 0);
+    database.Run("ROLLBACK;");
+    script->query_failure_fragment = "dba_extents";
+    script->queries.clear();
+    CHECK(!database.Query(query)->HasError() && ranges_read() == 0);
+    script->query_failure_fragment.clear();
+    // Local predicates cannot turn into per-range COUNT, since they need rows.
+    script->queries.clear();
+    CHECK(!database.Query("SELECT count(*) FROM o.COUNTS WHERE ID % 2 = 0")->HasError());
+    CHECK(ranges_read() == 0);
+    std::cout << "partial COUNT combines ranges at one SCN and validates every scalar reply" << std::endl;
+}
+
 void TestParallelMetricSnapshotsSurviveReverseFlushOrder() {
     auto script = std::make_shared<FakeScript>();
     auto factory = InstallFake(script);
@@ -6469,6 +6600,7 @@ int main() {
     TestHeavyColumnsAreReadAfterTheFilter();
     TestAttachedScanReadsInRowidRanges();
     TestParallelTopNRanksCandidatesAtOneSnapshot();
+    TestParallelCountsCombineOneSnapshot();
     TestParallelMetricSnapshotsSurviveReverseFlushOrder();
     TestTextComparesByTheSessionCollation();
     TestLargeScalarFetchKeepsRowsAndLocalFilters();

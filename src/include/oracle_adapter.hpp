@@ -298,6 +298,10 @@ struct OracleQueryBindData final : TableFunctionData {
     //! scan reads in two steps (see OracleDeferredColumns).
     std::string flashback_scn;
     std::string statement_sql;
+    // A scalar COUNT-only statement can emit one partial row per ROWID range.
+    // The optimizer retains a DuckDB SUM above it, including the serial fallback.
+    unique_ptr<OracleQueryBindData> count_source;
+    std::string count_select_list;
     ConnectionConfig config;
     std::string password;
     std::string object_name;
@@ -387,6 +391,8 @@ struct OracleQueryGlobalState final : GlobalTableFunctionState {
     size_t fetch_rows = STANDARD_VECTOR_SIZE;
     bool parallel = false;
     bool parallel_top_n = false;
+    bool scalar_count = false;
+    size_t count_rows = 0;
     std::vector<std::string> chunk_sql;
     std::atomic<idx_t> next_chunk {0};
     idx_t thread_count = 1;
@@ -410,6 +416,7 @@ struct OracleQueryLocalState final : LocalTableFunctionState {
     size_t typed_rows = 0;
     //! The ROWID range the cursor reads, which is the batch its rows belong to.
     idx_t batch_index = 0;
+    size_t count_rows = 0;
 };
 unique_ptr<LocalTableFunctionState> OracleQueryInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
                                                          GlobalTableFunctionState *global_state);
@@ -614,7 +621,8 @@ void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const 
 //! several sessions at one SCN, cut into ROWID ranges at extent boundaries; empty
 //! when the scan should be one stream (see the implementation for the reasons).
 std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const OracleQueryBindData &bind,
-                                                  const std::vector<column_t> &selected, idx_t sessions);
+                                                  const std::vector<column_t> &selected, idx_t sessions,
+                                                  const std::string &aggregate_select = std::string());
 
 unique_ptr<LogicalOperator> MakeOracleMergePlan(TableCatalogEntry &table, TableIndex table_index,
                                                 OracleWriteTarget target, std::string sql,

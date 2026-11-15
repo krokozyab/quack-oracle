@@ -2765,6 +2765,37 @@ static bool DeferrableColumn(const OracleColumn &column);
 // supplies the wire representation and has to map to the same types.
 unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context, OracleQueryBindData &bind,
                                                          TableFunctionInitInput &input) {
+    if (bind.count_source) {
+        auto &source = *bind.count_source;
+        Value enabled, requested;
+        idx_t sessions = 1;
+        if (context.TryGetCurrentSetting("oracle_parallel_count", enabled) && !enabled.IsNull() &&
+            BooleanValue::Get(enabled) && source.estimated_rows &&
+            *source.estimated_rows >= AUTOMATIC_PARALLEL_MINIMUM_ROWS &&
+            context.TryGetCurrentSetting("oracle_parallel_scan", requested) && !requested.IsNull()) {
+            const auto count = requested.GetValue<int64_t>();
+            const auto automatic = MinValue<uint64_t>(8, *source.estimated_rows / 250000 +
+                                                           (*source.estimated_rows % 250000 != 0));
+            sessions = count < 0 ? automatic : static_cast<idx_t>(MinValue<int64_t>(64, count));
+            sessions = MinValue<idx_t>(sessions, TaskScheduler::GetScheduler(context).NumberOfThreads());
+        }
+        auto chunks = PlanParallelAttachedScan(context, source, {}, sessions, bind.count_select_list);
+        if (!chunks.empty()) {
+            auto state = make_uniq<OracleQueryGlobalState>(OracleSessionHandle(), nullptr, bind.columns, bind.types,
+                                                           std::move(input.column_ids), bind.columns.size());
+            state->parallel = true;
+            state->scalar_count = true;
+            state->thread_count = MinValue<idx_t>(sessions, chunks.size());
+            state->chunk_sql = std::move(chunks);
+            state->secret_name = bind.secret_name;
+            state->config = bind.config;
+            state->password = bind.password;
+            state->catalog_name = bind.catalog_name;
+            state->sent_sql = state->chunk_sql.front() + " (and " +
+                              std::to_string(state->chunk_sql.size() - 1) + " more ROWID ranges)";
+            return std::move(state);
+        }
+    }
     OracleSessionHandle session;
     std::unique_ptr<OracleCursor> cursor;
     OracleScanOpening opened;
@@ -2817,6 +2848,7 @@ unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context,
     auto state = make_uniq<OracleQueryGlobalState>(std::move(session), std::move(cursor), std::move(columns),
                                                    bind.types, std::move(input.column_ids), chunk_columns);
     state->catalog_name = bind.catalog_name;
+    state->scalar_count = bool(bind.count_source);
     state->sent_sql = opened.sql;
     state->metrics.Add(opened.io);
     state->metrics.query_nanoseconds += opened.query_nanoseconds;
@@ -3454,9 +3486,19 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
                     local->last_io = local->session->IoStats();
                 }
                 const auto opened_at = clock_now();
-                local->cursor = state.parallel_top_n
+                local->cursor = state.parallel_top_n || state.scalar_count
                                     ? OpenOracleScalarRead(local->session.Get(), state.chunk_sql[chunk], state.columns)
                                     : local->session->Query(state.chunk_sql[chunk], {});
+                local->count_rows = 0;
+                if (state.scalar_count) {
+                    const auto &columns = local->cursor->Columns();
+                    if (columns.size() != state.columns.size() ||
+                        std::any_of(columns.begin(), columns.end(), [](const OracleColumn &column) {
+                            return column.oracle_type != 2;
+                        })) {
+                        throw IOException("Oracle partial COUNT describe changed");
+                    }
+                }
                 state.metrics.query_nanoseconds += elapsed(opened_at);
                 state.metrics.chunks_read++;
                 const auto io_now = local->session->IoStats();
@@ -3539,6 +3581,14 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
         const auto row_count = MinValue<size_t>(STANDARD_VECTOR_SIZE, available - position);
         position += row_count;
         const bool exhausted = batch.exhausted && position == available;
+        if (state.scalar_count) {
+            auto &count_rows = local ? local->count_rows : state.count_rows;
+            count_rows += row_count;
+            if (count_rows > 1 || (exhausted && count_rows != 1)) {
+                (local ? local->session : state.session).Poison();
+                throw IOException("Oracle COUNT must return exactly one row per range");
+            }
+        }
         if (local) {
             const auto io_now = local->session->IoStats();
             state.metrics.Add(io_now - local->last_io);
@@ -3591,6 +3641,15 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
         // all: `col IS NULL` matched every row, and count(col) counted them. The
         // compiler cannot see that; the adapter suite now does.
         output.SetChildCardinality(row_count);
+        if (state.scalar_count) {
+            for (idx_t column = 0; column < output.ColumnCount(); column++) {
+                if (row_count && (output.GetValue(column, 0).IsNull() ||
+                                 output.GetValue(column, 0).GetValue<int64_t>() < 0)) {
+                    (local ? local->session : state.session).Poison();
+                    throw IOException("Oracle COUNT must be non-NULL and nonnegative");
+                }
+            }
+        }
         state.metrics.convert_nanoseconds += elapsed(convert_started);
         if (local && exhausted) {
             local->cursor->Close();

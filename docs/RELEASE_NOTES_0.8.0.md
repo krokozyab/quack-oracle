@@ -2,6 +2,14 @@
 
 ## Added
 
+- Opt-in `oracle_parallel_count`: compute scalar COUNT(*) and COUNT(column)
+  over disjoint ROWID ranges at one SCN and sum them in DuckDB with a checked
+  BIGINT result. Empty inputs return zero. Uses reader/thread caps and falls
+  back to one count for missing privileges or write-pinned reads. DISTINCT,
+  grouping, mixed aggregates, samples and local filters retain their paths.
+  Defaults to false because range planning and multiple counts can be slower
+  than one Oracle count. Invalid or missing partial replies fail the query.
+
 - Opt-in `oracle_parallel_top_n`: rank candidates per ROWID range at one SCN,
   then retain DuckDB's global Top-N for the final result, including OFFSET and
   NULL ordering. Uses the ordinary reader cap and privilege fallback. Defaults

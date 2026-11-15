@@ -28,6 +28,8 @@
 #include "duckdb/planner/logical_operator_visitor.hpp"
 
 #include "duckdb/main/config.hpp"
+#include "duckdb/function/builtin_function_lookup.hpp"
+#include "duckdb/function/function_binder.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/binder.hpp"
@@ -199,6 +201,9 @@ struct PushedAggregate {
 	vector<LogicalType> wanted;     // what the AGGREGATE returned, groups first
     // AVG expands into SUM and COUNT on the wire, but one local result.
     std::map<idx_t, std::pair<double, bool>> averages;
+    bool scalar_count = false;
+    std::string count_select_list;
+    std::string count_where;
 };
 
 bool KeyType(const LogicalType &type) {
@@ -254,6 +259,7 @@ bool PlanPushedAggregate(ClientContext &context, LogicalAggregate &aggregate, Lo
 	};
 	std::string select_list;
 	std::string group_list;
+    bool scalar_count = aggregate.groups.empty() && !bind.statement_scan;
 	const auto add = [&](const std::string &expression, OracleColumn declared, const LogicalType &type,
 	                     const LogicalType &wanted) {
 		declared.name = "C" + std::to_string(result.columns.size());
@@ -289,6 +295,7 @@ bool PlanPushedAggregate(ClientContext &context, LogicalAggregate &aggregate, Lo
             return false;
         }
         const auto name = StringUtil::Lower(call.Function().GetName().GetIdentifierName());
+        scalar_count &= !call.IsDistinct() && (name == "count" || name == "count_star");
         if (call.IsDistinct() && name != "count") {
             return false;
         }
@@ -374,6 +381,11 @@ bool PlanPushedAggregate(ClientContext &context, LogicalAggregate &aggregate, Lo
 	if (!group_list.empty()) {
 		result.sql += " GROUP BY " + group_list;
 	}
+    result.scalar_count = scalar_count;
+    if (scalar_count) {
+        result.count_select_list = select_list;
+        result.count_where = where;
+    }
 	return true;
 }
 
@@ -403,7 +415,8 @@ void FinalizeOracleAverage(DataChunk &input, ExpressionState &, Vector &result) 
     }
 }
 
-void PushAggregate(ClientContext &context, unique_ptr<LogicalOperator> &op, ColumnBindingReplacer &replacer) {
+void PushAggregate(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &op, ColumnBindingReplacer &replacer) {
+    auto &context = input.context;
 	auto &aggregate = op->Cast<LogicalAggregate>();
 	vector<LogicalProjection *> projections;
 	auto *node = aggregate.children[0].get();
@@ -416,7 +429,9 @@ void PushAggregate(ClientContext &context, unique_ptr<LogicalOperator> &op, Colu
 	}
 	auto &get = node->Cast<LogicalGet>();
 	auto *bind = get.bind_data ? dynamic_cast<OracleQueryBindData *>(get.bind_data.get()) : nullptr;
-    if (!bind || (!bind->deferred_scan && !bind->statement_scan)) {
+    // A partial scan's local reduction must survive any later optimizer pass:
+    // wrapping its SQL would discard the range plan and its SUM contract.
+    if (!bind || bind->count_source || (!bind->deferred_scan && !bind->statement_scan)) {
         return;
     }
     PushedAggregate pushed;
@@ -434,6 +449,24 @@ void PushAggregate(ClientContext &context, unique_ptr<LogicalOperator> &op, Colu
 	scan_bind->schema_name = bind->schema_name;
 	scan_bind->secret_name = bind->secret_name;
 	scan_bind->catalog_name = bind->catalog_name;
+    Value count_setting;
+    const bool partial_count = pushed.scalar_count &&
+                               context.TryGetCurrentSetting("oracle_parallel_count", count_setting) &&
+                               !count_setting.IsNull() && BooleanValue::Get(count_setting);
+    if (partial_count) {
+        auto source = make_uniq<OracleQueryBindData>();
+        source->columns = bind->columns;
+        source->estimated_rows = bind->estimated_rows;
+        source->config = bind->config;
+        source->password = bind->password;
+        source->secret_name = bind->secret_name;
+        source->catalog_name = bind->catalog_name;
+        source->schema_name = bind->schema_name;
+        source->object_name = bind->object_name;
+        source->where_clause = std::move(pushed.count_where);
+        scan_bind->count_source = std::move(source);
+        scan_bind->count_select_list = std::move(pushed.count_select_list);
+    }
 	vector<Identifier> names;
 	for (const auto &column : scan_bind->columns) {
 		names.emplace_back(column.name);
@@ -454,13 +487,32 @@ void PushAggregate(ClientContext &context, unique_ptr<LogicalOperator> &op, Colu
 		ids.emplace_back(index);
 	}
 	scan->SetColumnIds(std::move(ids));
+    unique_ptr<LogicalOperator> source = std::move(scan);
+    auto result_index = get_index;
+    if (partial_count) {
+        result_index = input.optimizer.binder.GenerateTableIndex();
+        vector<unique_ptr<Expression>> sums;
+        for (idx_t index = 0; index < pushed.types.size(); index++) {
+            vector<unique_ptr<Expression>> arguments;
+            arguments.push_back(make_uniq<BoundColumnRefExpression>(
+                LogicalType::BIGINT, ColumnBinding(get_index, ProjectionIndex(index))));
+            FunctionBinder binder(context);
+            sums.push_back(binder.BindAggregateFunction(
+                GetBuiltinAggregateFunction(context, "sum", {LogicalType::BIGINT}), std::move(arguments)));
+        }
+        auto reduction = make_uniq<LogicalAggregate>(input.optimizer.binder.GenerateTableIndex(), result_index,
+                                                       std::move(sums));
+        reduction->children.push_back(std::move(source));
+        source = std::move(reduction);
+    }
 	// The AGGREGATE's own types, reached by a cast where the scan's differ (a sum
 	// of integers arrives as text and is a HUGEINT here).
 	vector<unique_ptr<Expression>> select;
     for (idx_t index = 0; index < pushed.types.size(); index++) {
         unique_ptr<Expression> reference =
-            make_uniq<BoundColumnRefExpression>(pushed.types[index], ColumnBinding(get_index, ProjectionIndex(index)));
-        if (pushed.types[index] != pushed.wanted[index]) {
+            make_uniq<BoundColumnRefExpression>(partial_count ? LogicalType::HUGEINT : pushed.types[index],
+                                                ColumnBinding(result_index, ProjectionIndex(index)));
+        if (reference->GetReturnType() != pushed.wanted[index]) {
             reference = BoundCastExpression::AddCastToType(context, std::move(reference), pushed.wanted[index]);
         }
         const auto average = pushed.averages.find(index);
@@ -488,7 +540,7 @@ void PushAggregate(ClientContext &context, unique_ptr<LogicalOperator> &op, Colu
 	const auto aggregates = aggregate.expressions.size();
 	const auto estimate = aggregate.has_estimated_cardinality ? aggregate.estimated_cardinality : 1;
 	auto projection = make_uniq<LogicalProjection>(group_index, std::move(select));
-	projection->children.push_back(std::move(scan));
+	projection->children.push_back(std::move(source));
 	projection->SetEstimatedCardinality(estimate);
 	op = std::move(projection);
 	// Whatever read the aggregates by (aggregate_index, n) now reads them from the projection.
@@ -749,7 +801,7 @@ void Walk(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &op, Colum
         PushJoin(input, op, replacer);
     }
     if (aggregates && op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-		PushAggregate(context, op, replacer);
+		PushAggregate(input, op, replacer);
 	}
 }
 
@@ -1152,7 +1204,7 @@ void PushDistinctCounts(OptimizerExtensionInput &input, unique_ptr<LogicalOperat
     }
     FilterPushdown pushdown(input.optimizer);
     aggregate.children[0] = pushdown.Rewrite(std::move(aggregate.children[0]));
-    PushAggregate(input.context, op, replacer);
+    PushAggregate(input, op, replacer);
 }
 
 void RejectExplicitOracleInsertDefaults(LogicalOperator &plan) {
@@ -1226,6 +1278,9 @@ void OptimizeOraclePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperat
 } // namespace
 
 void RegisterOracleOptimizer(DatabaseInstance &db) {
+    DBConfig::GetConfig(db).AddExtensionOption(
+        "oracle_parallel_count", "Count ROWID ranges at one SCN and sum their counts in DuckDB.",
+        LogicalType::BOOLEAN, Value::BOOLEAN(false));
     DBConfig::GetConfig(db).AddExtensionOption(
         "oracle_parallel_top_n", "Rank each ROWID range in Oracle and merge candidates in DuckDB; adds round trips.",
         LogicalType::BOOLEAN, Value::BOOLEAN(false));

@@ -2582,7 +2582,8 @@ std::string OracleSnapshotOfHeapTable(ClientContext &context, const OracleQueryB
 }
 
 std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const OracleQueryBindData &bind,
-                                                  const std::vector<column_t> &selected, idx_t sessions) {
+                                                  const std::vector<column_t> &selected, idx_t sessions,
+                                                  const std::string &aggregate_select) {
     // Only a plain read of a table as it is now: a sample would be taken once per
     // chunk, and a transaction that has written already holds the one session that
     // can see its rows. A scan that feeds an UPDATE or DELETE has pinned that session
@@ -2658,7 +2659,8 @@ std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const 
         // Unbounded copies use about four chunks per reader for balancing.
         // Ranked reads use one: each extra range costs another bounded query.
         const uint64_t chunks =
-            MinValue<uint64_t>(MinValue<uint64_t>(sessions * (bounded ? 1 : 4), 64), total_blocks / 256);
+            MinValue<uint64_t>(MinValue<uint64_t>(sessions * (bounded || !aggregate_select.empty() ? 1 : 4), 64),
+                               total_blocks / 256);
         const uint64_t target = (total_blocks + chunks - 1) / chunks;
         std::vector<std::string> cuts;
         uint64_t accumulated = 0;
@@ -2677,7 +2679,7 @@ std::vector<std::string> PlanParallelAttachedScan(ClientContext &context, const 
         (void)TextRows(session.Get(), "SELECT 1 FROM " + as_of + " WHERE 1 = 0");
         session = OracleSessionHandle();
 
-        const auto select_list = ProjectedSelectList(bind, selected);
+        const auto select_list = aggregate_select.empty() ? ProjectedSelectList(bind, selected) : aggregate_select;
         const auto where = bind.where_clause.empty() ? std::string() : " AND (" + bind.where_clause + ")";
         // Half-open ranges between consecutive cut points, open at both ends, so
         // every ROWID belongs to exactly one chunk.
