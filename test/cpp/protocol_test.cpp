@@ -1538,6 +1538,44 @@ static void TestArenaRowsOwnSlicesAndReuseRepeatedBytes() {
 }
 
 static void TestDirectScalarRowsMatchLegacyAcrossFragments() {
+    // A short scalar split by the transport needs more bytes, not an
+    // exception/unwind for every fragment. Do not publish a partial row.
+    const std::vector<OracleColumn> short_columns {{"V", 1}, {"Z", 1}};
+    ByteWriter short_response;
+    short_response.WriteByte(TTC_MESSAGE_ROW_DATA)
+        .WriteLengthPrefixed(std::vector<uint8_t> {'a', 'b'})
+        .WriteLengthPrefixed(std::vector<uint8_t> {'c', 'd'});
+    const auto first_end = short_response.Data().size();
+    short_response.WriteByte(21).WriteUInt16LE(1).WriteByte(1);
+    const auto continued_at = short_response.Data().size();
+    short_response.WriteByte(TTC_MESSAGE_ROW_DATA).WriteLengthPrefixed(std::vector<uint8_t> {'x', 'y', 'z'});
+    const auto continued_end = short_response.Data().size();
+    short_response.WriteByte(29);
+    RecordingRowSink short_sink;
+    TtcFetchResponseDecoder short_decoder(short_columns, 6, std::nullopt, false, 2, &short_sink);
+    const auto short_prefix = [&](size_t end) {
+        return std::vector<uint8_t>(short_response.Data().begin(), short_response.Data().begin() + end);
+    };
+    for (size_t end = 1; end < first_end; end++) {
+        CHECK(!short_decoder.Decode(short_prefix(end)));
+        CHECK(short_sink.rows.empty());
+    }
+    CHECK(!short_decoder.Decode(short_prefix(first_end)));
+    CHECK(short_sink.rows.size() == 1);
+    for (size_t end = continued_at; end < continued_end; end++) {
+        CHECK(!short_decoder.Decode(short_prefix(end)));
+        CHECK(short_sink.rows.size() == 1);
+    }
+    CHECK(short_decoder.Decode(short_response.Data()));
+    const auto short_expected = DecodeTtcFetchResponse(short_response.Data(), short_columns, 6);
+    CHECK(short_sink.rows == short_expected.rows);
+    CHECK(short_decoder.Take().last_row == short_expected.last_row);
+    auto malformed = short_response.Data();
+    malformed[continued_at] = 99;
+    RecordingRowSink malformed_sink;
+    TtcFetchResponseDecoder malformed_decoder(short_columns, 6, std::nullopt, false, 2, &malformed_sink);
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { malformed_decoder.Decode(malformed); });
+
     const std::vector<OracleColumn> columns {{"N", 2}, {"V", 1}, {"Z", 1}};
     ByteWriter response;
     response.WriteByte(TTC_MESSAGE_ROW_DATA)

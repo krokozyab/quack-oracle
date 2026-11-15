@@ -415,6 +415,9 @@ and binary ROWID frames retain their existing read path.
 Packed scalar storage falls back to ordinary decoding when its 64 MiB budget
 is exceeded. The fallback reuses received bytes and does not repeat Oracle SQL.
 Full and continued rows accept scalar values through 16 MiB on both paths.
+Direct scalar reads resume short values split across network fragments without
+throwing an exception for an incomplete value. A row is emitted only after all
+its values arrive; malformed input still fails validation.
 
 ### Passing values safely (bind parameters)
 

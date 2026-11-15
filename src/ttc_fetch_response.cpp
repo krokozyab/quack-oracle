@@ -409,8 +409,14 @@ size_t TtcFetchResponseDecoder::DecodeDirectRow(const std::vector<uint8_t> &mess
     if (continued && !direct_previous) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "direct row continuation appeared before a complete row");
     }
-    ByteReader reader(message.data() + offset, message.size() - offset);
-    if (reader.ReadByte() != TTC_MESSAGE_ROW_DATA) {
+    // Short cells dominate scalar scans. Check their offsets directly so the
+    // incomplete-row path needs neither unwinding nor per-byte reader calls.
+    // Chunked cells retain ByteReader's existing integer and length checks.
+    auto position = offset;
+    if (position == message.size()) {
+        return 0;
+    }
+    if (message[position++] != TTC_MESSAGE_ROW_DATA) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "expected direct ROW_DATA after row continuation");
     }
     if (!continued) {
@@ -424,14 +430,20 @@ size_t TtcFetchResponseDecoder::DecodeDirectRow(const std::vector<uint8_t> &mess
     // Retrying the same immutable prefix overwrites changed cells; unselected
     // cells continue to name their last complete value.
     for (const auto column : selected) {
-        const auto first = reader.ReadByte();
+        if (position == message.size()) {
+            return 0;
+        }
+        const auto first = message[position++];
         if (!first || first == TNS_NULL_LENGTH_INDICATOR) {
             locations[column] = {};
         } else if (first != TNS_LONG_LENGTH_INDICATOR) {
-            const auto at = offset + reader.Position();
-            reader.Skip(first);
-            locations[column] = {CellLocation::MESSAGE, at, first};
+            if (first > message.size() - position) {
+                return 0;
+            }
+            locations[column] = {CellLocation::MESSAGE, position, first};
+            position += first;
         } else {
+            ByteReader reader(message.data() + position, message.size() - position);
             auto &bytes = chunked_cells[column];
             bytes.clear();
             for (;;) {
@@ -443,7 +455,7 @@ size_t TtcFetchResponseDecoder::DecodeDirectRow(const std::vector<uint8_t> &mess
                     throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED,
                                         "chunked TTC value exceeds configured limit");
                 }
-                const auto at = offset + reader.Position();
+                const auto at = position + reader.Position();
                 reader.Skip(count);
                 const auto required = bytes.size() + count;
                 if (required > bytes.capacity()) {
@@ -458,6 +470,7 @@ size_t TtcFetchResponseDecoder::DecodeDirectRow(const std::vector<uint8_t> &mess
                 bytes.insert(bytes.end(), message.data() + at, message.data() + at + count);
             }
             locations[column] = bytes.empty() ? CellLocation {} : CellLocation {CellLocation::CHUNKED, 0, bytes.size()};
+            position += reader.Position();
         }
     }
     direct_message = &message;
@@ -469,7 +482,7 @@ size_t TtcFetchResponseDecoder::DecodeDirectRow(const std::vector<uint8_t> &mess
     }
     result.direct_rows++;
     direct_previous = true;
-    return reader.Position();
+    return position - offset;
 }
 
 bool TtcFetchResponseDecoder::DecodeInternal(const std::vector<uint8_t> &message) {
@@ -555,7 +568,11 @@ bool TtcFetchResponseDecoder::DecodeInternal(const std::vector<uint8_t> &message
             const auto &framing = row_header_present_columns ? selected_framing : row_framing;
             if (sink) {
                 const bool continued = row_header_present_columns.has_value();
-                offset += DecodeDirectRow(message, offset, wire_columns, continued);
+                const auto consumed = DecodeDirectRow(message, offset, wire_columns, continued);
+                if (!consumed) {
+                    return false;
+                }
+                offset += consumed;
                 if (continued) {
                     result.used_row_header_selection = true;
                     row_header_present_columns.reset();
@@ -611,7 +628,12 @@ bool TtcFetchResponseDecoder::DecodeInternal(const std::vector<uint8_t> &message
                                selected.end());
                 offset += continuation.bytes_consumed;
                 try {
-                    offset += DecodeDirectRow(message, offset, selected, true);
+                    const auto consumed = DecodeDirectRow(message, offset, selected, true);
+                    if (!consumed) {
+                        direct_selection.swap(selected);
+                        return false;
+                    }
+                    offset += consumed;
                 } catch (...) {
                     direct_selection.swap(selected);
                     throw;

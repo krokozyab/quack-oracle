@@ -63,3 +63,7 @@
   using an 8 KiB estimated initial payload budget. Small results can finish in
   one exchange; wide/unknown values, LOB and write-locked scans retain their
   ordinary initial query fetch. Exact AVG still finishes in DuckDB.
+
+- Resume incomplete short scalar rows without exception unwinding in the direct
+  decoder. Rows are emitted only when complete; existing malformed-input and
+  size checks remain in force. Chunked values retain their existing parser.

@@ -82,6 +82,8 @@ private:
     const TtcRowData *PreviousRow() const;
     bool DecodeInternal(const std::vector<uint8_t> &message);
 
+    // Zero requests another fragment for an incomplete short scalar row.
+    // No row reaches the sink until all selected cells have been read.
     size_t DecodeDirectRow(const std::vector<uint8_t> &message, size_t offset, const std::vector<size_t> &selected,
                            bool continued);
     void RefreshDirectViews();
