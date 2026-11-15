@@ -2872,6 +2872,46 @@ unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context,
 // decoder lends one row's byte views only during WriteRow; no view is retained.
 class OracleTypedSink final : public oracle_scanner::OracleRowSink {
 public:
+    static bool Fits(const std::vector<OracleColumn> &columns, const std::vector<LogicalType> &types, size_t rows) {
+        constexpr size_t budget = 64U << 20U;
+        if (!rows || columns.size() != types.size()) {
+            return false;
+        }
+        size_t chunk_bytes = 0;
+        size_t wire_bytes = 0;
+        for (size_t i = 0; i < columns.size(); ++i) {
+            const auto vector_bytes = size_t(STANDARD_VECTOR_SIZE) * GetTypeIdSize(types[i].InternalType()) + 4096;
+            if (vector_bytes > budget - chunk_bytes) {
+                return false;
+            }
+            chunk_bytes += vector_bytes;
+            const auto &column = columns[i];
+            size_t width;
+            switch (column.oracle_type) {
+            case 2: width = 22; break;
+            case 12: width = 7; break;
+            case 180: width = 11; break;
+            case 100: width = 4; break;
+            case 101: width = 8; break;
+            case 252: width = 1; break;
+            case 1:
+            case 96:
+            case 23:
+                if (!column.byte_width || column.byte_width > 253) {
+                    return false;
+                }
+                width = size_t(column.byte_width) * 4;
+                break;
+            default: return false;
+            }
+            if (width > budget - wire_bytes) {
+                return false;
+            }
+            wire_bytes += width;
+        }
+        const auto chunks = rows / STANDARD_VECTOR_SIZE + (rows % STANDARD_VECTOR_SIZE != 0);
+        return chunk_bytes <= budget / chunks && wire_bytes <= (budget - chunk_bytes * chunks) / rows / 4;
+    }
     OracleTypedSink(ClientContext &context, const std::vector<OracleColumn> &columns,
                     const std::vector<LogicalType> &types, std::vector<std::shared_ptr<DataChunk>> &chunks,
                     size_t maximum_rows)
@@ -3799,7 +3839,8 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
             typed_chunks.clear();
             typed_rows = 0;
             batch = TranslatingOracleErrors("oracle_query could not fetch from Oracle", [&] {
-                if (state.direct_scalar && state.chunk_columns == state.columns.size()) {
+                if (state.direct_scalar && state.chunk_columns == state.columns.size() &&
+                    OracleTypedSink::Fits(state.columns, state.types, state.fetch_rows)) {
                     try {
                         OracleTypedSink sink(context, state.columns, state.types, typed_chunks, state.fetch_rows);
                         oracle_scanner::OracleFetchResult result;

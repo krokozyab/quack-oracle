@@ -3633,6 +3633,53 @@ void TestTextComparesByTheSessionCollation() {
 }
 
 // DISTINCT counts need the equality of decoded values to match Oracle.
+void TestWideDirectScanFallsBackBeforeFetching() {
+    auto script = std::make_shared<FakeScript>();
+    script->direct_fetch = true;
+    script->affected_rows = 1;
+    FakeResponse dictionary {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1),
+        Column("DATA_LENGTH", 2), Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)}, {}};
+    FakeTable table;
+    WireRow row;
+    for (int i = 0; i < 1900; ++i) {
+        const auto name = "C" + std::to_string(i);
+        auto column = Column(name, 1);
+        column.byte_width = 1;
+        table.columns.push_back(column);
+        row.push_back(i % 3 ? Text("v") : WireValue());
+        dictionary.rows.push_back({Text("WIDE"), Text(name), Text("VARCHAR2"), Number("1"), WireValue(), WireValue(), Text("Y")});
+    }
+    table.rows = {row, row};
+    script->tables["WIDE"] = std::move(table);
+    script->routes = {
+        {"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}},
+        {"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("WIDE")}}}},
+        {"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}},
+        {"FROM user_tab_columns", std::move(dictionary)},
+        {"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS o(TYPE oracle_scanner);SET oracle_parallel_scan=1;SET oracle_direct_scan=false");
+    auto expected = database.Query("SELECT * FROM o.WIDE");
+    CHECK(!expected->HasError() && expected->RowCount() == 2);
+    database.Run("SET oracle_direct_scan=true;BEGIN;INSERT INTO o.WIDE(C1) VALUES ('held')");
+    auto actual = database.Query("SELECT * FROM o.WIDE");
+    CHECK(!actual->HasError() && actual->RowCount() == expected->RowCount());
+    CHECK(script->direct_fetches == 0);
+    for (idx_t row_index = 0; row_index < actual->RowCount(); ++row_index) {
+        for (idx_t column = 0; column < 1900; ++column) {
+            const auto got = actual->GetValue(column, row_index);
+            const auto want = expected->GetValue(column, row_index);
+            CHECK(got.IsNull() == want.IsNull());
+            if (!got.IsNull()) {
+                CHECK(got == want);
+            }
+        }
+    }
+    CHECK(!database.Query("SELECT C1 FROM o.WIDE")->HasError());
+    database.Run("ROLLBACK");
+}
+
 void TestLargeScalarFetchKeepsRowsAndLocalFilters() {
     for (int mode : {0, 1, 2}) {
         const bool packed = mode == 1;
@@ -7026,6 +7073,7 @@ int main() {
     TestParallelMetricSnapshotsSurviveReverseFlushOrder();
     TestTextComparesByTheSessionCollation();
     TestLargeScalarFetchKeepsRowsAndLocalFilters();
+    TestWideDirectScanFallsBackBeforeFetching();
     TestNestedOracleJoinsAndAggregates();
     TestExactAveragePartialPushdown();
     TestDistinctCountPushesOnlyEquivalentEquality();
