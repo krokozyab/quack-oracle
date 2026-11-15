@@ -409,7 +409,7 @@ void FinalizeOracleAverage(DataChunk &input, ExpressionState &, Vector &result) 
         if (narrow && count > 922337203685477LL) {
             throw OutOfRangeException("Oracle partial AVG count exceeds the safe DECIMAL accumulator bound");
         }
-        const auto value = narrow ? Hugeint::Cast<double>(sum) / (double(count) * scale)
+        const auto value = narrow ? double(Hugeint::Cast<int64_t>(sum)) / (double(count) * scale)
                                   : double(Hugeint::Cast<Extended>(sum) / (Extended(count) * Extended(scale)));
         result.SetValue(row, Value::DOUBLE(value));
     }

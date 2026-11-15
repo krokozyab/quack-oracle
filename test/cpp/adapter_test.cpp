@@ -3894,6 +3894,15 @@ void TestExactAveragePartialPushdown() {
                     {Number("1"), Text("0"), Number("922337203685478")}};
                 auto unsafe = database.Query(sql);
                 CHECK(unsafe->HasError() && unsafe->GetError().find("accumulator bound") != std::string::npos);
+                for (const auto *sum : {"-18014398509481987", "-18014398509481991"}) {
+                    script->routes[script->routes.size() - 2].second.rows = {
+                        {Number("1"), Text(sum), Number("2000000000000")}};
+                    const auto rounded = database.Query(sql);
+                    const auto expected = database.Query(std::string("SELECT (") + sum +
+                        "::BIGINT)::DOUBLE / (2000000000000::DOUBLE * 100)");
+                    CHECK(!rounded->HasError() && !expected->HasError());
+                    CHECK(rounded->GetValue(1, 0) == expected->GetValue(0, 0));
+                }
             }
             // NULL-only and empty input produce NULL, never division by zero.
             script->routes.back().second.rows = {{Number("1"), WireValue(), Number("0")}};
