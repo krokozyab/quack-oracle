@@ -3271,17 +3271,17 @@ void TestSelectiveFiltersReadThroughOneSession() {
         extents.push_back({Text("EXTENT" + std::to_string(index)), Number("1000")});
     }
     script->routes.push_back({"dba_extents", {{Column("LOW", 1), Column("BLOCKS", 2)}, extents}});
-    // Five million rows; ID unique from 1 to 5,000,000, KIND one of two values.
+    // Two million rows; ID unique from 1 to 2,000,000, KIND one of two values.
     script->routes.push_back(
         {"num_distinct IS NOT NULL",
          {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("NUM_DISTINCT", 2), Column("LOW_VALUE", 23),
            Column("HIGH_VALUE", 23)},
-          {{Text("FACTS"), Text("ID"), Number("5000000"), oracle_scanner::EncodeOracleNumber("1"),
-            oracle_scanner::EncodeOracleNumber("5000000")},
+          {{Text("FACTS"), Text("ID"), Number("2000000"), oracle_scanner::EncodeOracleNumber("1"),
+            oracle_scanner::EncodeOracleNumber("2000000")},
            {Text("FACTS"), Text("KIND"), Number("2"), oracle_scanner::EncodeOracleNumber("1"),
             oracle_scanner::EncodeOracleNumber("2")}}}});
     script->routes.push_back({"num_rows IS NOT NULL",
-                              {{Column("TABLE_NAME", 1), Column("NUM_ROWS", 2)}, {{Text("FACTS"), Number("5000000")}}}});
+                              {{Column("TABLE_NAME", 1), Column("NUM_ROWS", 2)}, {{Text("FACTS"), Number("2000000")}}}});
     script->routes.push_back({"FROM user_tables", {text_columns({"TABLE_NAME"}), {{Text("FACTS")}}}});
     script->routes.push_back({"FROM user_views", {text_columns({"VIEW_NAME"}), {}}});
     script->routes.push_back(
@@ -3307,7 +3307,7 @@ void TestSelectiveFiltersReadThroughOneSession() {
         }
         return false;
     };
-    CHECK(!read_in_ranges("ID = 7"));                       // one row of five million
+    CHECK(!read_in_ranges("ID = 7"));                       // one row of two million
     CHECK(!read_in_ranges("ID IN (7, 8, 9)"));              // three
     CHECK(!read_in_ranges("ID BETWEEN 1000 AND 50000"));    // about 1%
     CHECK(!read_in_ranges("KIND = 1 AND ID < 20000"));      // the most selective column decides

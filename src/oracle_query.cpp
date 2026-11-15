@@ -3062,10 +3062,9 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
             }
         } else if (bind.estimated_rows && *bind.estimated_rows >= AUTOMATIC_PARALLEL_MINIMUM_ROWS &&
                    EstimatedRowsAfterFilters(bind, filter_estimates) >= AUTOMATIC_PARALLEL_FILTERED_ROWS) {
-            // Automatic: a table Oracle's statistics say is big gets as many
-            // sessions as DuckDB has threads, up to eight, unless the filters Oracle
-            // was sent are estimated to leave few of its rows (see
-            // AUTOMATIC_PARALLEL_FILTERED_ROWS). The planner still
+            // Automatic: estimate the selected data after Oracle filters and
+            // size the reader count to that volume, up to eight and DuckDB's
+            // thread count. The planner still
             // reads one stream when the extents, the change number or a flashback
             // read are not to be had.
             uint64_t row_bytes = 0;
@@ -3094,7 +3093,7 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
             // Range planning/authentication must be amortized by the projected
             // data, not the width of columns the query never reads. Saturate
             // before multiplication when dictionary row counts are enormous.
-            constexpr uint64_t bytes_per_reader = 64U << 20U;
+            constexpr uint64_t bytes_per_reader = 16U << 20U;
             const auto rows = EstimatedRowsAfterFilters(bind, filter_estimates);
             const auto width = MaxValue<uint64_t>(row_bytes, 1);
             const auto readers = rows > (bytes_per_reader * 8) / width

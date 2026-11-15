@@ -1320,7 +1320,7 @@ Oracle 19c and Oracle Free 23ai with the demo schema above. The exceptions are
 Without choosing a key column or calling anything, an attached table can be read through
 several sessions when Oracle's statistics say it has 500,000 rows or more. The default
 `oracle_parallel_scan = -1` estimates the selected columns and filtered row count, targeting
-roughly 64 MiB per reader, up to eight and DuckDB's thread count. A narrow projection can
+roughly 16 MiB per reader, up to eight and DuckDB's thread count. A narrow projection can
 therefore stay sequential even for a large table. To set a maximum yourself, or use one
 session with `0`:
 
@@ -1449,7 +1449,7 @@ response exceeding that count is rejected.
 | `oracle_deferred_columns` | `true` | Read LOB, JSON, VECTOR and XML columns only for the rows that pass a filter DuckDB applies itself. See [Heavy columns after the filter](#heavy-columns-after-the-filter). |
 | `oracle_direct_scan` | `true` | Decode eligible attached scalar scans directly into typed vectors. NUMBER, DATE/TIMESTAMP, binary floats, BOOLEAN and short VARCHAR2/CHAR/RAW are supported; other columns retain the existing path. Set `false` for comparisons or troubleshooting. |
 | `oracle_fetch_rows` | `16384` | Maximum scalar attached-scan fetch rows, 1..65536. Output vectors remain 2048 rows. Declared row widths reduce the request toward an 8 MiB estimate; deferred, locked and short-limit scans retain the smaller path. |
-| `oracle_parallel_scan` | `-1` | Maximum sessions one scan of an attached table may read through at once: `-1` chooses (up to 8 and DuckDB's thread count, for a table of 500,000 rows or more; the projected data estimate targets roughly 64 MiB per reader), `0` or `1` is one session. Small tables and selective filters stay sequential even with a positive maximum. See [section 7](#7-read-a-big-table-faster). |
+| `oracle_parallel_scan` | `-1` | Maximum sessions one scan of an attached table may read through at once: `-1` chooses (up to 8 and DuckDB's thread count, for a table of 500,000 rows or more; the projected data estimate targets roughly 16 MiB per reader), `0` or `1` is one session. Small tables and selective filters stay sequential even with a positive maximum. See [section 7](#7-read-a-big-table-faster). |
 | `oracle_consistent_read` | `false` | Read every attached table of a statement `AS OF` one SCN. See [One moment for a whole statement](#one-moment-for-a-whole-statement). |
 
 Pooling matters more than it looks. Opening a session costs a TCP connect, a TLS
