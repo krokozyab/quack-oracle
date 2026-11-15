@@ -267,7 +267,8 @@ TtcFetchResponseDecoder::TtcFetchResponseDecoder(const std::vector<OracleColumn>
                                                  uint8_t ttc_field_version_p,
                                                  const std::optional<TtcRowData> &preceding_row_p, bool packed_scalars,
                                                  size_t reserve_rows)
-    : columns(columns_p), ttc_field_version(ttc_field_version_p), preceding_row(preceding_row_p) {
+    : columns(columns_p), ttc_field_version(ttc_field_version_p), maximum_rows(reserve_rows ? reserve_rows : 65536),
+      preceding_row(preceding_row_p) {
     if (columns.empty() || columns.size() > 4096) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC fetch response has an invalid cursor column count");
     }
@@ -380,6 +381,14 @@ bool TtcFetchResponseDecoder::DecodeInternal(const std::vector<uint8_t> &message
     while (offset < message.size() && !result.completed) {
         const auto *at = message.data() + offset;
         const auto remaining = message.size() - offset;
+        // Check before decoding/materializing a row, including compressed repeats
+        // and the legacy fallback. A packed preceding-row seed is not a reply row.
+        if (*at == TTC_MESSAGE_ROW_DATA || *at == TTC_MESSAGE_ROW_CONTINUATION) {
+            const auto rows = result.packed ? result.packed->RowCount() - size_t(packed_seed) : result.rows.size();
+            if (rows >= maximum_rows) {
+                throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle fetch response exceeds requested row count");
+            }
+        }
         switch (*at) {
         case TTC_MESSAGE_ROW_HEADER: {
             const auto row_header = DecodeRowHeaderPrefix(at, remaining, columns.size());

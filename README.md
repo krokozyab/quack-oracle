@@ -1411,6 +1411,11 @@ the `k` from a subset.
 
 ---
 
+
+Scalar fetch responses are bounded by the number of rows requested, before
+materializing repeated rows, including the legacy decoding fallback. A server
+response exceeding that count is rejected.
+
 ## 8. Settings
 
 | Setting | Default | What it does |

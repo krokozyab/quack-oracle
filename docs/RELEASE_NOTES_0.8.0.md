@@ -19,3 +19,6 @@
 
 - Partial AVG of DECIMAL widths <=4 refuses counts above 922337203685477,
   ensuring every partial sum fits the pinned DuckDB INT64 accumulator.
+
+- Reject scalar fetch responses exceeding the requested row count before
+  materializing them, including compressed repeats and legacy fallback.

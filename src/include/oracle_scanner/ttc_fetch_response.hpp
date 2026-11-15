@@ -47,6 +47,7 @@ public:
     TtcFetchResponseDecoder(const std::vector<OracleColumn> &columns, uint8_t ttc_field_version,
                             const std::optional<TtcRowData> &preceding_row, bool packed_scalars = false,
                             size_t reserve_rows = 0);
+    // A nonzero reserve_rows is also the requested response row limit.
 
     // True once the response is complete. Throws TRUNCATED, as
     // DecodeTtcFetchResponse does, when the bytes end inside a message, and
@@ -63,6 +64,7 @@ private:
 
     const std::vector<OracleColumn> &columns;
     uint8_t ttc_field_version;
+    size_t maximum_rows;
     std::optional<TtcRowData> preceding_row;
     // The columns a row without a row header carries, and how each frames its value.
     std::vector<size_t> row_columns;

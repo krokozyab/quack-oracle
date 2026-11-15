@@ -1400,6 +1400,29 @@ static void TestExactScaledNumberCodec() {
     CHECK(!TryDecodeOracleScaledInteger(OracleByteView(one),4,5));
 }
 
+static void TestFetchRejectsRowsBeyondRequest() {
+    const std::vector<OracleColumn> columns {OracleColumn {"V", 1}};
+    for (const bool packed : {false, true}) {
+        for (const bool seeded : {false, true}) {
+            const std::optional<TtcRowData> previous = seeded ? std::optional<TtcRowData>(TtcRowData {std::vector<uint8_t>{'x'}}) : std::nullopt;
+            ByteWriter response;
+            response.WriteByte(TTC_MESSAGE_ROW_DATA).WriteLengthPrefixed(std::vector<uint8_t>{'x'});
+            const auto first = response.Data();
+            // Repeated rows can have a tiny wire representation but large logical payload.
+            response.WriteByte(21).WriteUInt16LE(0).WriteByte(0).WriteByte(TTC_MESSAGE_ROW_DATA).WriteByte(29);
+            TtcFetchResponseDecoder decoder(columns, 6, previous, packed, 1);
+            CHECK(!decoder.Decode(first));
+            ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [&] { decoder.Decode(response.Data()); });
+            ByteWriter exact;
+            exact.WriteRaw(first).WriteByte(29);
+            TtcFetchResponseDecoder valid(columns, 6, previous, packed, 1);
+            CHECK(valid.Decode(exact.Data()));
+            auto result = valid.Take();
+            CHECK((result.packed ? result.packed->RowCount() : result.rows.size()) == 1);
+        }
+    }
+}
+
 static void TestPackedFetchFallsBackWhenDescriptorsExceedBudget() {
     constexpr size_t column_count = 1000;
     constexpr size_t row_count = 8300;
@@ -8937,6 +8960,7 @@ int main() {
     TestTtcErrorNamesTheFailingIteration();
     TestTtcErrorCarriesADmlRowId();
     TestTtcRowDataCodec();
+    TestFetchRejectsRowsBeyondRequest();
     TestPackedFetchFallsBackWhenDescriptorsExceedBudget();
     TestPackedSeedFallsBackWhenLogicalRowExceedsBudget();
     TestPackedBatchOwnsCellsAndBoundsMemory();
