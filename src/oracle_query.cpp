@@ -2978,7 +2978,8 @@ static bool OracleDirectScanEnabled(ClientContext &context, const OracleQueryBin
            (!context.TryGetCurrentSetting("oracle_direct_scan", value) || value.IsNull() || BooleanValue::Get(value));
 }
 
-static size_t OracleScanFetchRows(ClientContext &context, const OracleQueryBindData &bind) {
+static size_t OracleScanFetchRows(ClientContext &context, const OracleQueryBindData &bind,
+                                  const std::vector<OracleColumn> &selected_columns) {
     if (!bind.deferred_scan || bind.for_update || bind.limit_rows || !bind.top_n.empty() ||
         !bind.sample_clause.empty()) {
         return STANDARD_VECTOR_SIZE;
@@ -2993,7 +2994,7 @@ static size_t OracleScanFetchRows(ClientContext &context, const OracleQueryBindD
         requested = size_t(value);
     }
     size_t width = 0;
-    for (const auto &column : bind.columns) {
+    for (const auto &column : selected_columns) {
         switch (column.oracle_type) {
         case 1:
         case 2:
@@ -3439,7 +3440,7 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
         auto state = make_uniq<OracleQueryGlobalState>(OracleSessionHandle(), nullptr, std::move(columns),
                                                        std::move(chunk_types), std::move(input.column_ids), chunk_columns);
         state->local_filter = std::move(local_filter);
-        state->fetch_rows = OracleScanFetchRows(context, bind);
+        state->fetch_rows = OracleScanFetchRows(context, bind, state->columns);
         state->direct_scalar = OracleDirectScanEnabled(context, bind);
         state->parallel = true;
         state->parallel_top_n = !bind.order_clause.empty();
@@ -3541,7 +3542,7 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
                                                    std::move(types), std::move(input.column_ids), chunk_columns);
     state->local_filter = std::move(local_filter);
     state->deferred = std::move(deferred);
-    state->fetch_rows = state->deferred ? STANDARD_VECTOR_SIZE : OracleScanFetchRows(context, bind);
+    state->fetch_rows = state->deferred ? STANDARD_VECTOR_SIZE : OracleScanFetchRows(context, bind, state->columns);
     state->direct_scalar = !state->deferred && OracleDirectScanEnabled(context, bind);
     state->sent_sql = opened.sql;
     state->local_filter_text = state->local_filter ? state->local_filter->ToString() : std::string();

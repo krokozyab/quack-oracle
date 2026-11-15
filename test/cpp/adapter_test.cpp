@@ -155,6 +155,7 @@ struct FakeScript {
     bool direct_fetch = false;
     std::vector<size_t> initial_fetch_rows;
     size_t direct_fetches = 0;
+    size_t maximum_fetch_request = 0;
     // A parallel scan drives several sessions at once, all of them recording
     // into this one script. Unsynchronised, the recording loses entries and the
     // test that reads them back becomes a coin flip — which is how this was
@@ -351,7 +352,11 @@ public:
         return answer ? answer->columns : script->columns;
     }
 
-    OracleBatch Fetch(size_t) override {
+    OracleBatch Fetch(size_t requested) override {
+        {
+            std::lock_guard<std::mutex> guard(script->record_lock);
+            script->maximum_fetch_request = (std::max)(script->maximum_fetch_request, requested);
+        }
         if (exhausted && script->reject_fetch_after_exhaustion) {
             throw oracle_scanner::ProtocolError(oracle_scanner::ProtocolErrorKind::INVALID_STATE,
                                                 "fake cursor fetched after end of data");
@@ -3718,6 +3723,27 @@ void TestWideDirectScanFallsBackBeforeFetching() {
     }
     CHECK(!database.Query("SELECT C1 FROM o.WIDE")->HasError());
     database.Run("ROLLBACK");
+}
+
+void TestUnselectedLobKeepsLargeScalarFetches() {
+    auto script = std::make_shared<FakeScript>();
+    script->routes = {
+        {"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}},
+        {"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("PROJECTED")}}}},
+        {"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}},
+        {"FROM user_tab_columns", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1),
+         Column("DATA_LENGTH", 2), Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+         {{Text("PROJECTED"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("Y")},
+          {Text("PROJECTED"), Text("PAYLOAD"), Text("CLOB"), Number("4000"), WireValue(), WireValue(), Text("Y")}}}},
+        {"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}}};
+    script->tables["PROJECTED"] = {{Column("ID", 2, 10, 0), Column("PAYLOAD", 112)}, {{Number("7"), Text("hidden")}}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS o(TYPE oracle_scanner); SET oracle_fetch_rows=16384; SET oracle_parallel_scan=1");
+    script->maximum_fetch_request = 0;
+    const auto result = database.Query("SELECT ID FROM o.PROJECTED");
+    CHECK(!result->HasError() && result->GetValue(0, 0).ToString() == "7");
+    CHECK(script->maximum_fetch_request == 16384);
 }
 
 void TestLargeScalarFetchKeepsRowsAndLocalFilters() {
@@ -7122,6 +7148,7 @@ int main() {
     TestParallelMetricSnapshotsSurviveReverseFlushOrder();
     TestTextComparesByTheSessionCollation();
     TestLargeScalarFetchKeepsRowsAndLocalFilters();
+    TestUnselectedLobKeepsLargeScalarFetches();
     TestWideDirectScanFallsBackBeforeFetching();
     TestNestedOracleJoinsAndAggregates();
     TestExactAveragePartialPushdown();
