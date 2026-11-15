@@ -337,7 +337,14 @@ public:
         OracleBatch batch;
         batch.columns = Columns();
         if (!drained) {
-            batch.rows = answer ? answer->rows : script->rows;
+            const auto arena = std::make_shared<oracle_scanner::OracleRowArena>();
+            for (const auto &source : answer ? answer->rows : script->rows) {
+                oracle_scanner::OracleRowData row(source.size(), arena);
+                for (size_t column = 0; column < source.size(); column++) {
+                    row.SetOwned(column, source[column]);
+                }
+                batch.rows.push_back(std::move(row));
+            }
             drained = true;
             // Like a real cursor, which only learns it is exhausted on the
             // fetch that returns nothing: rows now, the empty end-of-data next.

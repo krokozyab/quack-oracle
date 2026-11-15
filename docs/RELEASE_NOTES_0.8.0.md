@@ -42,3 +42,10 @@
 - Auto parallelism estimates the selected columns and filtered row count,
   targeting approximately 64 MiB per reader, up to eight readers. Small narrow
   copies therefore avoid paying for unnecessary range planning and sessions.
+
+- Native result rows now use a response-owned byte arena with offset/NULL
+  descriptors, including execute prefetch, ROWID and LOB paths. Row continuations
+  share unchanged bytes, incomplete rows roll back arena appends, and fetch
+  snapshots use independent storage. Converters consume byte views without
+  materializing temporary wire-cell vectors. SQL result types are unchanged;
+  LOB I/O may still allocate temporary content buffers.

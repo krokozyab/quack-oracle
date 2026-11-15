@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 #include <vector>
+#include "oracle_scanner/row_batch.hpp"
 
 namespace oracle_scanner {
 
@@ -11,7 +12,7 @@ constexpr uint8_t TTC_MESSAGE_ROW_DATA = 7;
 
 // Decodes one scalar TTC ROW_DATA frame after a describe response has fixed
 // the column count. Type conversion is intentionally left to value_codec.
-using TtcRowData = std::vector<std::optional<std::vector<uint8_t>>>;
+using TtcRowData = OracleRowData;
 struct TtcRowDataPrefix {
     TtcRowData values;
     size_t bytes_consumed = 0;
@@ -83,7 +84,10 @@ struct TtcInlineLob {
     std::vector<uint8_t> locator;
 };
 std::vector<uint8_t> EncodeTtcInlineLob(const TtcInlineLob &lob);
-TtcInlineLob DecodeTtcInlineLob(const std::vector<uint8_t> &cell);
+TtcInlineLob DecodeTtcInlineLob(OracleByteView cell);
+inline TtcInlineLob DecodeTtcInlineLob(const std::vector<uint8_t> &cell) {
+    return DecodeTtcInlineLob(OracleByteView(cell));
+}
 
 inline TtcColumnFraming TtcFramingForType(uint16_t oracle_type) {
     if (IsOracleLocatorType(oracle_type)) {
@@ -106,12 +110,15 @@ TtcRowDataPrefix DecodeTtcRowDataPrefix(const std::vector<uint8_t> &message,
                                         size_t maximum_value_bytes = (1U << 20U));
 // The same, reading from a position inside a larger response rather than from
 // a copy of what is left of it.
-TtcRowDataPrefix DecodeTtcRowDataPrefix(const uint8_t *data, size_t size,
-                                        const std::vector<TtcColumnFraming> &framing,
-                                        size_t maximum_value_bytes = (1U << 20U));
+TtcRowDataPrefix DecodeTtcRowDataPrefix(const uint8_t *data, size_t size, const std::vector<TtcColumnFraming> &framing,
+                                        size_t maximum_value_bytes = (1U << 20U),
+                                        OracleRowData::ArenaPtr arena = nullptr);
 
 TtcRowDataPrefix DecodeTtcRowDataPrefix(const std::vector<uint8_t> &message, size_t column_count,
                                         size_t maximum_value_bytes = 16U << 20U);
+class ByteReader;
+void AppendTtcScalarCell(ByteReader &reader, const uint8_t *data, OracleRowData &row, size_t maximum_value_bytes);
+
 TtcRowData DecodeTtcRowData(const std::vector<uint8_t> &message, size_t column_count,
                             size_t maximum_value_bytes = 16U << 20U);
 

@@ -1421,6 +1421,13 @@ keep the established fetch path. Direct batches have a conservative 64 MiB
 retained-data budget. For direct batches, EXPLAIN ANALYZE includes value conversion
 in fetch time and reports the number of direct scalar batches.
 
+The remaining native row paths, including execute-prefetched rows and ROWID/LOB
+scans, store bytes in a response-owned arena with offset and NULL descriptors.
+Repeated values share their byte ranges; the last-row snapshot is copied into
+independent storage before the next fetch. Consumers read borrowed byte views.
+LOB I/O can still use temporary content buffers. SQL types and existing value,
+response and LOB-prefetch limits are unchanged; this is not a query-wide memory cap.
+
 Scalar fetch responses are bounded by the number of rows requested, before
 materializing repeated rows, including the legacy decoding fallback. A server
 response exceeding that count is rejected.

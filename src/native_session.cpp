@@ -53,7 +53,7 @@ public:
         }
         inline_eligible = !prefetch_eligible && SupportsInlineLobDefine(columns, field_version);
         if (!pending.empty()) {
-            previous_row = pending.back();
+            previous_row = pending.back().Clone();
         }
     }
 
@@ -106,10 +106,13 @@ public:
                 }
                 const bool character=columns[index].oracle_type==ORACLE_WIRE_TYPE_CLOB;
                 if (columns[index].inline_lob_cells && !prefetched) {
-                    row[index]=ResolveInlineLob(*row[index],character);
+                    row.Set(index, ResolveInlineLob(*row[index], character));
                     continue;
                 }
-                if (!prefetched) { row[index]=ReadWholeLob(*row[index],character);continue; }
+                if (!prefetched) {
+                    row.Set(index, ReadWholeLob(*row[index], character));
+                    continue;
+                }
                 const auto call=channel.LockCall();
                 const auto cell=DecodeStoredLobPrefetch(*row[index],character,prefetch_limits);
                 const auto content=MaterializePrefetchedOracleLob(cell,65536,prefetch_limits.maximum_content_bytes,
@@ -119,7 +122,7 @@ public:
                         return channel.LobOperation(request,server_field_version);
                     });
                 if (!content) { throw ProtocolError(ProtocolErrorKind::MALFORMED,"non-NULL prefetched LOB became NULL"); }
-                row[index]=character ? DecodeUtf16BeToUtf8(*content) : *content;
+                row.Set(index, character ? DecodeUtf16BeToUtf8(*content) : *content);
             }
         }
     }
@@ -127,7 +130,7 @@ public:
     // A value that came with its row: whole, when what the server sent covers
     // it, and otherwise the rest of it is read from the locator. A CLOB or BLOB
     // came with only its size, so the size spares the length request.
-    std::vector<uint8_t> ResolveInlineLob(const std::vector<uint8_t> &cell, bool character) {
+    std::vector<uint8_t> ResolveInlineLob(OracleByteView cell, bool character) {
         const auto lob = DecodeTtcInlineLob(cell);
         if (!character && lob.prefix.size() == lob.total) {
             return lob.prefix;
@@ -144,7 +147,7 @@ public:
             [&](const std::vector<uint8_t> &locator, uint64_t offset, uint64_t amount) {
                 TtcLobRequest request;
                 request.sequence = NextCursorSequence();
-                request.locator = locator;
+                request.locator.assign(locator.begin(), locator.end());
                 request.operation = LOB_OP_READ;
                 request.offset = offset;
                 request.amount = amount;
@@ -153,14 +156,14 @@ public:
         return character ? DecodeUtf16BeToUtf8(*content) : *content;
     }
 
-    std::vector<uint8_t> ReadWholeLob(const std::vector<uint8_t> &locator, bool is_character) {
+    std::vector<uint8_t> ReadWholeLob(OracleByteView locator, bool is_character) {
         // Sequence allocation and every request/response share the session call lock.
         const auto call = channel.LockCall();
         auto content = ReadOracleLobContent(is_character,
             [&](uint64_t offset, uint64_t amount) {
                 TtcLobRequest request;
                 request.sequence = NextCursorSequence();
-                request.locator = locator;
+                request.locator.assign(locator.begin(), locator.end());
                 request.operation = LOB_OP_READ;
                 request.offset = offset;
                 request.amount = amount;
@@ -168,7 +171,7 @@ public:
             }, [&] {
                 TtcLobRequest request;
                 request.sequence = NextCursorSequence();
-                request.locator = locator;
+                request.locator.assign(locator.begin(), locator.end());
                 request.operation = LOB_OP_GET_LENGTH;
                 return channel.LobOperation(request, server_field_version).amount;
             });

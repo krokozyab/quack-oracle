@@ -131,6 +131,8 @@ private:
     uint8_t server_field_version;
     std::optional<TtcRowData> preceding_row;
     TtcFetchResponse result;
+    OracleRowData::ArenaPtr row_arena = std::make_shared<OracleRowArena>();
+    size_t kept_arena_bytes = 0;
     size_t resume_offset = 0;
     size_t kept_rows = 0;
     size_t kept_batch_bytes = 0;
@@ -191,17 +193,22 @@ inline std::optional<OracleLobPrefetch> DecodeCursorLobPrefetchCell(ByteReader &
     return result;
 }
 
-inline std::optional<OracleLobPrefetch> DecodeStoredLobPrefetch(const std::vector<uint8_t> &cell,
-    bool character,const OracleLobPrefetchLimits &limits) {
+inline std::optional<OracleLobPrefetch> DecodeStoredLobPrefetch(OracleByteView cell, bool character,
+                                                                const OracleLobPrefetchLimits &limits) {
     if (cell.size() > limits.maximum_row_bytes) {
         throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED,"stored LOB prefetch cell exceeds row budget");
     }
-    ByteReader reader(cell);
+    ByteReader reader(cell.data(), cell.size());
     auto value=DecodeCursorLobPrefetchCell(reader,character,limits.prefix_units,limits.maximum_content_bytes);
     if (!value || reader.Remaining() != 0) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED,"stored LOB prefetch cell is not one non-NULL value");
     }
     return value;
+}
+
+inline std::optional<OracleLobPrefetch> DecodeStoredLobPrefetch(const std::vector<uint8_t> &cell, bool character,
+                                                                const OracleLobPrefetchLimits &limits) {
+    return DecodeStoredLobPrefetch(OracleByteView(cell), character, limits);
 }
 
 } // namespace oracle_scanner

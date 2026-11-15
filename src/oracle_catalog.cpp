@@ -333,14 +333,14 @@ struct OracleAttachedState {
     // start, so the same reader serves the whole-schema query, whose first
     // field is the table name, and the single-object one, which has no such
     // field.
-    OracleColumn ColumnFromDictionaryRow(const std::vector<std::optional<std::vector<uint8_t>>> &row, size_t offset,
+    OracleColumn ColumnFromDictionaryRow(const oracle_scanner::OracleRowData &row, size_t offset,
                                          const std::string &object_name) const {
         if (row.size() < offset + 6 || !row[offset] || !row[offset + 1] || !row[offset + 2] || !row[offset + 5]) {
             throw IOException("Oracle ATTACH received incomplete USER_TAB_COLUMNS metadata for '%s'", object_name);
         }
         const std::string name(row[offset]->begin(), row[offset]->end());
         const std::string type(row[offset + 1]->begin(), row[offset + 1]->end());
-        const auto number = [](const std::optional<std::vector<uint8_t>> &value, int16_t fallback) {
+        const auto number = [](const std::optional<oracle_scanner::OracleByteView> &value, int16_t fallback) {
             if (!value) {
                 return fallback;
             }
@@ -869,7 +869,9 @@ struct OracleAttachedState {
                                 std::stoull(oracle_scanner::DecodeOracleNumber(*row[2]));
                             if (row.size() >= 5 && row[3] && row[4]) {
                                 value_bounds[std::string(row[0]->begin(), row[0]->end())]
-                                            [std::string(row[1]->begin(), row[1]->end())] = {*row[3], *row[4]};
+                                            [std::string(row[1]->begin(), row[1]->end())] = {
+                                                std::vector<uint8_t>(row[3]->begin(), row[3]->end()),
+                                                std::vector<uint8_t>(row[4]->begin(), row[4]->end())};
                             }
                         } catch (const std::exception &) {
                             continue;

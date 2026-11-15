@@ -126,38 +126,48 @@ TtcRowContinuationPrefix DecodeRowContinuationPrefix(const uint8_t *data, size_t
                             " described columns");
 }
 
-TtcRowDataPrefix DecodePrefetchedRow(const uint8_t *data, size_t size,
-    const std::vector<size_t> &wire_columns,const std::vector<OracleColumn> &columns,
-    const OracleLobPrefetchLimits &limits) {
+TtcRowDataPrefix DecodePrefetchedRow(const uint8_t *data, size_t size, const std::vector<size_t> &wire_columns,
+                                     const std::vector<OracleColumn> &columns, const OracleLobPrefetchLimits &limits,
+                                     const OracleRowData::ArenaPtr &arena) {
     ByteReader reader(data, size);
     if (reader.ReadByte() != TTC_MESSAGE_ROW_DATA) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED,"expected prefetched TTC ROW_DATA");
     }
-    TtcRowData values;
-    size_t row_bytes=0;
-    for (const auto index : wire_columns) {
-        if (index >= columns.size()) {
-            throw ProtocolError(ProtocolErrorKind::MALFORMED,"prefetched column index exceeds describe");
-        }
-        const auto &column=columns[index];
-        if (!IsOracleLobType(column.oracle_type)) {
-            values.push_back(reader.ReadLengthPrefixed(limits.maximum_row_bytes-row_bytes));
-        } else {
-            const auto start=reader.Position();
-            const auto value=DecodeCursorLobPrefetchCell(reader,column.oracle_type == 112,
-                limits.prefix_units,limits.maximum_content_bytes);
-            if (!value) { values.emplace_back(std::nullopt); }
-            else {
-                const auto length=reader.Position()-start;
-                if (length > limits.maximum_row_bytes-row_bytes) {
-                    throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED,"prefetched row exceeds stored byte budget");
+    TtcRowData values(0, arena);
+    const auto checkpoint = arena->Size();
+    try {
+        size_t row_bytes = 0;
+        for (const auto index : wire_columns) {
+            if (index >= columns.size()) {
+                throw ProtocolError(ProtocolErrorKind::MALFORMED, "prefetched column index exceeds describe");
+            }
+            const auto &column = columns[index];
+            if (!IsOracleLobType(column.oracle_type)) {
+                AppendTtcScalarCell(reader, data, values, limits.maximum_row_bytes - row_bytes);
+            } else {
+                const auto start = reader.Position();
+                const auto value = DecodeCursorLobPrefetchCell(reader, column.oracle_type == 112, limits.prefix_units,
+                                                               limits.maximum_content_bytes);
+                if (!value) {
+                    values.emplace_back(std::nullopt);
+                } else {
+                    const auto length = reader.Position() - start;
+                    if (length > limits.maximum_row_bytes - row_bytes) {
+                        throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED,
+                                            "prefetched row exceeds stored byte budget");
+                    }
+                    values.Append(OracleByteView(data + start, reader.Position() - start));
                 }
-                values.emplace_back(std::vector<uint8_t>(data+start,data+reader.Position()));
+            }
+            if (values.back()) {
+                row_bytes += values.back()->size();
             }
         }
-        if (values.back()) { row_bytes+=values.back()->size(); }
+        return {std::move(values), reader.Position()};
+    } catch (...) {
+        arena->Truncate(checkpoint);
+        throw;
     }
-    return {std::move(values),reader.Position()};
 }
 
 TtcRowData MergeChangedColumns(const TtcRowData &previous_row, const std::vector<size_t> &present_columns,
@@ -167,7 +177,7 @@ TtcRowData MergeChangedColumns(const TtcRowData &previous_row, const std::vector
     }
     auto row = previous_row;
     for (size_t index = 0; index < present_columns.size(); index++) {
-        row[present_columns[index]] = values[index];
+        row.CopyCell(present_columns[index], values, index);
     }
     return row;
 }
@@ -211,9 +221,9 @@ TtcRowData ExpandWireRow(size_t column_count, const std::vector<size_t> &wire_co
     if (wire_columns.size() != values.size()) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC row disagrees with the columns that carry values");
     }
-    TtcRowData row(column_count);
+    TtcRowData row(column_count, values.Arena());
     for (size_t index = 0; index < wire_columns.size(); index++) {
-        row[wire_columns[index]] = values[index];
+        row.CopyCell(wire_columns[index], values, index);
     }
     return row;
 }
@@ -223,6 +233,10 @@ TtcRowData ExpandWireRow(size_t column_count, const std::vector<size_t> &wire_co
 LobPrefetchFetchResponseDecoder::LobPrefetchFetchResponseDecoder(const std::vector<OracleColumn> &columns_p,
     const OracleLobPrefetchLimits &limits_p,uint8_t server_field_version_p,const std::optional<TtcRowData> &preceding_row_p)
     : columns(columns_p), limits(limits_p), server_field_version(server_field_version_p), preceding_row(preceding_row_p) {
+    if (preceding_row) {
+        preceding_row = preceding_row->Clone(row_arena);
+        kept_arena_bytes = row_arena->Size();
+    }
     if (columns.empty() || columns.size() > 4096) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC fetch response has an invalid cursor column count");
     }
@@ -248,6 +262,7 @@ bool LobPrefetchFetchResponseDecoder::Decode(const std::vector<uint8_t> &message
     // calls; everything after them is decided again, exactly as one pass over
     // the joined response would decide it.
     result.rows.erase(result.rows.begin() + static_cast<std::ptrdiff_t>(kept_rows), result.rows.end());
+    row_arena->Truncate(kept_arena_bytes);
     result.used_row_header_selection = kept_row_header_selection;
     result.used_row_continuation = kept_row_continuation;
     result.completion.reset();
@@ -262,13 +277,17 @@ bool LobPrefetchFetchResponseDecoder::Decode(const std::vector<uint8_t> &message
         }
         size_t stored_row_bytes=0,changed=0;
         for (size_t column=0;column<columns.size();++column) {
-            const std::optional<std::vector<uint8_t>> *value=previous ? &(*previous)[column] : nullptr;
-            if (changed<selected.size() && selected[changed]==column) { value=&values[changed++]; }
-            if (!value || !*value) { continue; }
-            if ((*value)->size()>limits.maximum_row_bytes-stored_row_bytes) {
+            auto value = previous ? (*previous)[column] : std::nullopt;
+            if (changed < selected.size() && selected[changed] == column) {
+                value = values[changed++];
+            }
+            if (!value) {
+                continue;
+            }
+            if (value->size() > limits.maximum_row_bytes - stored_row_bytes) {
                 throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED,"prefetched expanded row exceeds byte budget");
             }
-            stored_row_bytes+=(*value)->size();
+            stored_row_bytes += value->size();
         }
         if (changed!=selected.size()) {
             throw ProtocolError(ProtocolErrorKind::MALFORMED,"prefetched row budget column selection is invalid");
@@ -290,6 +309,7 @@ bool LobPrefetchFetchResponseDecoder::Decode(const std::vector<uint8_t> &message
         if (!row_header_present_columns) {
             resume_offset = offset;
             kept_rows = result.rows.size();
+            kept_arena_bytes = row_arena->Size();
             kept_batch_bytes = stored_batch_bytes;
             kept_row_header_selection = result.used_row_header_selection;
             kept_row_continuation = result.used_row_continuation;
@@ -307,13 +327,13 @@ bool LobPrefetchFetchResponseDecoder::Decode(const std::vector<uint8_t> &message
         }
         case TTC_MESSAGE_ROW_DATA: {
             const auto wire_columns = WireCarryingColumns(columns, row_header_present_columns);
-            TtcRowData values;
+            TtcRowData values(0, row_arena);
             if (wire_columns.empty()) {
                 // Every column this row would carry is zero-width, so ROW_DATA
                 // is its message byte and nothing else.
                 offset += 1;
             } else {
-                auto row = DecodePrefetchedRow(at,remaining,wire_columns,columns,limits);
+                auto row = DecodePrefetchedRow(at, remaining, wire_columns, columns, limits, row_arena);
                 values = std::move(row.values);
                 offset += row.bytes_consumed;
             }
@@ -346,8 +366,9 @@ bool LobPrefetchFetchResponseDecoder::Decode(const std::vector<uint8_t> &message
             // Zero-width columns carry no bytes here either, so they are
             // dropped from the selection before the values are read.
             const auto wire_columns = WireCarryingColumns(columns, continuation.present_columns);
-            const auto partial=DecodePrefetchedRow(at+continuation.bytes_consumed,
-                remaining-continuation.bytes_consumed,wire_columns,columns,limits);
+            const auto partial =
+                DecodePrefetchedRow(at + continuation.bytes_consumed, remaining - continuation.bytes_consumed,
+                                    wire_columns, columns, limits, row_arena);
             offset += continuation.bytes_consumed + partial.bytes_consumed;
             account_row(partial.values,wire_columns,previous_row);
             auto merged = MergeChangedColumns(*previous_row,wire_columns,partial.values,columns.size());
@@ -408,8 +429,11 @@ bool LobPrefetchFetchResponseDecoder::Decode(const std::vector<uint8_t> &message
 }
 
 TtcFetchResponse LobPrefetchFetchResponseDecoder::Take() {
-    if (const auto *last = PreviousRow()) { result.last_row = *last; }
-    else { result.last_row.reset(); }
+    if (const auto *last = PreviousRow()) {
+        result.last_row = last->Clone();
+    } else {
+        result.last_row.reset();
+    }
     return std::move(result);
 }
 

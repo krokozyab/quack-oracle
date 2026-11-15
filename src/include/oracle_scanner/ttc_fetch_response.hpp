@@ -106,6 +106,8 @@ private:
     std::vector<size_t> row_columns;
     std::vector<TtcColumnFraming> row_framing;
     TtcFetchResponse result;
+    OracleRowData::ArenaPtr row_arena = std::make_shared<OracleRowArena>();
+    size_t kept_arena_bytes = 0;
     // What is kept between calls: the rows decoded before resume_offset, and
     // whether any of them needed a row header or a continuation. Rows after it
     // were decoded with a row header still waiting, and are decoded again.

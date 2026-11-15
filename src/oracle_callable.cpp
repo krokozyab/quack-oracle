@@ -124,14 +124,14 @@ std::string UnsupportedReason(const std::string &dictionary_type) {
     return "Oracle type " + dictionary_type + " has no bind mapping in this version";
 }
 
-std::string TextOf(const std::optional<std::vector<uint8_t>> &wire) {
+std::string TextOf(const std::optional<oracle_scanner::OracleByteView> &wire) {
     if (!wire) {
         return {};
     }
     return std::string(wire->begin(), wire->end());
 }
 
-int64_t IntegerOf(const std::optional<std::vector<uint8_t>> &wire, const char *field) {
+int64_t IntegerOf(const std::optional<oracle_scanner::OracleByteView> &wire, const char *field) {
     if (!wire) {
         return -1;
     }
@@ -333,12 +333,10 @@ OracleCallableBind EncodeOracleCallableArgument(const std::string &type_name,
 }
 
 // Reads a query that returns text columns, bounded.
-std::vector<std::vector<std::optional<std::vector<uint8_t>>>> ReadMetadataRows(OracleSession &session,
-                                                                              const std::string &sql,
-                                                                              const std::vector<OracleBind> &binds,
-                                                                              size_t minimum_columns,
-                                                                              const char *what) {
-    std::vector<std::vector<std::optional<std::vector<uint8_t>>>> rows;
+std::vector<oracle_scanner::OracleRowData> ReadMetadataRows(OracleSession &session, const std::string &sql,
+                                                            const std::vector<OracleBind> &binds,
+                                                            size_t minimum_columns, const char *what) {
+    std::vector<oracle_scanner::OracleRowData> rows;
     auto cursor = TranslatingOracleErrors(what, [&] { return session.Query(sql, binds); });
     for (;;) {
         const auto batch = TranslatingOracleErrors(what, [&] { return cursor->Fetch(STANDARD_VECTOR_SIZE); });

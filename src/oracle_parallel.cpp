@@ -226,7 +226,7 @@ unique_ptr<FunctionData> OracleParallelBind(ClientContext &context, TableFunctio
         if (batch.rows.empty() || batch.rows[0].size() < 3) {
             throw IOException("Oracle returned no key range for '%s'", input.inputs[1].GetValue<std::string>());
         }
-        const auto decode = [&](const std::optional<std::vector<uint8_t>> &wire) {
+        const auto decode = [&](const std::optional<oracle_scanner::OracleByteView> &wire) {
             return wire ? TranslatingOracleErrors("oracle_scan_parallel could not decode the key range",
                                                   [&] { return oracle_scanner::DecodeOracleNumber(*wire); })
                         : std::string();

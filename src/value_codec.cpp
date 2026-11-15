@@ -607,6 +607,10 @@ std::vector<uint8_t> EncodeOracleIntervalYearMonth(int32_t years, int32_t months
 }
 
 OracleIntervalYearMonth DecodeOracleIntervalYearMonth(const std::vector<uint8_t> &wire) {
+    return DecodeOracleIntervalYearMonth(OracleByteView(wire));
+}
+
+OracleIntervalYearMonth DecodeOracleIntervalYearMonth(OracleByteView wire) {
     if (wire.size() != 5) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle INTERVAL YEAR TO MONTH must be 5 bytes");
     }
@@ -635,6 +639,10 @@ std::vector<uint8_t> EncodeOracleIntervalDaySecond(int32_t days, int32_t hours, 
 }
 
 OracleIntervalDaySecond DecodeOracleIntervalDaySecond(const std::vector<uint8_t> &wire) {
+    return DecodeOracleIntervalDaySecond(OracleByteView(wire));
+}
+
+OracleIntervalDaySecond DecodeOracleIntervalDaySecond(OracleByteView wire) {
     if (wire.size() != 11) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle INTERVAL DAY TO SECOND must be 11 bytes");
     }
@@ -654,6 +662,10 @@ OracleIntervalDaySecond DecodeOracleIntervalDaySecond(const std::vector<uint8_t>
 }
 
 std::optional<std::string> TryDecodeOracleRowid(const std::vector<uint8_t> &wire) {
+    return TryDecodeOracleRowid(OracleByteView(wire));
+}
+
+std::optional<std::string> TryDecodeOracleRowid(OracleByteView wire) {
     size_t offset = 0;
     if (wire.size() == 13 && wire[0] == 1) {
         offset = 1;

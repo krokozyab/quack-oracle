@@ -187,7 +187,7 @@ TtcLobResponse DecodeCompleteTtcLobCall(const std::vector<uint8_t> &response, si
     return decoded;
 }
 
-std::vector<uint8_t> DecodeUtf16BeToUtf8(const std::vector<uint8_t> &utf16) {
+std::vector<uint8_t> DecodeUtf16BeToUtf8(OracleByteView utf16) {
     if (utf16.size() % 2 != 0) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "a CLOB read returned an odd number of UTF-16 bytes");
     }

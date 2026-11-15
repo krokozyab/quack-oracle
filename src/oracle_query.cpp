@@ -3298,7 +3298,7 @@ static bool DeferrableColumn(const OracleColumn &column) {
     }
 }
 
-std::string RowIdText(const std::optional<std::vector<uint8_t>> &wire) {
+std::string RowIdText(const std::optional<oracle_scanner::OracleByteView> &wire) {
     return wire ? std::string(wire->begin(), wire->end()) : std::string();
 }
 

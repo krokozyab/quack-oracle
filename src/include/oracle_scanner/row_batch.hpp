@@ -4,8 +4,14 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <initializer_list>
+#include <iterator>
+#include <limits>
+#include <memory>
 #include <optional>
 #include <vector>
+#include <utility>
 
 namespace oracle_scanner {
 
@@ -44,6 +50,264 @@ public:
 private:
     const uint8_t *bytes;
     size_t count;
+};
+
+inline bool operator==(OracleByteView left, OracleByteView right) {
+    return left.size() == right.size() && (!left.size() || std::memcmp(left.data(), right.data(), left.size()) == 0);
+}
+inline bool operator==(OracleByteView left, const std::vector<uint8_t> &right) {
+    return left == OracleByteView(right);
+}
+inline bool operator==(const std::vector<uint8_t> &left, OracleByteView right) {
+    return OracleByteView(left) == right;
+}
+inline bool operator!=(OracleByteView left, OracleByteView right) {
+    return !(left == right);
+}
+
+// One response owns the bytes; row/cell copies copy only offsets. Views are
+// borrowed until the next append. Offsets remain valid across arena growth.
+class OracleRowArena {
+public:
+    size_t Size() const {
+        return bytes.size();
+    }
+    void Truncate(size_t count) {
+        if (count > bytes.size()) {
+            throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "Oracle row arena checkpoint is outside its bytes");
+        }
+        bytes.resize(count);
+    }
+    size_t Append(OracleByteView value) {
+        if (value.size() > bytes.max_size() - bytes.size()) {
+            throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle row arena exceeds addressable storage");
+        }
+        const auto offset = bytes.size();
+        // A cell may be copied from this arena while it grows (LOB assembly,
+        // or reassigning a column). Rebase the source after any reallocation.
+        const auto address = reinterpret_cast<uintptr_t>(value.data());
+        const auto base = reinterpret_cast<uintptr_t>(bytes.data());
+        const bool internal = value.size() && address >= base && address - base < bytes.size() &&
+                              value.size() <= bytes.size() - (address - base);
+        const auto source_offset = internal ? address - base : 0;
+        if (internal) {
+            bytes.resize(offset + value.size());
+            std::memmove(bytes.data() + offset, bytes.data() + source_offset, value.size());
+        } else if (value.size()) {
+            bytes.insert(bytes.end(), value.begin(), value.end());
+        }
+        return offset;
+    }
+    OracleByteView Get(size_t offset, size_t count) const {
+        if (offset > bytes.size() || count > bytes.size() - offset) {
+            throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "Oracle row cell exceeds its arena");
+        }
+        static constexpr uint8_t empty = 0;
+        return OracleByteView(bytes.empty() ? &empty : bytes.data() + offset, count);
+    }
+
+private:
+    std::vector<uint8_t> bytes;
+};
+
+class OracleRowData {
+public:
+    using ArenaPtr = std::shared_ptr<OracleRowArena>;
+    OracleRowData() : OracleRowData(0, nullptr) {
+    }
+    explicit OracleRowData(size_t columns, ArenaPtr arena = nullptr)
+        : arena(arena ? std::move(arena) : std::make_shared<OracleRowArena>()) {
+        CheckColumns(columns);
+        cells.resize(columns);
+    }
+    OracleRowData(std::initializer_list<std::optional<std::vector<uint8_t>>> values) : OracleRowData() {
+        reserve(values.size());
+        for (const auto &value : values) {
+            push_back(value);
+        }
+    }
+    OracleRowData(size_t count, const std::vector<uint8_t> &value) : OracleRowData(count) {
+        if (count) {
+            Set(0, OracleByteView(value));
+            for (size_t i = 1; i < count; i++) {
+                CopyCell(i, *this, 0);
+            }
+        }
+    }
+    size_t size() const {
+        return cells.size();
+    }
+    bool empty() const {
+        return cells.empty();
+    }
+    const ArenaPtr &Arena() const {
+        return arena;
+    }
+    void reserve(size_t count) {
+        CheckColumns(count);
+        cells.reserve(count);
+    }
+    void resize(size_t count) {
+        CheckColumns(count);
+        cells.resize(count);
+    }
+    // const prvalues deliberately forbid the old row[i] = value spelling:
+    // mutating a temporary view would otherwise silently do nothing.
+    const std::optional<OracleByteView> operator[](size_t index) const {
+        const auto &cell = CellAt(index);
+        return cell.length == NULL_LENGTH ? std::nullopt
+                                          : std::optional<OracleByteView>(arena->Get(cell.offset, cell.length));
+    }
+    const std::optional<OracleByteView> back() const {
+        return (*this)[size() - 1];
+    }
+    void Set(size_t index, const std::optional<OracleByteView> &value) {
+        auto &cell = CellAt(index);
+        cell = value ? Cell {arena->Append(*value), value->size()} : Cell {};
+    }
+    void Set(size_t index, const std::vector<uint8_t> &value) {
+        Set(index, OracleByteView(value));
+    }
+    void SetOwned(size_t index, const std::optional<std::vector<uint8_t>> &value) {
+        Set(index, value ? std::optional<OracleByteView>(OracleByteView(*value)) : std::nullopt);
+    }
+    void CopyCell(size_t index, const OracleRowData &source, size_t column) {
+        if (arena == source.arena) {
+            CellAt(index) = source.CellAt(column);
+        } else {
+            Set(index, source[column]);
+        }
+    }
+    void Append(const std::optional<OracleByteView> &value) {
+        CheckColumns(cells.size() + 1);
+        cells.emplace_back();
+        Set(cells.size() - 1, value);
+    }
+    void AppendCellBytes(size_t index, OracleByteView value) {
+        auto &cell = CellAt(index);
+        if (cell.length == NULL_LENGTH) {
+            cell = {arena->Size(), 0};
+        }
+        if (cell.offset + cell.length != arena->Size()) {
+            throw ProtocolError(ProtocolErrorKind::INVALID_STATE, "Oracle row cell chunks are not contiguous");
+        }
+        arena->Append(value);
+        cell.length += value.size();
+    }
+    void push_back(const std::optional<std::vector<uint8_t>> &value) {
+        Append(value ? std::optional<OracleByteView>(OracleByteView(*value)) : std::nullopt);
+    }
+    void emplace_back(const std::optional<std::vector<uint8_t>> &value) {
+        push_back(value);
+    }
+    OracleRowData Clone(ArenaPtr target = nullptr) const {
+        OracleRowData result(size(), std::move(target));
+        if (result.arena == arena) {
+            result.cells = cells;
+            return result;
+        }
+        size_t logical_bytes = 0;
+        for (const auto &cell : cells) {
+            if (cell.length != NULL_LENGTH) {
+                logical_bytes += (std::min)(cell.length, arena->Size() - logical_bytes);
+            }
+        }
+        if (arena->Size() <= logical_bytes) {
+            // Preserve shared ranges when copying the arena is no larger than
+            // copying this logical row. Repeated large cells stay shared.
+            const auto base = result.arena->Append(arena->Get(0, arena->Size()));
+            result.cells = cells;
+            for (auto &cell : result.cells) {
+                if (cell.length != NULL_LENGTH) {
+                    cell.offset += base;
+                }
+            }
+        } else {
+            for (size_t i = 0; i < size(); i++) {
+                result.CopyCell(i, *this, i);
+            }
+        }
+        return result;
+    }
+    class Iterator {
+    public:
+        using iterator_category = std::forward_iterator_tag;
+        using value_type = std::optional<OracleByteView>;
+        using difference_type = std::ptrdiff_t;
+        using pointer = void;
+        using reference = value_type;
+        Iterator() = default;
+        Iterator(const OracleRowData *row, size_t index) : row(row), index(index) {
+        }
+        value_type operator*() const {
+            return (*row)[index];
+        }
+        Iterator &operator++() {
+            index++;
+            return *this;
+        }
+        Iterator operator++(int) {
+            auto copy = *this;
+            ++*this;
+            return copy;
+        }
+        bool operator!=(const Iterator &other) const {
+            return row != other.row || index != other.index;
+        }
+        bool operator==(const Iterator &other) const {
+            return !(*this != other);
+        }
+
+    private:
+        const OracleRowData *row = nullptr;
+        size_t index = 0;
+    };
+    Iterator begin() const {
+        return Iterator(this, 0);
+    }
+    Iterator end() const {
+        return Iterator(this, size());
+    }
+    bool operator!=(const OracleRowData &other) const {
+        return !(*this == other);
+    }
+    bool operator==(const OracleRowData &other) const {
+        if (size() != other.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < size(); i++) {
+            if ((*this)[i] != other[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+private:
+    static void CheckColumns(size_t columns) {
+        if (columns > 4096) {
+            throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "Oracle row has too many columns");
+        }
+    }
+    static constexpr size_t NULL_LENGTH = (std::numeric_limits<size_t>::max)();
+    struct Cell {
+        size_t offset = 0;
+        size_t length = NULL_LENGTH;
+    };
+    Cell &CellAt(size_t index) {
+        if (index >= cells.size()) {
+            throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle row cell index is out of range");
+        }
+        return cells[index];
+    }
+    const Cell &CellAt(size_t index) const {
+        if (index >= cells.size()) {
+            throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle row cell index is out of range");
+        }
+        return cells[index];
+    }
+    ArenaPtr arena;
+    std::vector<Cell> cells;
 };
 
 // Transport-neutral scalar batch. Offsets survive arena growth, and a row
@@ -132,13 +396,13 @@ public:
         static constexpr uint8_t empty = 0;
         return OracleByteView(bytes.empty() ? &empty : bytes.data() + cell.offset, cell.length);
     }
-    std::vector<std::optional<std::vector<uint8_t>>> MaterializeRow(size_t row) const {
-        std::vector<std::optional<std::vector<uint8_t>>> result;
+    OracleRowData MaterializeRow(size_t row) const {
+        OracleRowData result;
         result.reserve(columns);
         for (size_t i = 0; i < columns; i++) {
             const auto value = Get(row, i);
             if (value) {
-                result.emplace_back(std::vector<uint8_t>(value->begin(), value->end()));
+                result.Append(value);
             } else {
                 result.emplace_back(std::nullopt);
             }

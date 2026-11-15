@@ -303,9 +303,9 @@ Value TimestampValueFor(const OracleColumn &column, const oracle_scanner::Oracle
 
 
 // The JSON text of one OSON image, with the column named when it cannot be read.
-std::string OsonToJson(const OracleColumn &column, const std::vector<uint8_t> &image) {
+std::string OsonToJson(const OracleColumn &column, oracle_scanner::OracleByteView image) {
     try {
-        return oracle_scanner::DecodeOsonToJson(image);
+        return oracle_scanner::DecodeOsonToJson(image.data(), image.size());
     } catch (const oracle_scanner::ProtocolError &error) {
         throw ConversionException("Oracle JSON column \"%s\" cannot be read: %s", column.name, error.what());
     }
@@ -325,10 +325,10 @@ vector<Value> VectorElements(const std::vector<T> &elements) {
 // may be in any format maps to DOUBLE, which every format but BINARY fits
 // exactly; a BINARY value there is reported rather than turned into numbers
 // that are not its elements.
-Value VectorValueFor(const OracleColumn &column, const std::vector<uint8_t> &image) {
+Value VectorValueFor(const OracleColumn &column, oracle_scanner::OracleByteView image) {
     oracle_scanner::OracleVector decoded;
     try {
-        decoded = oracle_scanner::DecodeOracleVector(image);
+        decoded = oracle_scanner::DecodeOracleVector(image.data(), image.size());
     } catch (const oracle_scanner::ProtocolError &error) {
         throw ConversionException("Oracle VECTOR column \"%s\" cannot be read: %s", column.name, error.what());
     }
@@ -396,7 +396,7 @@ Value VectorValueFor(const OracleColumn &column, const std::vector<uint8_t> &ima
                                              : Value::LIST(element_type, std::move(elements));
 }
 
-Value ValueFor(const OracleColumn &column, const std::optional<std::vector<uint8_t>> &wire) {
+Value ValueFor(const OracleColumn &column, const std::optional<oracle_scanner::OracleByteView> &wire) {
     if (!wire) {
         return Value();
     }
@@ -653,11 +653,7 @@ static bool WriteExactOracleDecimal(Vector &vector, idx_t row, const OracleColum
 void WriteOracleValueView(Vector &vector, idx_t row, const OracleColumn &column,
                           const std::optional<oracle_scanner::OracleByteView> &wire) {
     const auto fallback = [&] {
-        std::optional<std::vector<uint8_t>> owned;
-        if (wire) {
-            owned.emplace(wire->begin(), wire->end());
-        }
-        WriteOracleValue(vector, row, column, owned);
+        WriteOracleValue(vector, row, column, wire);
     };
     if (vector.GetVectorType() != VectorType::FLAT_VECTOR) {
         fallback();
@@ -714,7 +710,7 @@ void WriteOracleValueView(Vector &vector, idx_t row, const OracleColumn &column,
 }
 
 void WriteOracleValue(Vector &vector, idx_t row, const OracleColumn &column,
-                      const std::optional<std::vector<uint8_t>> &wire) {
+                      const std::optional<oracle_scanner::OracleByteView> &wire) {
     const auto through_value = [&] { vector.SetValue(row, ValueFor(column, wire)); };
     if (vector.GetVectorType() != VectorType::FLAT_VECTOR) {
         through_value();
@@ -849,7 +845,7 @@ void WriteOracleValue(Vector &vector, idx_t row, const OracleColumn &column,
         // which decodes it again and says why if it must be refused.
         oracle_scanner::OracleVector decoded;
         try {
-            decoded = oracle_scanner::DecodeOracleVector(*wire);
+            decoded = oracle_scanner::DecodeOracleVector(wire->data(), wire->size());
         } catch (const oracle_scanner::ProtocolError &) {
             through_value();
             return;

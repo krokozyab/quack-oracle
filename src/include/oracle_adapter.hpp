@@ -104,12 +104,28 @@ bool OracleColumnRoundsOnRead(const OracleColumn &column);
 //! first described, so the type a column gets is settled once.
 void ApplyUnconstrainedNumberSetting(ClientContext &context, std::vector<OracleColumn> &columns);
 //! Converts one wire value using the column's Oracle type; absent means NULL.
-Value ValueFor(const OracleColumn &column, const std::optional<std::vector<uint8_t>> &wire);
+Value ValueFor(const OracleColumn &column, const std::optional<oracle_scanner::OracleByteView> &wire);
+inline Value ValueFor(const OracleColumn &column, const std::optional<std::vector<uint8_t>> &wire) {
+    return ValueFor(column, wire ? std::optional<oracle_scanner::OracleByteView>(oracle_scanner::OracleByteView(*wire))
+                                 : std::nullopt);
+}
+inline Value ValueFor(const OracleColumn &column, std::nullopt_t) {
+    return ValueFor(column, std::optional<oracle_scanner::OracleByteView>());
+}
 //! Stores one wire value in row `row` of a vector of the column's type: the
 //! same result as `vector.SetValue(row, ValueFor(column, wire))`, without
 //! building the Value in between.
 void WriteOracleValue(Vector &vector, idx_t row, const OracleColumn &column,
-                      const std::optional<std::vector<uint8_t>> &wire);
+                      const std::optional<oracle_scanner::OracleByteView> &wire);
+inline void WriteOracleValue(Vector &vector, idx_t row, const OracleColumn &column,
+                             const std::optional<std::vector<uint8_t>> &wire) {
+    WriteOracleValue(vector, row, column,
+                     wire ? std::optional<oracle_scanner::OracleByteView>(oracle_scanner::OracleByteView(*wire))
+                          : std::nullopt);
+}
+inline void WriteOracleValue(Vector &vector, idx_t row, const OracleColumn &column, std::nullopt_t) {
+    WriteOracleValue(vector, row, column, std::optional<oracle_scanner::OracleByteView>());
+}
 void WriteOracleValueView(Vector &vector, idx_t row, const OracleColumn &column,
                           const std::optional<oracle_scanner::OracleByteView> &wire);
 //! A unique DuckDB output name for a described column.

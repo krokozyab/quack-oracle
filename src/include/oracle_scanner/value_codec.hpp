@@ -23,9 +23,15 @@ struct OracleDateTime {
 std::vector<uint8_t> EncodeOracleDate(const OracleDateTime &value);
 OracleDateTime DecodeOracleDate(const std::vector<uint8_t> &wire);
 OracleDateTime DecodeOracleDateView(OracleByteView wire);
+inline OracleDateTime DecodeOracleDate(OracleByteView wire) {
+    return DecodeOracleDateView(wire);
+}
 std::vector<uint8_t> EncodeOracleTimestamp(const OracleDateTime &value, bool with_time_zone);
 OracleDateTime DecodeOracleTimestamp(const std::vector<uint8_t> &wire);
 OracleDateTime DecodeOracleTimestampView(OracleByteView wire);
+inline OracleDateTime DecodeOracleTimestamp(OracleByteView wire) {
+    return DecodeOracleTimestampView(wire);
+}
 
 // A TIMESTAMP WITH TIME ZONE carries its date and time as UTC with the offset
 // beside them (captured from 19c: 05:06:07 at +04:00 arrives as 01:06:07), so
@@ -48,8 +54,14 @@ std::vector<uint8_t> EncodeOracleBinaryFloat(float value);
 std::vector<uint8_t> EncodeOracleBinaryDouble(double value);
 float DecodeOracleBinaryFloat(const std::vector<uint8_t> &wire);
 float DecodeOracleBinaryFloatView(OracleByteView wire);
+inline float DecodeOracleBinaryFloat(OracleByteView wire) {
+    return DecodeOracleBinaryFloatView(wire);
+}
 double DecodeOracleBinaryDouble(const std::vector<uint8_t> &wire);
 double DecodeOracleBinaryDoubleView(OracleByteView wire);
+inline double DecodeOracleBinaryDouble(OracleByteView wire) {
+    return DecodeOracleBinaryDoubleView(wire);
+}
 
 // Converts through decimal text so Oracle NUMBER values never pass through a
 // binary floating-point representation. The encoder accepts ordinary or
@@ -57,6 +69,9 @@ double DecodeOracleBinaryDoubleView(OracleByteView wire);
 std::vector<uint8_t> EncodeOracleNumber(const std::string &decimal);
 std::string DecodeOracleNumber(const std::vector<uint8_t> &wire);
 std::string DecodeOracleNumberView(OracleByteView wire);
+inline std::string DecodeOracleNumber(OracleByteView wire) {
+    return DecodeOracleNumberView(wire);
+}
 
 // The same value as an integer, without the text: present only when the wire
 // form is well formed, holds a whole number and fits int64_t. A caller falls
@@ -64,6 +79,9 @@ std::string DecodeOracleNumberView(OracleByteView wire);
 // malformed value is reported.
 std::optional<int64_t> TryDecodeOracleInteger(const std::vector<uint8_t> &wire);
 std::optional<int64_t> TryDecodeOracleIntegerView(OracleByteView wire);
+inline std::optional<int64_t> TryDecodeOracleInteger(OracleByteView wire) {
+    return TryDecodeOracleIntegerView(wire);
+}
 
 struct OracleScaledInteger {
     uint64_t upper = 0;
@@ -89,9 +107,11 @@ struct OracleIntervalDaySecond {
 };
 std::vector<uint8_t> EncodeOracleIntervalYearMonth(int32_t years, int32_t months);
 OracleIntervalYearMonth DecodeOracleIntervalYearMonth(const std::vector<uint8_t> &wire);
+OracleIntervalYearMonth DecodeOracleIntervalYearMonth(OracleByteView wire);
 std::vector<uint8_t> EncodeOracleIntervalDaySecond(int32_t days, int32_t hours, int32_t minutes, int32_t seconds,
                                                    int32_t nanoseconds);
 OracleIntervalDaySecond DecodeOracleIntervalDaySecond(const std::vector<uint8_t> &wire);
+OracleIntervalDaySecond DecodeOracleIntervalDaySecond(OracleByteView wire);
 
 // A ROWID as the 18 characters Oracle itself prints (ROWIDTOCHAR): data object,
 // file, block and row in the base-64 alphabet A-Za-z0-9+/. The input is the twelve
@@ -101,5 +121,6 @@ OracleIntervalDaySecond DecodeOracleIntervalDaySecond(const std::vector<uint8_t>
 // A logical UROWID, which an index-organized table has, is not decoded and
 // yields no value.
 std::optional<std::string> TryDecodeOracleRowid(const std::vector<uint8_t> &wire);
+std::optional<std::string> TryDecodeOracleRowid(OracleByteView wire);
 
 } // namespace oracle_scanner

@@ -84,7 +84,7 @@ struct OracleColumn {
 
 struct OracleBatch {
     std::vector<OracleColumn> columns;
-    std::vector<std::vector<std::optional<std::vector<uint8_t>>>> rows;
+    std::vector<OracleRowData> rows;
     bool exhausted = false;
     std::optional<OraclePackedBatch> packed;
     size_t RowCount() const {

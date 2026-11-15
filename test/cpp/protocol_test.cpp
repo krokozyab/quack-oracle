@@ -1211,6 +1211,13 @@ static void TestFetchResponseDecoderResumes() {
                     resumed.rows.push_back(resumed.packed->MaterializeRow(row));
                 }
             }
+            if (!packed) {
+                CHECK(resumed.rows.front().Arena()->Size() == expected.rows.front().Arena()->Size());
+                for (const auto &row : resumed.rows) {
+                    CHECK(row.Arena() == resumed.rows.front().Arena());
+                }
+                CHECK(resumed.last_row->Arena() != resumed.rows.front().Arena());
+            }
             CHECK(resumed.rows == expected.rows && resumed.last_row == expected.last_row &&
                    resumed.bytes_consumed == expected.bytes_consumed && resumed.completed &&
                    resumed.exhausted == expected.exhausted &&
@@ -1439,13 +1446,96 @@ public:
         TtcRowData owned(values.size());
         for (size_t i = 0; i < values.size(); i++) {
             if (values[i]) {
-                owned[i].emplace(values[i]->begin(), values[i]->end());
+                owned.Set(i, values[i]);
             }
         }
         rows.push_back(std::move(owned));
     }
     std::vector<TtcRowData> rows;
 };
+
+static void TestArenaRowsOwnSlicesAndReuseRepeatedBytes() {
+    OracleRowData row(3);
+    row.Set(0, std::vector<uint8_t>());
+    row.Set(1, std::vector<uint8_t>(800, 'x'));
+    CHECK(row[0] && row[0]->empty() && !row[2]);
+    auto copy = row;
+    copy.Set(1, std::vector<uint8_t>(10000, 'y'));
+    CHECK(row[1] == std::vector<uint8_t>(800, 'x'));
+    CHECK(copy[1] == std::vector<uint8_t>(10000, 'y'));
+    // Appending an existing view can reallocate its own backing storage.
+    row.Set(2, row[1]);
+    CHECK(row[2] == row[1] && row[1] == std::vector<uint8_t>(800, 'x'));
+    auto detached = row.Clone();
+    CHECK(detached == row && detached.Arena() != row.Arena());
+    row = OracleRowData();
+    CHECK(detached[1] == std::vector<uint8_t>(800, 'x'));
+    ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [] { OracleRowData too_wide(4097); });
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)detached[3]; });
+    ExpectError(ProtocolErrorKind::INVALID_STATE, [&] { detached.Arena()->Get(detached.Arena()->Size() + 1, 0); });
+    uint8_t byte = 1;
+    ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED,
+                [&] { detached.Arena()->Append(OracleByteView(&byte, (std::numeric_limits<size_t>::max)())); });
+
+    // A failed parser attempt must not leave bytes in a caller-owned arena.
+    const auto partial_arena = std::make_shared<OracleRowArena>();
+    OracleRowData anchor(1, partial_arena);
+    anchor.Set(0, std::vector<uint8_t> {'a'});
+    ByteWriter partial;
+    partial.WriteByte(TTC_MESSAGE_ROW_DATA).WriteLengthPrefixed(std::vector<uint8_t> {'b'}).WriteByte(4).WriteByte('c');
+    ExpectError(ProtocolErrorKind::TRUNCATED, [&] {
+        DecodeTtcRowDataPrefix(partial.Data().data(), partial.Data().size(),
+                               {TtcColumnFraming::SCALAR, TtcColumnFraming::SCALAR}, 1024, partial_arena);
+    });
+    CHECK(partial_arena->Size() == 1 && anchor[0] == std::vector<uint8_t> {'a'});
+
+    const std::vector<OracleColumn> columns {{"N", 2}, {"V", 1}, {"Z", 1}};
+    ByteWriter response;
+    const auto number = EncodeOracleNumber("123");
+    response.WriteByte(TTC_MESSAGE_ROW_DATA)
+        .WriteLengthPrefixed(number)
+        .WriteLengthPrefixed(std::vector<uint8_t>(800, 'x'))
+        .WriteLengthPrefixed(std::nullopt);
+    for (size_t i = 0; i < 100; i++) {
+        response.WriteByte(21)
+            .WriteUInt16LE(1)
+            .WriteByte(1)
+            .WriteByte(TTC_MESSAGE_ROW_DATA)
+            .WriteLengthPrefixed(number);
+    }
+    response.WriteByte(TTC_MESSAGE_ROW_DATA)
+        .WriteLengthPrefixed(number)
+        .WriteLengthPrefixed(std::vector<uint8_t> {'z'})
+        .WriteLengthPrefixed(std::nullopt)
+        .WriteByte(29);
+    for (size_t fragment : {size_t(1), size_t(7), response.Data().size()}) {
+        TtcFetchResponseDecoder decoder(columns, 6, std::nullopt, false, 102);
+        for (size_t end = fragment;; end += fragment) {
+            const auto count = (std::min)(end, response.Data().size());
+            try {
+                decoder.Decode(std::vector<uint8_t>(response.Data().begin(), response.Data().begin() + count));
+            } catch (const ProtocolError &error) {
+                CHECK(error.Kind() == ProtocolErrorKind::TRUNCATED);
+            }
+            if (count == response.Data().size()) {
+                break;
+            }
+        }
+        const auto result = decoder.Take();
+        CHECK(result.rows.size() == 102 && result.last_row);
+        const auto arena = result.rows.front().Arena();
+        CHECK(arena->Size() == number.size() * 102 + 801);
+        for (size_t i = 0; i < 101; i++) {
+            CHECK(result.rows[i].Arena() == arena);
+            CHECK(result.rows[i][1] == std::vector<uint8_t>(800, 'x') && !result.rows[i][2]);
+            CHECK(result.rows[i][1]->data() == result.rows[0][1]->data());
+        }
+        CHECK(result.last_row->Arena() != arena);
+        CHECK(result.last_row->Arena()->Size() == number.size() + 1);
+        CHECK((*result.last_row)[1] == std::vector<uint8_t> {'z'});
+    }
+    std::cout << "arena rows retain NULL/empty values, share repeats and compact fetch snapshots" << std::endl;
+}
 
 static void TestDirectScalarRowsMatchLegacyAcrossFragments() {
     const std::vector<OracleColumn> columns {{"N", 2}, {"V", 1}, {"Z", 1}};
@@ -6841,6 +6931,11 @@ static void TestLobPrefetchDecoderResumes() {
         }
         CHECK(complete);
         const auto resumed = decoder.Take();
+        CHECK(resumed.rows.front().Arena()->Size() == expected.rows.front().Arena()->Size());
+        for (const auto &row : resumed.rows) {
+            CHECK(row.Arena() == resumed.rows.front().Arena());
+        }
+        CHECK(resumed.last_row->Arena() != resumed.rows.front().Arena());
         CHECK(resumed.rows == expected.rows && resumed.last_row == expected.last_row &&
                resumed.bytes_consumed == expected.bytes_consumed &&
                resumed.used_row_header_selection == expected.used_row_header_selection &&
@@ -9137,6 +9232,7 @@ int main() {
     TestTtcErrorNamesTheFailingIteration();
     TestTtcErrorCarriesADmlRowId();
     TestTtcRowDataCodec();
+    TestArenaRowsOwnSlicesAndReuseRepeatedBytes();
     TestDirectScalarRowsMatchLegacyAcrossFragments();
     TestFetchRejectsRowsBeyondRequest();
     TestPackedFetchFallsBackWhenDescriptorsExceedBudget();
