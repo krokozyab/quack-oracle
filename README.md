@@ -1317,10 +1317,12 @@ Oracle 19c and Oracle Free 23ai with the demo schema above. The exceptions are
 
 ## 7. Read a big table faster
 
-Without choosing a key column or calling anything, an attached table is read through
-several sessions when Oracle's statistics say it has 500,000 rows or more (`oracle_parallel_scan`
-is `-1`, automatic: as many sessions as DuckDB has threads, up to eight). To choose the number
-yourself, or to turn it off with `0`:
+Without choosing a key column or calling anything, an attached table can be read through
+several sessions when Oracle's statistics say it has 500,000 rows or more. The default
+`oracle_parallel_scan = -1` estimates the selected columns and filtered row count, targeting
+roughly 64 MiB per reader, up to eight and DuckDB's thread count. A narrow projection can
+therefore stay sequential even for a large table. To set a maximum yourself, or use one
+session with `0`:
 
 ```sql
 SET oracle_parallel_scan = 8;
@@ -1342,8 +1344,8 @@ session reads them in (that follows the order the extents were allocated); witho
 Oracle promises neither.
 
 It reads one stream instead, and says nothing, when: the setting is 0 or 1; the setting is left
-automatic and the filters Oracle is sent are estimated from its statistics to leave fewer than
-100,000 rows (`NUM_DISTINCT` for `=` and `IN`, `LOW_VALUE`/`HIGH_VALUE` for a range on a number, date
+automatic or a positive maximum, and the filters Oracle is sent are estimated from its
+statistics to leave fewer than 100,000 rows (`NUM_DISTINCT` for `=` and `IN`, `LOW_VALUE`/`HIGH_VALUE` for a range on a number, date
 or timestamp; one customer's 50 orders of a million then take 0.02 s instead of 0.18 s, an estimate
 thrown off by skewed data only picks the slower of the two ways to read, never another result);
 the user cannot
@@ -1437,7 +1439,7 @@ response exceeding that count is rejected.
 | `oracle_deferred_columns` | `true` | Read LOB, JSON, VECTOR and XML columns only for the rows that pass a filter DuckDB applies itself. See [Heavy columns after the filter](#heavy-columns-after-the-filter). |
 | `oracle_direct_scan` | `true` | Decode eligible attached scalar scans directly into typed vectors. NUMBER, DATE/TIMESTAMP, binary floats, BOOLEAN and short VARCHAR2/CHAR/RAW are supported; other columns retain the existing path. Set `false` for comparisons or troubleshooting. |
 | `oracle_fetch_rows` | `16384` | Maximum scalar attached-scan fetch rows, 1..65536. Output vectors remain 2048 rows. Declared row widths reduce the request toward an 8 MiB estimate; deferred, locked and short-limit scans retain the smaller path. |
-| `oracle_parallel_scan` | `-1` | Maximum sessions one scan of an attached table may read through at once: `-1` chooses (DuckDB's thread count, up to 8, for a table of 500,000 rows or more), `0` or `1` is one session. Small tables and selective filters stay sequential even with a positive maximum. See [section 7](#7-read-a-big-table-faster). |
+| `oracle_parallel_scan` | `-1` | Maximum sessions one scan of an attached table may read through at once: `-1` chooses (up to 8 and DuckDB's thread count, for a table of 500,000 rows or more; the projected data estimate targets roughly 64 MiB per reader), `0` or `1` is one session. Small tables and selective filters stay sequential even with a positive maximum. See [section 7](#7-read-a-big-table-faster). |
 | `oracle_consistent_read` | `false` | Read every attached table of a statement `AS OF` one SCN. See [One moment for a whole statement](#one-moment-for-a-whole-statement). |
 
 Pooling matters more than it looks. Opening a session costs a TCP connect, a TLS

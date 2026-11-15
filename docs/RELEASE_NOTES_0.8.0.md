@@ -39,3 +39,6 @@
   values are consumed synchronously; the last-row snapshot survives fetches.
   Value-conversion failures poison the active read handle and retain their
   original exception, without being mistaken for incomplete network framing.
+- Auto parallelism estimates the selected columns and filtered row count,
+  targeting approximately 64 MiB per reader, up to eight readers. Small narrow
+  copies therefore avoid paying for unnecessary range planning and sessions.

@@ -3068,7 +3068,40 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
             // AUTOMATIC_PARALLEL_FILTERED_ROWS). The planner still
             // reads one stream when the extents, the change number or a flashback
             // read are not to be had.
-            sessions = MinValue<idx_t>(8, static_cast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads()));
+            uint64_t row_bytes = 0;
+            for (const auto column : selected) {
+                if (column >= bind.columns.size()) {
+                    row_bytes += 16;
+                    continue;
+                }
+                const auto &declared = bind.columns[column];
+                const auto type = MappedType(declared);
+                switch (type.id()) {
+                case LogicalTypeId::BIGINT:
+                case LogicalTypeId::DECIMAL:
+                case LogicalTypeId::FLOAT:
+                case LogicalTypeId::DOUBLE:
+                case LogicalTypeId::BOOLEAN:
+                case LogicalTypeId::TIMESTAMP:
+                case LogicalTypeId::TIMESTAMP_NS:
+                    row_bytes += GetTypeIdSize(type.InternalType());
+                    break;
+                default:
+                    row_bytes += MinValue<uint64_t>(256, MaxValue<uint64_t>(16, declared.byte_width));
+                    break;
+                }
+            }
+            // Range planning/authentication must be amortized by the projected
+            // data, not the width of columns the query never reads. Saturate
+            // before multiplication when dictionary row counts are enormous.
+            constexpr uint64_t bytes_per_reader = 64U << 20U;
+            const auto rows = EstimatedRowsAfterFilters(bind, filter_estimates);
+            const auto width = MaxValue<uint64_t>(row_bytes, 1);
+            const auto readers = rows > (bytes_per_reader * 8) / width
+                                     ? 8
+                                     : MaxValue<uint64_t>(1, (rows * width + bytes_per_reader - 1) / bytes_per_reader);
+            sessions =
+                MinValue<idx_t>(readers, static_cast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads()));
         }
     }
     auto chunks = PlanParallelAttachedScan(context, bind, selected, sessions);

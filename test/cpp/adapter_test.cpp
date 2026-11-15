@@ -3284,9 +3284,9 @@ void TestSelectiveFiltersReadThroughOneSession() {
     TestDatabase database;
     database.Run("SET threads = 4;");
     database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner);");
-    const auto read_in_ranges = [&](const std::string &where) {
+    const auto read_in_ranges = [&](const std::string &where, const std::string &projection = "ID, KIND") {
         script->queries.clear();
-        auto result = database.Query("SELECT ID, KIND FROM o.main.FACTS WHERE " + where + ";");
+        auto result = database.Query("SELECT " + projection + " FROM o.main.FACTS WHERE " + where + ";");
         CHECK(!result->HasError());
         for (const auto &query : script->queries) {
             if (query.find("WHERE ROWID") != std::string::npos) {
@@ -3300,8 +3300,9 @@ void TestSelectiveFiltersReadThroughOneSession() {
     CHECK(!read_in_ranges("ID BETWEEN 1000 AND 50000"));    // about 1%
     CHECK(!read_in_ranges("KIND = 1 AND ID < 20000"));      // the most selective column decides
     CHECK(read_in_ranges("ID > 1000"));                     // nearly all of them
-    CHECK(read_in_ranges("KIND = 1"));                      // half
-    // A number of sessions set by hand is used as set.
+    CHECK(!read_in_ranges("KIND = 1"));                     // half: too little projected data
+    CHECK(!read_in_ranges("ID > 1000", "ID"));              // same rows, narrow projection stays serial
+    // A positive maximum still avoids selective reads.
     database.Run("SET oracle_parallel_scan = 4;");
     CHECK(!read_in_ranges("ID = 7"));
     std::cout << "a selective filter reads through one session" << std::endl;
