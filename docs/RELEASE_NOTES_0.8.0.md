@@ -56,3 +56,8 @@
 
 - Add `ORACLE_SCANNER_STATIC_LINK=OFF` for measuring loadable builds and a guard
   that rejects an already loaded built-in copy before explicit loading.
+
+- Prefetch up to 32 rows for known narrow bounded scalar reads and aggregates,
+  using an 8 KiB estimated initial payload budget. Small results can finish in
+  one exchange; wide/unknown values, LOB and write-locked scans retain their
+  ordinary initial query fetch. Exact AVG still finishes in DuckDB.

@@ -14,6 +14,8 @@ public:
     explicit ValidatedOracleSession(std::unique_ptr<OracleSession> inner);
 
     std::unique_ptr<OracleCursor> Query(const std::string &sql, const std::vector<OracleBind> &binds) override;
+    std::unique_ptr<OracleCursor> QueryWithInitialFetch(const std::string &sql,
+                                                     const std::vector<OracleBind> &binds, size_t rows) override;
     uint64_t Execute(const std::string &sql, const std::vector<OracleBind> &binds) override;
     void ExecuteAdmin(const std::string &sql) override;
     uint64_t ExecuteWithRowCount(const std::string &sql, const std::vector<OracleBind> &binds) override;

@@ -519,10 +519,16 @@ void NativeOracleSession::RequireOpen() const {
 }
 
 std::unique_ptr<OracleCursor> NativeOracleSession::Query(const std::string &sql, const std::vector<OracleBind> &binds) {
+    return QueryWithInitialFetch(sql, binds, binds.empty() ? 2 : 1);
+}
+
+std::unique_ptr<OracleCursor> NativeOracleSession::QueryWithInitialFetch(const std::string &sql,
+                                                                     const std::vector<OracleBind> &binds, size_t rows) {
+    RequireInitialFetchRows(rows);
     // Like every other operation: an ORA-01013 answering an accepted Cancel is
     // observed here, which is what makes the session usable again afterwards.
     return RunNativeOperation(*lifetime, [&]() -> std::unique_ptr<OracleCursor> {
-        auto cursor = OpenQuery(sql, binds);
+        auto cursor = OpenQuery(sql, binds, rows);
         AnnotateDatabaseZone(*cursor);
         return cursor;
     });
@@ -554,7 +560,7 @@ void NativeOracleSession::AnnotateDatabaseZone(OracleCursor &opened) {
     cursor.SetDatabaseZone(database_zone->first, database_zone->second);
 }
 
-std::unique_ptr<OracleCursor> NativeOracleSession::OpenQuery(const std::string &sql, const std::vector<OracleBind> &binds) {
+std::unique_ptr<OracleCursor> NativeOracleSession::OpenQuery(const std::string &sql, const std::vector<OracleBind> &binds, size_t initial_rows) {
     RequireOpen();
     const auto call = channel->LockCall();
     const auto ordered_binds = OrderOracleStatementBinds(sql, binds, OracleBindUse::QUERY);
@@ -564,6 +570,7 @@ std::unique_ptr<OracleCursor> NativeOracleSession::OpenQuery(const std::string &
         request.sequence = NextSequence();
         request.sql = sql;
         request.is_query = true;
+        request.prefetch_rows = static_cast<uint32_t>(initial_rows);
         channel->ExecuteNoBinds(handle, request);
     } else {
         TtcExecuteBindsRequest request;
@@ -571,6 +578,7 @@ std::unique_ptr<OracleCursor> NativeOracleSession::OpenQuery(const std::string &
         request.sql = sql;
         request.binds = ordered_binds;
         request.is_query = true;
+        request.prefetch_rows = static_cast<uint32_t>(initial_rows);
         channel->ExecuteBinds(handle, request);
     }
     const auto response = channel->ReceiveDecodedExecuteResponse(handle, connection->TtcFieldVersion(),

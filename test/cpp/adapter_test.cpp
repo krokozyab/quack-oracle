@@ -135,6 +135,7 @@ struct FakeScript {
     bool packed_fetch = false;
     size_t packed_fetches = 0;
     bool direct_fetch = false;
+    std::vector<size_t> initial_fetch_rows;
     size_t direct_fetches = 0;
     // A parallel scan drives several sessions at once, all of them recording
     // into this one script. Unsynchronised, the recording loses entries and the
@@ -437,6 +438,16 @@ public:
                                                "injected dictionary read failure");
         }
         return std::make_unique<FakeCursor>(script, sql);
+    }
+
+    std::unique_ptr<OracleCursor> QueryWithInitialFetch(const std::string &sql,
+                                                     const std::vector<OracleBind> &binds, size_t rows) override {
+        RequireInitialFetchRows(rows);
+        {
+            std::lock_guard<std::mutex> guard(script->record_lock);
+            script->initial_fetch_rows.push_back(rows);
+        }
+        return Query(sql, binds);
     }
 
     uint64_t Execute(const std::string &sql, const std::vector<OracleBind> &) override {
@@ -2189,10 +2200,29 @@ void TestAttachedCatalogAgainstAFakeSession() {
 
     // The dictionary decides the DuckDB types: an integral NUMBER(10) widens to
     // BIGINT, a VARCHAR2 stays text.
-    auto scanned = database.Query("SELECT ID, LABEL FROM ora.main.ITEMS ORDER BY ID;");
+    auto scanned = database.Query("SELECT ID, LABEL FROM ora.main.ITEMS ORDER BY ID LIMIT 5;");
     CHECK(!scanned->HasError() && scanned->RowCount() == 2);
     CHECK(scanned->GetTypes()[0] == duckdb::LogicalType::BIGINT && scanned->GetTypes()[1] == duckdb::LogicalType::VARCHAR);
     CHECK(scanned->GetValue(0, 0).ToString() == "1" && scanned->GetValue(1, 1).ToString() == "second");
+    CHECK(!script->initial_fetch_rows.empty() && script->initial_fetch_rows.back() == 32);
+
+
+    auto wide = std::find_if(script->routes.begin(), script->routes.end(), [](const auto &route) {
+        return route.first == "FROM user_tab_columns";
+    });
+    CHECK(wide != script->routes.end());
+    wide->second.rows[1][3] = Number("253");
+    database.Run("ATTACH 'ora' AS budget (TYPE oracle_scanner);");
+    CHECK(!database.Query("SELECT ID,LABEL FROM budget.main.ITEMS LIMIT 5;")->HasError());
+    CHECK(script->initial_fetch_rows.back() == 7);
+    database.Run("DETACH budget;");
+    wide->second.rows[1][3] = Number("254");
+    database.Run("ATTACH 'ora' AS wide (TYPE oracle_scanner);");
+    const auto hints_before_wide = script->initial_fetch_rows.size();
+    CHECK(!database.Query("SELECT LABEL FROM wide.main.ITEMS LIMIT 5;")->HasError());
+    CHECK(script->initial_fetch_rows.size() == hints_before_wide);
+    database.Run("DETACH wide;");
+    wide->second.rows[1][3] = Number("20");
 
     // NOT NULL and the primary key both come from the dictionary.
     auto constraints = database.Query(
@@ -3155,6 +3185,7 @@ void TestJoinKeysReachOracle() {
     // own TOP_N stays above it. The setting turns it off.
     auto top = database.Query("SELECT ID FROM o.main.FACTS ORDER BY ID DESC NULLS FIRST LIMIT 5 OFFSET 2;");
     CHECK(!top->HasError());
+    CHECK(!script->initial_fetch_rows.empty() && script->initial_fetch_rows.back() == 32);
     CHECK(script->queries.back().find("ORDER BY \"ID\" DESC NULLS FIRST FETCH FIRST 7 ROWS ONLY") != std::string::npos);
     database.Run("SET oracle_top_n_pushdown = false;");
     CHECK(!database.Query("SELECT ID FROM o.main.FACTS ORDER BY ID DESC LIMIT 5;")->HasError());

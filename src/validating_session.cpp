@@ -26,6 +26,14 @@ std::unique_ptr<OracleCursor> ValidatedOracleSession::Query(const std::string &s
     return Inner().Query(sql, binds);
 }
 
+std::unique_ptr<OracleCursor> ValidatedOracleSession::QueryWithInitialFetch(const std::string &sql,
+                                                                        const std::vector<OracleBind> &binds,
+                                                                        size_t rows) {
+    RequireInitialFetchRows(rows);
+    ValidateOracleQuery(sql, binds);
+    return Inner().QueryWithInitialFetch(sql, binds, rows);
+}
+
 uint64_t ValidatedOracleSession::Execute(const std::string &sql, const std::vector<OracleBind> &binds) {
     ValidateOracleDml(sql, binds);
     return Inner().Execute(sql, binds);

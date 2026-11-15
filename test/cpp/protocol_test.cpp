@@ -2951,6 +2951,36 @@ static void TestValidatedSession() {
     ExpectError(ProtocolErrorKind::INVALID_STATE, [&] { session.Commit(); });
 }
 
+static void TestInitialFetchHintIsValidatedAndForwarded() {
+    class InitialSession final : public TestSession {
+    public:
+        size_t requested_rows = 0;
+        std::unique_ptr<OracleCursor> QueryWithInitialFetch(const std::string &sql,
+                                                         const std::vector<OracleBind> &binds, size_t rows) override {
+            RequireInitialFetchRows(rows);
+            requested_rows = rows;
+            return Query(sql, binds);
+        }
+    };
+    auto raw = std::make_unique<InitialSession>();
+    auto *inner = raw.get();
+    ValidatedOracleSession session(std::move(raw));
+    session.QueryWithInitialFetch("select 1 from dual", {}, 32);
+    CHECK(inner->queries == 1 && inner->requested_rows == 32);
+    for (const auto rows : {size_t(0), size_t(33)}) {
+        ExpectError(ProtocolErrorKind::LIMIT_EXCEEDED, [&] {
+            session.QueryWithInitialFetch("select 1 from dual", {}, rows);
+        });
+    }
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] {
+        session.QueryWithInitialFetch("delete from t", {}, 32);
+    });
+    CHECK(inner->queries == 1);
+    TestSession fallback;
+    fallback.QueryWithInitialFetch("select 1 from dual", {}, 32);
+    CHECK(fallback.queries == 1);
+}
+
 static void TestStatementRegistry() {
     OracleStatementRegistry registry(2);
     const auto query = registry.Open(OracleSqlKind::QUERY);
@@ -9254,6 +9284,7 @@ int main() {
     TestSqlStatementValidation();
     TestTransactions();
     TestValidatedSession();
+    TestInitialFetchHintIsValidatedAndForwarded();
     TestStatementRegistry();
     TestTtcStatementChannel();
     TestTtcCursorClosePiggyback();

@@ -921,6 +921,45 @@ std::string FormatCallScalar(uint16_t oracle_type, const std::vector<uint8_t> &w
     }
 }
 
+std::unique_ptr<OracleCursor> OpenOracleScalarRead(OracleSession &session, const std::string &sql,
+                                                 const std::vector<OracleColumn> &columns) {
+    constexpr size_t payload_budget = 8192;
+    size_t row_bytes = 0;
+    for (const auto &column : columns) {
+        size_t width;
+        if (column.xml) {
+            return session.Query(sql, {});
+        }
+        switch (column.oracle_type) {
+        case 2:
+        case 12:
+        case 180:
+        case 100:
+        case 101:
+        case 252:
+            width = 22;
+            break;
+        case 1:
+        case 23:
+        case 96:
+            if (!column.byte_width || column.byte_width > 253) {
+                return session.Query(sql, {});
+            }
+            // Allow for character-set expansion on the wire.
+            width = 4 * column.byte_width;
+            break;
+        default:
+            return session.Query(sql, {});
+        }
+        if (width > payload_budget - row_bytes) {
+            return session.Query(sql, {});
+        }
+        row_bytes += width;
+    }
+    const auto rows = row_bytes ? MinValue<size_t>(32, payload_budget / row_bytes) : 2;
+    return rows > 2 ? session.QueryWithInitialFetch(sql, {}, rows) : session.Query(sql, {});
+}
+
 std::string OutputName(const OracleColumn &column, idx_t index, std::unordered_set<std::string> &used) {
     auto result = column.name.empty() ? "column_" + std::to_string(index + 1) : column.name;
     if (used.insert(result).second) {

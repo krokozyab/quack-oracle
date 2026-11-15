@@ -25,6 +25,8 @@ public:
     ~NativeOracleSession() override;
 
     std::unique_ptr<OracleCursor> Query(const std::string &sql, const std::vector<OracleBind> &binds) override;
+    std::unique_ptr<OracleCursor> QueryWithInitialFetch(const std::string &sql,
+                                                     const std::vector<OracleBind> &binds, size_t rows) override;
     uint64_t Execute(const std::string &sql, const std::vector<OracleBind> &binds) override;
     void ExecuteAdmin(const std::string &sql) override;
     // Executes one validated DML statement through a bounded anonymous PL/SQL
@@ -45,7 +47,7 @@ private:
     explicit NativeOracleSession(std::unique_ptr<TnsClientConnection> connection);
     uint8_t NextSequence();
     void RequireOpen() const;
-    std::unique_ptr<OracleCursor> OpenQuery(const std::string &sql, const std::vector<OracleBind> &binds);
+    std::unique_ptr<OracleCursor> OpenQuery(const std::string &sql, const std::vector<OracleBind> &binds, size_t initial_rows = 2);
     void AnnotateDatabaseZone(OracleCursor &cursor);
     uint64_t ExecuteStatement(const std::string &sql, const std::vector<OracleBind> &binds, OracleSqlKind kind);
     //! Runs `operation` with the binds of one statement, sending any LOB value

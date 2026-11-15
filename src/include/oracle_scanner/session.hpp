@@ -207,6 +207,18 @@ public:
         return {};
     }
     virtual std::unique_ptr<OracleCursor> Query(const std::string &sql, const std::vector<OracleBind> &binds) = 0;
+    // A hint for the initial result batch, for callers that know its row width.
+    // Implementations may retain their ordinary query path.
+    virtual std::unique_ptr<OracleCursor> QueryWithInitialFetch(const std::string &sql,
+                                                             const std::vector<OracleBind> &binds, size_t rows) {
+        RequireInitialFetchRows(rows);
+        return Query(sql, binds);
+    }
+    static void RequireInitialFetchRows(size_t rows) {
+        if (rows == 0 || rows > 32) {
+            throw ProtocolError(ProtocolErrorKind::LIMIT_EXCEEDED, "initial query fetch must request 1..32 rows");
+        }
+    }
     virtual uint64_t Execute(const std::string &sql, const std::vector<OracleBind> &binds) = 0;
     // One administrative DDL command on a dedicated autocommit session. This
     // must never be used on the metadata runtime transaction.

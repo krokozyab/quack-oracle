@@ -86,6 +86,9 @@ auto TranslatingOracleErrors(const char *operation, FUNCTION function) -> declty
 
 //! Refuses any column this client cannot read, then returns its DuckDB type.
 LogicalType TypeFor(const OracleColumn &column);
+std::unique_ptr<OracleCursor> OpenOracleScalarRead(OracleSession &session, const std::string &sql,
+                                                const std::vector<OracleColumn> &columns);
+
 //! The DuckDB type an Oracle column maps to, with no support check.
 LogicalType MappedType(const OracleColumn &column);
 //! How a NUMBER column is held in DuckDB; see MapNumber in oracle_types.cpp.

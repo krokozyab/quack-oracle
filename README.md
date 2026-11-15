@@ -754,6 +754,13 @@ rows would be cut before the filter) leaves the scan reading everything, as befo
 queries over a table with NULLs and ties, with and without pushed filters, returned the same
 rows with and without it on 19c and 23ai.
 
+Bounded scalar attached reads and pushed aggregates may request up to 32 rows in
+an initial result batch, avoiding a separate fetch when the result fits. The
+adapter uses declared column widths and an 8 KiB estimated payload budget;
+this is not a bound on total query or response memory. Unknown or wide values,
+LOBs and scans locked for writes retain the ordinary initial batch. Scalar SQL
+results and exact AVG finalization are unchanged.
+
 #### Samples and `LIMIT`
 
 `SELECT … FROM o.BIG TABLESAMPLE SYSTEM (1%)` and

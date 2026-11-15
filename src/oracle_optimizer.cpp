@@ -335,6 +335,8 @@ bool PlanPushedAggregate(ClientContext &context, LogicalAggregate &aggregate, Lo
             const bool narrow = type.id() == LogicalTypeId::DECIMAL && DecimalType::GetWidth(type) <= 4;
             result.averages.emplace(result.types.size(), std::make_pair(multiplier, narrow));
             OracleColumn text;
+            text.oracle_type = 1;
+            text.byte_width = 64;
             add("TO_CHAR(SUM(" + Quoted(source) + ") * " + std::to_string(uint64_t(multiplier)) + ", 'TM9')", text,
                 LogicalType::VARCHAR, LogicalType::HUGEINT);
             add("CAST(COUNT(" + Quoted(source) + ") AS NUMBER(18,0))", count_column, LogicalType::BIGINT,

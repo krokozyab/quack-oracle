@@ -2743,7 +2743,15 @@ void OpenProjectedScan(ClientContext &context, OracleQueryBindData &bind, const 
     try {
         session = AcquireOracleReadSession(context, bind.secret_name, bind.catalog_name, bind.config, bind.password);
         const auto before = session->IoStats();
-        cursor = session->Query(sql, {});
+        if (!schema_only && !bind.for_update && !bind.order_clause.empty()) {
+            std::vector<OracleColumn> projected;
+            for (const auto column : selected) {
+                projected.push_back(column < bind.columns.size() ? bind.columns[column] : OracleColumn());
+            }
+            cursor = OpenOracleScalarRead(session.Get(), sql, projected);
+        } else {
+            cursor = session->Query(sql, {});
+        }
         if (opening) {
             opening->sql = sql;
             opening->io = session->IoStats() - before;

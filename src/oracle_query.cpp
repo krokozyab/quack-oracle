@@ -2780,7 +2780,7 @@ unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context,
             sql.replace(at, marker.size(), replacement);
             at += replacement.size();
         }
-        cursor = session->Query(sql, {});
+        cursor = OpenOracleScalarRead(session.Get(), sql, bind.columns);
         opened.sql = sql;
         opened.io = session->IoStats() - before;
     } catch (const std::exception &error) {
