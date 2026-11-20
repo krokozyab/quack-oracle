@@ -29,20 +29,12 @@ void RunCheckOobProbe(ByteStream &stream, uint16_t negotiated_sdu) {
     // check. The listener's CONTROL response is only meaningful after this
     // exact marker shape.
     packets.Send({TnsPacketType::MARKER, 0, {0x01, 0x00, 0x02}});
-    const auto reply = packets.Receive();
-    // The two-byte CONTROL body is listener-version dependent (19c emits a
-    // different value than newer Free builds); it is an acknowledgement, not
-    // a negotiated value. Its type and width are the contract; the header
-    // flags are not. 19c and Free answer with flags 0x20, but a node listener
-    // reached through a SCAN redirect answers 0x24 — the 0x04 redirect bit of
-    // the re-CONNECT carried over — and python-oracledb Thin reads CONTROL
-    // packets without looking at their flags at all.
-    if (reply.type != TnsPacketType::CONTROL || reply.payload.size() != 2) {
-        throw ProtocolError(ProtocolErrorKind::MALFORMED,
-                            "Oracle CHECK_OOB probe returned invalid CONTROL reply (type " +
-                                std::to_string(static_cast<uint8_t>(reply.type)) + ", flags " +
-                                std::to_string(reply.flags) + ", payload bytes " + std::to_string(reply.payload.size()) + ")");
-    }
+    // The probe is not waited on. Some servers acknowledge it with a CONTROL
+    // packet (19c and Free with header flags 0x20, a node listener reached
+    // through a SCAN redirect with 0x24); others, 19c among them, send nothing
+    // and wait for TTIPRO, so a read here would never return. Like
+    // python-oracledb Thin, the client goes on to TTC at once, and
+    // TtcChannel::Receive skips the acknowledgement when one arrives.
 }
 
 
@@ -656,9 +648,9 @@ private:
 TnsClientConnection::TnsClientConnection(std::unique_ptr<ByteStream> stream_p, uint16_t negotiated_sdu_p,
                                          std::string connect_descriptor_p, std::string auth_connect_string_p,
                                          OracleClientIdentity client_identity_p, bool cancellation_supported,
-                                         bool end_of_response_negotiated_p)
+                                         bool end_of_response_negotiated_p, bool oob_probed)
     : stream(std::move(stream_p)), packets(std::make_unique<TnsPacketStream>(*stream, true, negotiated_sdu_p)),
-      ttc(std::make_unique<TtcChannel>(*packets, negotiated_sdu_p, 16U << 20U, cancellation_supported)),
+      ttc(std::make_unique<TtcChannel>(*packets, negotiated_sdu_p, 16U << 20U, cancellation_supported, oob_probed)),
       negotiated_sdu(negotiated_sdu_p), end_of_response_negotiated(end_of_response_negotiated_p),
       connect_descriptor(std::move(connect_descriptor_p)), auth_connect_string(std::move(auth_connect_string_p)),
       client_identity(std::move(client_identity_p)) {
@@ -693,7 +685,8 @@ std::unique_ptr<TnsClientConnection> TnsClientConnection::Connect(const Connecti
     auto connection = std::unique_ptr<TnsClientConnection>(new TnsClientConnection(
         std::move(accepted.stream), accepted.result.negotiated_sdu, accepted.descriptor,
         BuildAuthConnectString(effective_config, accepted.original),
-        CurrentOracleClientIdentity(effective_config.client_program), !uses_tls, accepted.result.end_of_response));
+        CurrentOracleClientIdentity(effective_config.client_program), !uses_tls, accepted.result.end_of_response,
+        accepted.result.check_oob));
     // The connect budget and cancellation keep holding through TTC negotiation
     // and O5LOGON, and are lifted when authentication completes.
     connection->end_establishment = [establishment] { establishment->Disarm(); };

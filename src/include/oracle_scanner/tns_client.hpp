@@ -64,7 +64,7 @@ public:
 private:
     TnsClientConnection(std::unique_ptr<ByteStream> stream, uint16_t negotiated_sdu, std::string connect_descriptor,
                         std::string auth_connect_string, OracleClientIdentity client_identity, bool cancellation_supported,
-                        bool end_of_response_negotiated);
+                        bool end_of_response_negotiated, bool oob_probed);
 
     std::unique_ptr<ByteStream> stream;
     std::unique_ptr<TnsPacketStream> packets;

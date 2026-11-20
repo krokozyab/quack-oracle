@@ -10,9 +10,9 @@
 namespace oracle_scanner {
 
 TtcChannel::TtcChannel(TnsPacketStream &packets_p, size_t negotiated_sdu_p, size_t maximum_message_size,
-                       bool cancellation_supported_p)
+                       bool cancellation_supported_p, bool oob_probed)
     : packets(packets_p), negotiated_sdu(negotiated_sdu_p), assembler(maximum_message_size),
-      cancellation_supported(cancellation_supported_p) {
+      cancellation_supported(cancellation_supported_p), oob_breaks(oob_probed) {
     if (negotiated_sdu <= TNS_PACKET_HEADER_SIZE + 2 || negotiated_sdu > MAX_TNS_PACKET_LENGTH) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "TTC negotiated SDU is invalid");
     }
@@ -106,7 +106,11 @@ void TtcChannel::Cancel() {
     }
     try {
         std::lock_guard<std::mutex> lock(outbound_mutex);
-        packets.Send({TnsPacketType::MARKER, 0, {0x01, 0x00, 0x03}}); // INTERRUPT
+        if (oob_breaks) {
+            packets.SendUrgent(0x21);
+        } else {
+            packets.Send({TnsPacketType::MARKER, 0, {0x01, 0x00, 0x03}}); // INTERRUPT
+        }
     } catch (...) {
         cancellation_requested.store(false);
         throw;
@@ -163,8 +167,22 @@ void TtcChannel::Send(const std::vector<uint8_t> &request) {
 std::vector<uint8_t> TtcChannel::Receive() {
     size_t reset_count = 0;
     size_t empty_fragment_count = 0;
+    size_t control_count = 0;
     while (true) {
         const auto packet = packets.Receive();
+        if (packet.type == TnsPacketType::CONTROL) {
+            // The acknowledgement of the CHECK_OOB probe, from servers that send
+            // one (see RunCheckOobProbe). Its two-byte body differs between
+            // versions and its header flags can carry a redirect bit, so only its
+            // type and width are checked. Such a server takes in-band interrupts.
+            if (packet.payload.size() != 2 || ++control_count > 1) {
+                throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                                    "Oracle sent an unexpected TNS CONTROL packet (payload bytes " +
+                                        std::to_string(packet.payload.size()) + ")");
+            }
+            oob_breaks = false;
+            continue;
+        }
         if (packet.type == TnsPacketType::MARKER) {
             if (packet.payload.size() != 3 || packet.payload[0] != 1 || packet.payload[1] != 0) {
                 throw ProtocolError(ProtocolErrorKind::MALFORMED,
