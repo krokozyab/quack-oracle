@@ -230,6 +230,11 @@ struct FakeScript {
     // lock does, until the deadline of the caller it is bound to expires.
     std::string block_until_deadline;
     size_t blocked_statements = 0;
+    // Cancelling the session ends its blocked statement with ORA-01013, the way
+    // a server answers a break; false makes a server that never answers, so
+    // only the deadline ends the statement.
+    bool cancel_answers = true;
+    size_t cancel_requests = 0;
 
     size_t sessions_opened = 0;
     size_t sessions_destroyed = 0;
@@ -581,6 +586,8 @@ public:
     }
 
     OracleCallResult Call(const OracleCallRequest &request) override {
+        WaitIfBlocked(request.block);
+        WaitIfBlocked(request.qualified_name);
         for (const auto &operation : request.dml_operations) {
             WaitIfBlocked(operation.sql);
         }
@@ -640,7 +647,13 @@ public:
         }
     }
 
+    // Called from the interrupt watcher while another thread waits in a call.
     void Cancel() override {
+        std::lock_guard<std::mutex> guard(script->record_lock);
+        script->cancel_requests++;
+        if (script->cancel_answers) {
+            cancelled = true;
+        }
     }
 
     void Close() override {
@@ -678,6 +691,12 @@ public:
         }
         const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         while (std::chrono::steady_clock::now() < limit) {
+            if (cancelled.exchange(false)) {
+                std::lock_guard<std::mutex> guard(script->record_lock);
+                failed = true;
+                throw oracle_scanner::ProtocolError(oracle_scanner::ProtocolErrorKind::INVALID_STATE,
+                                                    "ORA-01013: user requested cancel of current operation", 1013);
+            }
             const auto current = source ? source->Get() : std::nullopt;
             if (current && std::chrono::steady_clock::now() >= *current) {
                 std::lock_guard<std::mutex> guard(script->record_lock);
@@ -696,6 +715,7 @@ private:
     std::shared_ptr<FakeScript> script;
     std::string user;
     std::shared_ptr<oracle_scanner::OracleIoDeadline> deadline;
+    std::atomic<bool> cancelled {false};
     bool closed = false;
     bool failed = false;
 };
@@ -6990,9 +7010,10 @@ void TestTransactionPoolsDoNotMixSecrets() {
 
 // Connection::Interrupt reaches the IO of every transaction path, on a session
 // the pool handed out: opening a query (a SELECT FOR UPDATE waits on its lock
-// right there, at bind), a scalar statement, and a batch. Each waits until the
-// caller's deadline expires, so only the interrupt can end it; the statement
-// is sent once, the session is not reused, and the connection goes on.
+// right there, at bind), a scalar statement, and a batch. Each waits until it
+// is cancelled or the caller's deadline expires, so only the interrupt can end
+// it; Oracle is asked to cancel it once, the statement is sent once, the
+// session is not reused, and the connection goes on.
 void TestInterruptReachesEveryTransactionPath() {
     struct Path {
         std::string name;
@@ -7023,6 +7044,7 @@ void TestInterruptReachesEveryTransactionPath() {
         CHECK(RunOn(database.db, {POOLED_INSERT}));
         const auto opened = script->sessions_opened;
         const auto closes = script->session_closes;
+        const auto cancels = script->cancel_requests;
         script->block_until_deadline = path.fragment;
         duckdb::Connection connection(database.db);
         bool failed = false;
@@ -7043,12 +7065,97 @@ void TestInterruptReachesEveryTransactionPath() {
         // that session, its exchange failed, is closed rather than returned.
         CHECK(script->sessions_opened == opened && script->blocked_statements == 1);
         CHECK(script->session_closes == closes + 1);
+        CHECK(script->cancel_requests == cancels + 1);
         script->block_until_deadline.clear();
         // The connection goes on: a new transaction begins and commits.
         CHECK(!connection.Query("BEGIN;")->HasError() && !connection.Query(POOLED_INSERT)->HasError() &&
               !connection.Query("COMMIT;")->HasError());
         CHECK(script->blocked_statements == 1);
     }
+}
+
+// Runs sql on its own connection, interrupts it after 150 ms, and reports the
+// error and how long after the interrupt the query returned.
+std::pair<std::string, std::chrono::milliseconds> InterruptAfterStart(TestDatabase &database, const std::string &sql) {
+    duckdb::Connection connection(database.db);
+    std::string error;
+    std::chrono::steady_clock::time_point returned;
+    std::thread runner([&] {
+        auto result = connection.Query(sql);
+        error = result->HasError() ? result->GetError() : std::string("no error");
+        returned = std::chrono::steady_clock::now();
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    const auto interrupted = std::chrono::steady_clock::now();
+    connection.Interrupt();
+    runner.join();
+    return {error, std::chrono::duration_cast<std::chrono::milliseconds>(returned - interrupted)};
+}
+
+// An interrupt reaches the statement of oracle_query and of the functions that
+// open a session of their own, and stops it on the server: the session is
+// asked to cancel once, Oracle answers ORA-01013, and the caller gets DuckDB's
+// interrupt rather than an Oracle error. Seen live: Ctrl-C waited until Oracle
+// had finished, and oracle_query_transaction left the statement running.
+void TestInterruptCancelsStandaloneCalls() {
+    struct Path {
+        std::string name;
+        std::string fragment;
+        std::string sql;
+    };
+    const std::vector<Path> paths = {
+        {"oracle_query", "SLOW_QUERY", "SELECT * FROM oracle_query('ora', 'SELECT id FROM app.items /* SLOW_QUERY */');"},
+        {"oracle_plsql", "SLOW_BLOCK", "SELECT * FROM oracle_plsql('ora', 'BEGIN app.slow_block; /* SLOW_BLOCK */ END;');"},
+        {"oracle_execute", "SLOW_UPDATE",
+         "SELECT * FROM oracle_execute('ora', 'UPDATE app.items SET n = n + 1 /* SLOW_UPDATE */');"},
+        {"oracle_execute_many", "SLOW_BATCH",
+         "SELECT * FROM oracle_execute_many('ora', 'UPDATE app.items SET n = :n /* SLOW_BATCH */', [{n: 1}]);"},
+        {"oracle_call_named", "app.slow_compute",
+         "SELECT * FROM oracle_call_named('ora', 'app.slow_compute', "
+         "[{name: 'i', direction: 'in', type: 'number', value: '3'}]);"},
+    };
+    for (const auto &path : paths) {
+        auto script = std::make_shared<FakeScript>();
+        script->columns = {Column("ID", 2)};
+        script->rows = {{Number("1")}};
+        auto factory = InstallFake(script);
+        TestDatabase database;
+        script->block_until_deadline = path.fragment;
+        const auto outcome = InterruptAfterStart(database, path.sql);
+        const bool stopped = outcome.first.find("INTERRUPT") != std::string::npos &&
+                             outcome.second < std::chrono::seconds(1) && script->blocked_statements == 1 &&
+                             script->cancel_requests == 1;
+        if (!stopped) {
+            std::cerr << path.name << ": " << outcome.first << " after " << outcome.second.count() << " ms, "
+                      << script->cancel_requests << " cancel requests\n";
+        }
+        CHECK(stopped);
+        // The database goes on with the next statement.
+        script->block_until_deadline.clear();
+        CHECK(!database.Query("SELECT * FROM oracle_query('ora', 'SELECT id FROM app.items')")->HasError());
+    }
+}
+
+// A server that never answers the cancel: the call is given up once
+// ORACLE_CANCEL_GRACE (2 s) has passed, as before there was a cancel, and the
+// caller still gets DuckDB's interrupt.
+void TestInterruptWithoutCancelAnswer() {
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {Column("ID", 2)};
+    script->rows = {{Number("1")}};
+    script->cancel_answers = false;
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    script->block_until_deadline = "SLOW_QUERY";
+    const auto outcome =
+        InterruptAfterStart(database, "SELECT * FROM oracle_query('ora', 'SELECT id FROM app.items /* SLOW_QUERY */');");
+    const bool abandoned = outcome.first.find("INTERRUPT") != std::string::npos &&
+                           outcome.second >= std::chrono::milliseconds(1900) &&
+                           outcome.second < std::chrono::seconds(4) && script->cancel_requests == 1;
+    if (!abandoned) {
+        std::cerr << "no cancel answer: " << outcome.first << " after " << outcome.second.count() << " ms\n";
+    }
+    CHECK(abandoned);
 }
 
 static size_t CountQueries(const FakeScript &script, const std::string &sql) {
@@ -7273,6 +7380,8 @@ int main() {
     TestTransactionPoolSizeDetachAndAbandonedTransactions();
     TestTransactionPoolsDoNotMixSecrets();
     TestInterruptReachesEveryTransactionPath();
+    TestInterruptCancelsStandaloneCalls();
+    TestInterruptWithoutCancelAnswer();
     TestQueryTypeMappingAndValues();
     TestWriteOracleValueMatchesValueFor();
     TestPackedFetchThroughSql();

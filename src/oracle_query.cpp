@@ -5,6 +5,7 @@
 #include <set>
 #include <unordered_map>
 #include <condition_variable>
+#include <functional>
 #include <thread>
 #include "oracle_adapter.hpp"
 
@@ -70,17 +71,42 @@ using oracle_scanner::OracleCursor;
 using oracle_scanner::OracleSession;
 
 
-// The watcher touches only the caller's synchronized deadline, never its
-// session, socket or TLS objects. Join before unwinding the adapter scope.
+// How long an interrupted call may take to come back after Oracle was asked to
+// cancel it (ORA-01013) before the caller stops waiting for it anyway.
+constexpr auto ORACLE_CANCEL_GRACE = std::chrono::seconds(2);
+
+// On an interrupt the watcher asks Oracle to cancel the call, when it was given
+// a cancel, so the statement stops on the server too; the session's Cancel is
+// made to be called while another thread waits on that session's response.
+// Without a cancel, or when no answer comes within ORACLE_CANCEL_GRACE, it
+// expires the caller's synchronized deadline, so the waiting read gives up.
+// It touches no socket or TLS object itself. Join before unwinding the
+// adapter scope, and before the session the cancel reaches is closed or moved.
 class OracleCallerInterruptScope {
 public:
-    explicit OracleCallerInterruptScope(ClientContext &context_p)
-        : context(context_p), source(OracleIoDeadlineFor(context)), previous(source->Get()) {
+    explicit OracleCallerInterruptScope(ClientContext &context_p, std::function<void()> cancel_p = nullptr)
+        : context(context_p), source(OracleIoDeadlineFor(context)), previous(source->Get()),
+          cancel(std::move(cancel_p)) {
         Check();
         watcher = std::thread([this] {
             std::unique_lock<std::mutex> guard(lock);
             while (!stop) {
                 if (context.IsInterrupted()) {
+                    bool sent = false;
+                    const auto cancel_now = cancel;
+                    if (cancel_now) {
+                        guard.unlock();
+                        try {
+                            cancel_now();
+                            sent = true;
+                        } catch (...) {
+                            // TCPS has no cancel, a closed session refuses one: stop waiting instead.
+                        }
+                        guard.lock();
+                    }
+                    if (sent && wake.wait_for(guard, ORACLE_CANCEL_GRACE, [this] { return stop; })) {
+                        return;
+                    }
                     const auto now = std::chrono::steady_clock::now();
                     const auto current = source->Get();
                     source->Set(current ? (std::min)(*current, now) : now);
@@ -101,16 +127,40 @@ public:
         if (watcher.joinable()) { watcher.join(); }
     }
     void Check() const { if (context.IsInterrupted()) { throw InterruptException(); } }
+    // For a scope that starts before the session is known: an interrupt until
+    // then only expires the deadline.
+    void SetCancel(std::function<void()> cancel_p) {
+        std::lock_guard<std::mutex> guard(lock);
+        cancel = std::move(cancel_p);
+    }
 private:
     ClientContext &context;
     std::shared_ptr<oracle_scanner::OracleIoDeadline> source;
     oracle_scanner::OracleIoDeadline::Deadline previous;
+    std::function<void()> cancel;
     std::mutex lock;
     std::condition_variable wake;
     std::thread watcher;
     bool stop = false;
     bool signalled = false;
 };
+
+// An interrupted call ends in DuckDB's interrupt, whatever Oracle or the
+// transport reported for it (ORA-01013, or the expired deadline).
+void ThrowIfInterrupted(ClientContext &context) {
+    if (context.IsInterrupted()) {
+        throw InterruptException();
+    }
+}
+
+// One blocking call on a session the caller opened for itself, with an
+// interrupt watcher that cancels it. The watcher lives exactly as long as the
+// call, so it never meets the session while it is committed or closed.
+template <class Call>
+auto InterruptibleOracleCall(ClientContext &context, OracleSession &session, Call &&call) -> decltype(call()) {
+    OracleCallerInterruptScope interrupt(context, [&session] { session.Cancel(); });
+    return call();
+}
 
 struct OracleExecuteBindData final : TableFunctionData {
     std::string catalog_name;
@@ -664,27 +714,26 @@ unique_ptr<FunctionData> BindOracleSelect(ClientContext &context, const std::str
     } else {
         result->session = AcquireOracleReadSession(context, secret_name, std::string(), config, password);
     }
-    // The transactional form describes by running the query, so a SELECT FOR
-    // UPDATE waits on its lock here: the caller's interrupt must reach it.
-    std::unique_ptr<OracleCallerInterruptScope> interrupt;
-    if (transactional) {
-        interrupt = std::make_unique<OracleCallerInterruptScope>(context);
-    }
+    // Opening runs the query, in both forms: a long query, or a SELECT FOR
+    // UPDATE waiting on its lock, runs right here, so the caller's interrupt
+    // must reach it. The bind data keeps its address when DuckDB takes it.
+    auto &session = result->session;
+    OracleCallerInterruptScope interrupt(context, [&session] { session->Cancel(); });
     try {
         result->cursor = result->session->Query(sql, binds);
     } catch (const std::exception &error) {
         // Join first, retain the expired caller deadline through cleanup.
-        if (interrupt) {
-            interrupt->Stop();
-        }
+        interrupt.Stop();
         // A pooled session whose statement failed cannot be handed to the next
         // one: the failure may have left the channel mid-message.
         result->session.Poison();
         if (transactional) {
             PoisonTransactionSession(context, result->catalog_name);
         }
+        ThrowIfInterrupted(context);
         ThrowOracleAdapterError("oracle_query could not open Oracle query", error);
     }
+    interrupt.Stop();
     result->columns = result->cursor->Columns();
     if (result->columns.empty()) {
         throw BinderException("oracle_query received no described Oracle columns");
@@ -1030,10 +1079,11 @@ unique_ptr<GlobalTableFunctionState> OracleAdminInit(ClientContext &context, Tab
     const auto &bind = input.bind_data->Cast<OracleExecuteBindData>();
     try {
         auto session = OpenOracleSession(bind.config, bind.password);
-        session->ExecuteAdmin(bind.sql);
+        InterruptibleOracleCall(context, *session, [&] { session->ExecuteAdmin(bind.sql); });
         session->Close();
         return make_uniq<OracleExecuteGlobalState>(0);
     } catch (const std::exception &error) {
+        ThrowIfInterrupted(context);
         ThrowOracleAdapterError("oracle_execute_admin failed", error);
     }
 }
@@ -1088,15 +1138,17 @@ void OracleStatusFunction(ClientContext &, TableFunctionInput &input, DataChunk 
     state.emitted = true;
 }
 
-unique_ptr<GlobalTableFunctionState> OracleExecuteInit(ClientContext &, TableFunctionInitInput &input) {
+unique_ptr<GlobalTableFunctionState> OracleExecuteInit(ClientContext &context, TableFunctionInitInput &input) {
     const auto &bind = input.bind_data->Cast<OracleExecuteBindData>();
     try {
         auto session = OpenOracleSession(bind.config, bind.password);
-        const auto affected_rows = session->ExecuteWithRowCount(bind.sql, bind.binds);
+        const auto affected_rows = InterruptibleOracleCall(
+            context, *session, [&] { return session->ExecuteWithRowCount(bind.sql, bind.binds); });
         session->Commit();
         session->Close();
         return make_uniq<OracleExecuteGlobalState>(affected_rows);
     } catch (const std::exception &error) {
+        ThrowIfInterrupted(context);
         throw IOException("oracle_execute failed: %s", error.what());
     }
 }
@@ -1110,6 +1162,7 @@ unique_ptr<GlobalTableFunctionState> OracleTransactionExecuteInit(ClientContext 
     OracleCallerInterruptScope interrupt(context);
     try {
         auto &session = TransactionSession(context, target);
+        interrupt.SetCancel([&session] { session.Cancel(); });
         const auto affected_rows = session.ExecuteWithRowCount(bind.sql, bind.binds);
         interrupt.Check();
         return make_uniq<OracleExecuteGlobalState>(affected_rows);
@@ -1117,6 +1170,7 @@ unique_ptr<GlobalTableFunctionState> OracleTransactionExecuteInit(ClientContext 
         // Join first, retain the expired caller deadline through cleanup.
         interrupt.Stop();
         PoisonTransactionSession(context, target.catalog_name);
+        ThrowIfInterrupted(context);
         ThrowOracleAdapterError("oracle_execute_transaction failed", error);
     }
 }
@@ -1170,12 +1224,13 @@ unique_ptr<FunctionData> OracleExecuteManyBind(ClientContext &context, TableFunc
     return std::move(result);
 }
 
-unique_ptr<GlobalTableFunctionState> OracleExecuteManyInit(ClientContext &, TableFunctionInitInput &input) {
+unique_ptr<GlobalTableFunctionState> OracleExecuteManyInit(ClientContext &context, TableFunctionInitInput &input) {
     const auto &bind = input.bind_data->Cast<OracleExecuteManyBindData>();
     std::unique_ptr<OracleSession> session;
     try {
         session = OpenOracleSession(bind.config, bind.password);
-        const auto affected_rows = session->ExecuteBatch(bind.sql, bind.rows);
+        const auto affected_rows = InterruptibleOracleCall(
+            context, *session, [&] { return session->ExecuteBatch(bind.sql, bind.rows); });
         session->Commit();
         session->Close();
         return make_uniq<OracleExecuteGlobalState>(affected_rows);
@@ -1190,6 +1245,7 @@ unique_ptr<GlobalTableFunctionState> OracleExecuteManyInit(ClientContext &, Tabl
             } catch (...) {
             }
         }
+        ThrowIfInterrupted(context);
         ThrowOracleAdapterError("oracle_execute_many failed", error);
     }
 }
@@ -1207,7 +1263,7 @@ unique_ptr<FunctionData> OracleCallNumberBind(ClientContext &context, TableFunct
     return std::move(result);
 }
 
-unique_ptr<GlobalTableFunctionState> OracleCallNumberInit(ClientContext &, TableFunctionInitInput &input) {
+unique_ptr<GlobalTableFunctionState> OracleCallNumberInit(ClientContext &context, TableFunctionInitInput &input) {
     const auto &bind = input.bind_data->Cast<OracleCallNumberBindData>();
     try {
         auto session = OpenOracleSession(bind.config, bind.password);
@@ -1215,7 +1271,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallNumberInit(ClientContext &, Table
         request.kind = oracle_scanner::OracleCallableKind::FUNCTION;
         request.qualified_name = bind.function;
         request.return_bind = {"r", 2, oracle_scanner::BindDirection::BIND_OUT, std::nullopt, 22};
-        auto result = session->Call(request);
+        auto result = InterruptibleOracleCall(context, *session, [&] { return session->Call(request); });
         if (result.outputs.size() != 1 || !result.explicit_cursors.empty() || !result.implicit_cursors.empty() ||
             result.outputs[0].oracle_type != 2) {
             throw BinderException("oracle_call_number requires a scalar Oracle NUMBER result");
@@ -1227,6 +1283,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallNumberInit(ClientContext &, Table
         session->Close();
         return make_uniq<OracleCallScalarGlobalState>(std::move(value));
     } catch (const std::exception &error) {
+        ThrowIfInterrupted(context);
         throw IOException("oracle_call_number failed: %s", error.what());
     }
 }
@@ -1245,7 +1302,7 @@ unique_ptr<FunctionData> OracleCallNumberArgsBind(ClientContext &context, TableF
     return std::move(result);
 }
 
-unique_ptr<GlobalTableFunctionState> OracleCallNumberArgsInit(ClientContext &, TableFunctionInitInput &input) {
+unique_ptr<GlobalTableFunctionState> OracleCallNumberArgsInit(ClientContext &context, TableFunctionInitInput &input) {
     const auto &bind = input.bind_data->Cast<OracleCallNumberArgsBindData>();
     try {
         auto session = OpenOracleSession(bind.config, bind.password);
@@ -1254,7 +1311,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallNumberArgsInit(ClientContext &, T
         request.qualified_name = bind.function;
         request.return_bind = {"r", 2, oracle_scanner::BindDirection::BIND_OUT, std::nullopt, 22};
         request.arguments = bind.arguments;
-        auto result = session->Call(request);
+        auto result = InterruptibleOracleCall(context, *session, [&] { return session->Call(request); });
         if (result.outputs.size() != 1 || !result.explicit_cursors.empty() || !result.implicit_cursors.empty() ||
             result.outputs[0].oracle_type != 2) {
             throw BinderException("oracle_call_number_args requires a scalar Oracle NUMBER result");
@@ -1266,6 +1323,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallNumberArgsInit(ClientContext &, T
         session->Close();
         return make_uniq<OracleCallScalarGlobalState>(std::move(value));
     } catch (const std::exception &error) {
+        ThrowIfInterrupted(context);
         throw IOException("oracle_call_number_args failed: %s", error.what());
     }
 }
@@ -1293,7 +1351,7 @@ unique_ptr<FunctionData> OracleCallOutNumberBind(ClientContext &context, TableFu
     return std::move(result);
 }
 
-unique_ptr<GlobalTableFunctionState> OracleCallOutNumberInit(ClientContext &, TableFunctionInitInput &input) {
+unique_ptr<GlobalTableFunctionState> OracleCallOutNumberInit(ClientContext &context, TableFunctionInitInput &input) {
     const auto &bind = input.bind_data->Cast<OracleCallOutNumberBindData>();
     try {
         auto session = OpenOracleSession(bind.config, bind.password);
@@ -1301,7 +1359,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallOutNumberInit(ClientContext &, Ta
         request.kind = oracle_scanner::OracleCallableKind::PROCEDURE;
         request.qualified_name = bind.procedure;
         request.arguments = {{bind.argument, 2, oracle_scanner::BindDirection::BIND_OUT, std::nullopt, 22}};
-        auto result = session->Call(request);
+        auto result = InterruptibleOracleCall(context, *session, [&] { return session->Call(request); });
         if (result.outputs.size() != 1 || !result.explicit_cursors.empty() || !result.implicit_cursors.empty() ||
             result.outputs[0].oracle_type != 2) {
             throw BinderException("oracle_call_out_number requires one scalar Oracle NUMBER OUT argument");
@@ -1313,6 +1371,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallOutNumberInit(ClientContext &, Ta
         session->Close();
         return make_uniq<OracleCallScalarGlobalState>(std::move(value));
     } catch (const std::exception &error) {
+        ThrowIfInterrupted(context);
         throw IOException("oracle_call_out_number failed: %s", error.what());
     }
 }
@@ -1331,7 +1390,7 @@ unique_ptr<FunctionData> OracleCallOutVarcharBind(ClientContext &context, TableF
     return std::move(result);
 }
 
-unique_ptr<GlobalTableFunctionState> OracleCallOutVarcharInit(ClientContext &, TableFunctionInitInput &input) {
+unique_ptr<GlobalTableFunctionState> OracleCallOutVarcharInit(ClientContext &context, TableFunctionInitInput &input) {
     const auto &bind = input.bind_data->Cast<OracleCallOutVarcharBindData>();
     try {
         auto session = OpenOracleSession(bind.config, bind.password);
@@ -1339,7 +1398,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallOutVarcharInit(ClientContext &, T
         request.kind = oracle_scanner::OracleCallableKind::PROCEDURE;
         request.qualified_name = bind.procedure;
         request.arguments = {{bind.argument, 1, oracle_scanner::BindDirection::BIND_OUT, std::nullopt, 32767}};
-        auto result = session->Call(request);
+        auto result = InterruptibleOracleCall(context, *session, [&] { return session->Call(request); });
         if (result.outputs.size() != 1 || !result.explicit_cursors.empty() || !result.implicit_cursors.empty() ||
             result.outputs[0].oracle_type != 1) {
             throw BinderException("oracle_call_out_varchar requires one scalar Oracle VARCHAR2 OUT argument");
@@ -1351,6 +1410,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallOutVarcharInit(ClientContext &, T
         session->Close();
         return make_uniq<OracleCallScalarGlobalState>(std::move(value));
     } catch (const std::exception &error) {
+        ThrowIfInterrupted(context);
         throw IOException("oracle_call_out_varchar failed: %s", error.what());
     }
 }
@@ -1370,7 +1430,7 @@ unique_ptr<FunctionData> OracleCallInOutNumberBind(ClientContext &context, Table
     return std::move(result);
 }
 
-unique_ptr<GlobalTableFunctionState> OracleCallInOutNumberInit(ClientContext &, TableFunctionInitInput &input) {
+unique_ptr<GlobalTableFunctionState> OracleCallInOutNumberInit(ClientContext &context, TableFunctionInitInput &input) {
     const auto &bind = input.bind_data->Cast<OracleCallInOutNumberBindData>();
     try {
         auto session = OpenOracleSession(bind.config, bind.password);
@@ -1378,7 +1438,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallInOutNumberInit(ClientContext &, 
         request.kind = oracle_scanner::OracleCallableKind::PROCEDURE;
         request.qualified_name = bind.procedure;
         request.arguments = {{bind.argument, 2, oracle_scanner::BindDirection::BIND_IN_OUT, bind.value, 22}};
-        auto result = session->Call(request);
+        auto result = InterruptibleOracleCall(context, *session, [&] { return session->Call(request); });
         if (result.outputs.size() != 1 || !result.explicit_cursors.empty() || !result.implicit_cursors.empty() ||
             result.outputs[0].oracle_type != 2) {
             throw BinderException("oracle_call_inout_number requires one scalar Oracle NUMBER IN OUT argument");
@@ -1390,6 +1450,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallInOutNumberInit(ClientContext &, 
         session->Close();
         return make_uniq<OracleCallScalarGlobalState>(std::move(value));
     } catch (const std::exception &error) {
+        ThrowIfInterrupted(context);
         throw IOException("oracle_call_inout_number failed: %s", error.what());
     }
 }
@@ -1410,7 +1471,7 @@ unique_ptr<FunctionData> OracleCallInOutVarcharBind(ClientContext &context, Tabl
     return std::move(result);
 }
 
-unique_ptr<GlobalTableFunctionState> OracleCallInOutVarcharInit(ClientContext &, TableFunctionInitInput &input) {
+unique_ptr<GlobalTableFunctionState> OracleCallInOutVarcharInit(ClientContext &context, TableFunctionInitInput &input) {
     const auto &bind = input.bind_data->Cast<OracleCallInOutVarcharBindData>();
     try {
         auto session = OpenOracleSession(bind.config, bind.password);
@@ -1418,7 +1479,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallInOutVarcharInit(ClientContext &,
         request.kind = oracle_scanner::OracleCallableKind::PROCEDURE;
         request.qualified_name = bind.procedure;
         request.arguments = {{bind.argument, 1, oracle_scanner::BindDirection::BIND_IN_OUT, bind.value, 32767}};
-        auto result = session->Call(request);
+        auto result = InterruptibleOracleCall(context, *session, [&] { return session->Call(request); });
         if (result.outputs.size() != 1 || !result.explicit_cursors.empty() || !result.implicit_cursors.empty() ||
             result.outputs[0].oracle_type != 1) {
             throw BinderException("oracle_call_inout_varchar requires one scalar Oracle VARCHAR2 IN OUT argument");
@@ -1430,6 +1491,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallInOutVarcharInit(ClientContext &,
         session->Close();
         return make_uniq<OracleCallScalarGlobalState>(std::move(value));
     } catch (const std::exception &error) {
+        ThrowIfInterrupted(context);
         throw IOException("oracle_call_inout_varchar failed: %s", error.what());
     }
 }
@@ -1457,7 +1519,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallInit(ClientContext &context, Tabl
         request.qualified_name = bind.procedure;
         request.arguments = {{bind.cursor_argument, oracle_scanner::ORACLE_WIRE_TYPE_CURSOR,
                               oracle_scanner::BindDirection::BIND_OUT, std::nullopt, 4}};
-        auto result = session->Call(request);
+        auto result = InterruptibleOracleCall(context, *session, [&] { return session->Call(request); });
         if (result.explicit_cursors.size() != 1 || !result.implicit_cursors.empty()) {
             throw BinderException("oracle_call currently requires exactly one explicit SYS_REFCURSOR result");
         }
@@ -1474,6 +1536,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallInit(ClientContext &context, Tabl
         }
         return make_uniq<OracleCallGlobalState>(std::move(formatted));
     } catch (const std::exception &error) {
+        ThrowIfInterrupted(context);
         throw IOException("oracle_call failed: %s", error.what());
     }
 }
@@ -1509,7 +1572,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallImplicitInit(ClientContext &conte
         oracle_scanner::OracleCallRequest request;
         request.kind = oracle_scanner::OracleCallableKind::PROCEDURE;
         request.qualified_name = bind.procedure;
-        auto result = session->Call(request);
+        auto result = InterruptibleOracleCall(context, *session, [&] { return session->Call(request); });
         if (!result.explicit_cursors.empty() || result.implicit_cursors.empty()) {
             throw BinderException("oracle_call_implicit requires one or more implicit cursor results");
         }
@@ -1526,6 +1589,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallImplicitInit(ClientContext &conte
         }
         return make_uniq<OracleCallGlobalState>(std::move(formatted));
     } catch (const std::exception &error) {
+        ThrowIfInterrupted(context);
         throw IOException("oracle_call_implicit failed: %s", error.what());
     }
 }
@@ -1567,7 +1631,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallCursorsInit(ClientContext &contex
             request.arguments.push_back(
                 {argument, oracle_scanner::ORACLE_WIRE_TYPE_CURSOR, oracle_scanner::BindDirection::BIND_OUT, std::nullopt, 4});
         }
-        auto result = session->Call(request);
+        auto result = InterruptibleOracleCall(context, *session, [&] { return session->Call(request); });
         if (result.explicit_cursors.size() != bind.cursor_arguments.size() || !result.implicit_cursors.empty()) {
             throw BinderException("oracle_call_cursors procedure did not return every requested SYS_REFCURSOR");
         }
@@ -1584,6 +1648,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallCursorsInit(ClientContext &contex
         }
         return make_uniq<OracleCallGlobalState>(std::move(formatted));
     } catch (const std::exception &error) {
+        ThrowIfInterrupted(context);
         throw IOException("oracle_call_cursors failed: %s", error.what());
     }
 }
@@ -1778,7 +1843,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallAutoInit(ClientContext &context, 
         request.qualified_name = ResolvedCallableName(signature);
         request.return_bind = return_bind;
         request.arguments = arguments;
-        auto result = session->Call(request);
+        auto result = InterruptibleOracleCall(context, *session, [&] { return session->Call(request); });
         if (!result.implicit_cursors.empty()) {
             throw BinderException("oracle_call_auto does not combine explicit and implicit cursor results");
         }
@@ -1846,6 +1911,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallAutoInit(ClientContext &context, 
         }
         return make_uniq<OracleCallNamedGlobalState>(std::move(rows));
     } catch (const oracle_scanner::ProtocolError &error) {
+        ThrowIfInterrupted(context);
         throw IOException("oracle_call_auto failed: %s", error.what());
     }
 }
@@ -1940,6 +2006,7 @@ unique_ptr<GlobalTableFunctionState> OracleTransactionManyInit(ClientContext &co
     OracleCallerInterruptScope interrupt(context);
     try {
         auto &session = TransactionSession(context, target);
+        interrupt.SetCancel([&session] { session.Cancel(); });
         if (bind.exact_counts) {
             state->counts.reserve(bind.rows.size());
             for (idx_t index = 0; index < bind.rows.size(); ++index) {
@@ -1961,6 +2028,7 @@ unique_ptr<GlobalTableFunctionState> OracleTransactionManyInit(ClientContext &co
         // Rollback cannot wait for a reply on the interrupted exchange.
         interrupt.Stop();
         PoisonTransactionSession(context, target.catalog_name);
+        ThrowIfInterrupted(context);
         ThrowOracleAdapterError("oracle_execute_many_transaction failed", error);
     }
 }
@@ -2052,6 +2120,7 @@ unique_ptr<GlobalTableFunctionState> OracleCompositeInit(ClientContext &context,
     OracleCallerInterruptScope interrupt(context);
     try {
         auto &session = TransactionSession(context, target);
+        interrupt.SetCancel([&session] { session.Cancel(); });
         // Sent once. A block that failed is never retried: the statements
         // before the failing one ran, and only the transaction's rollback
         // takes them back.
@@ -2072,6 +2141,7 @@ unique_ptr<GlobalTableFunctionState> OracleCompositeInit(ClientContext &context,
         // Rollback cannot wait for a reply on the interrupted exchange.
         interrupt.Stop();
         PoisonTransactionSession(context, target.catalog_name);
+        ThrowIfInterrupted(context);
         ThrowOracleAdapterError("oracle_execute_composite_transaction failed", error);
     }
 }
@@ -2133,6 +2203,7 @@ unique_ptr<GlobalTableFunctionState> OracleTransactionCallInit(ClientContext &co
     OracleCallerInterruptScope interrupt(context);
     try {
         auto &session = TransactionSession(context, target);
+        interrupt.SetCancel([&session] { session.Cancel(); });
         // A procedure can change package state, NLS or the current schema of
         // the session itself; the session ends closed rather than reused.
         TaintTransactionSession(context, target.catalog_name);
@@ -2165,6 +2236,7 @@ unique_ptr<GlobalTableFunctionState> OracleTransactionCallInit(ClientContext &co
         // Rollback cannot wait for a reply on the interrupted exchange.
         interrupt.Stop();
         PoisonTransactionSession(context, target.catalog_name);
+        ThrowIfInterrupted(context);
         ThrowOracleAdapterError("oracle_call_named_transaction failed", error);
     }
 }
@@ -2246,7 +2318,7 @@ unique_ptr<GlobalTableFunctionState> OraclePlsqlInit(ClientContext &context, Tab
         request.kind = oracle_scanner::OracleCallableKind::ANONYMOUS_BLOCK;
         request.block = bind.block;
         request.arguments = bind.arguments;
-        auto result = session->Call(request);
+        auto result = InterruptibleOracleCall(context, *session, [&] { return session->Call(request); });
         if (!result.implicit_cursors.empty()) {
             for (auto &cursor : result.explicit_cursors) {
                 cursor->Close();
@@ -2301,6 +2373,7 @@ unique_ptr<GlobalTableFunctionState> OraclePlsqlInit(ClientContext &context, Tab
         }
         return make_uniq<OracleCallNamedGlobalState>(std::move(rows));
     } catch (const std::exception &error) {
+        ThrowIfInterrupted(context);
         throw IOException("oracle_plsql failed: %s", error.what());
     }
 }
@@ -2356,6 +2429,7 @@ unique_ptr<GlobalTableFunctionState> OracleTransactionPlsqlInit(ClientContext &c
     OracleCallerInterruptScope interrupt(context);
     try {
         auto &session = TransactionSession(context, target);
+        interrupt.SetCancel([&session] { session.Cancel(); });
         // A block can change package state, NLS or the current schema of the
         // session itself; the session ends closed rather than reused.
         TaintTransactionSession(context, target.catalog_name);
@@ -2398,6 +2472,7 @@ unique_ptr<GlobalTableFunctionState> OracleTransactionPlsqlInit(ClientContext &c
     } catch (const std::exception &error) {
         interrupt.Stop();
         PoisonTransactionSession(context, target.catalog_name);
+        ThrowIfInterrupted(context);
         ThrowOracleAdapterError("oracle_plsql_transaction failed", error);
     }
 }
@@ -2410,7 +2485,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallNamedInit(ClientContext &context,
         request.kind = oracle_scanner::OracleCallableKind::PROCEDURE;
         request.qualified_name = bind.procedure;
         request.arguments = bind.arguments;
-        auto result = session->Call(request);
+        auto result = InterruptibleOracleCall(context, *session, [&] { return session->Call(request); });
         if (!result.implicit_cursors.empty()) {
             throw BinderException("oracle_call_named does not combine explicit and implicit cursor results");
         }
@@ -2453,6 +2528,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallNamedInit(ClientContext &context,
         }
         return make_uniq<OracleCallNamedGlobalState>(std::move(rows));
     } catch (const std::exception &error) {
+        ThrowIfInterrupted(context);
         throw IOException("oracle_call_named failed: %s", error.what());
     }
 }
@@ -2528,7 +2604,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallNamedFunctionInit(ClientContext &
         request.qualified_name = bind.function;
         request.return_bind = bind.return_bind;
         request.arguments = bind.arguments;
-        auto result = session->Call(request);
+        auto result = InterruptibleOracleCall(context, *session, [&] { return session->Call(request); });
         if (!result.implicit_cursors.empty()) {
             throw BinderException("oracle_call_named_function does not combine explicit and implicit cursor results");
         }
@@ -2591,6 +2667,7 @@ unique_ptr<GlobalTableFunctionState> OracleCallNamedFunctionInit(ClientContext &
         }
         return make_uniq<OracleCallNamedGlobalState>(std::move(rows));
     } catch (const std::exception &error) {
+        ThrowIfInterrupted(context);
         throw IOException("oracle_call_named_function failed: %s", error.what());
     }
 }
@@ -3289,7 +3366,7 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
         auto session = AcquireOracleReadSession(context, std::string(), target.catalog_name,
                                                 target.config, target.password);
         std::unique_ptr<OracleCursor> cursor;
-        OracleCallerInterruptScope interrupt(context);
+        OracleCallerInterruptScope interrupt(context, [&session] { session->Cancel(); });
         try {
             cursor = session->Query(bind.query_sql, bind.query_binds);
             const auto &columns = cursor->Columns();
@@ -3319,6 +3396,8 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
                     throw IOException("Oracle query type changed; prepare the query again");
                 }
             }
+            // The watcher's cancel reaches the session through this variable.
+            interrupt.Stop();
             auto state = make_uniq<OracleQueryGlobalState>(std::move(session), std::move(cursor),
                 columns, bind.types, std::move(input.column_ids), columns.size());
             state->catalog_name = bind.catalog_name;
@@ -3328,6 +3407,7 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
             cursor.reset();
             session.Poison();
             PoisonTransactionSession(context, bind.catalog_name);
+            ThrowIfInterrupted(context);
             ThrowOracleAdapterError(bind.declared_schema ? "oracle_query_transaction_typed failed"
                                                          : "oracle_query_transaction failed",
                                     error);
