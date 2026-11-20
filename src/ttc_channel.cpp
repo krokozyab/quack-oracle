@@ -163,8 +163,21 @@ void TtcChannel::Send(const std::vector<uint8_t> &request) {
 std::vector<uint8_t> TtcChannel::Receive() {
     size_t reset_count = 0;
     size_t empty_fragment_count = 0;
+    size_t control_count = 0;
     while (true) {
         const auto packet = packets.Receive();
+        if (packet.type == TnsPacketType::CONTROL) {
+            // The acknowledgement of the CHECK_OOB probe, from servers that send
+            // one (see RunCheckOobProbe). Its two-byte body differs between
+            // versions and its header flags can carry a redirect bit, so only its
+            // type and width are checked.
+            if (packet.payload.size() != 2 || ++control_count > 1) {
+                throw ProtocolError(ProtocolErrorKind::MALFORMED,
+                                    "Oracle sent an unexpected TNS CONTROL packet (payload bytes " +
+                                        std::to_string(packet.payload.size()) + ")");
+            }
+            continue;
+        }
         if (packet.type == TnsPacketType::MARKER) {
             if (packet.payload.size() != 3 || packet.payload[0] != 1 || packet.payload[1] != 0) {
                 throw ProtocolError(ProtocolErrorKind::MALFORMED,

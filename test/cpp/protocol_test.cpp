@@ -645,6 +645,37 @@ static void TestTtcChannelShortPacketBoundary() {
     CHECK(channel.Receive() == message);
 }
 
+// A server that acknowledges the CHECK_OOB probe sends a CONTROL packet with a
+// two-byte body ahead of the TTIPRO response; the channel skips it. A CONTROL
+// packet of another width, or a second one, is still refused.
+static void TestTtcChannelSkipsOobAcknowledgement() {
+    const std::vector<uint8_t> message {1, 6, 0, 'o', 'k', 0};
+    const auto inbound_after = [&](const std::vector<std::vector<uint8_t>> &controls) {
+        std::vector<uint8_t> inbound;
+        for (const auto &body : controls) {
+            const auto control = EncodeTnsPacket(TnsPacketType::CONTROL, 0x20, body, true);
+            inbound.insert(inbound.end(), control.begin(), control.end());
+        }
+        for (const auto &packet : EncodeTnsDataPackets(message, true, 64, 0)) {
+            inbound.insert(inbound.end(), packet.begin(), packet.end());
+        }
+        return inbound;
+    };
+    {
+        FragmentedStream stream(inbound_after({{0x00, 0x09}}), 2);
+        TnsPacketStream packets(stream, true, 64);
+        TtcChannel channel(packets, 64, 128);
+        CHECK(channel.Receive() == message);
+    }
+    for (const auto &controls : std::vector<std::vector<std::vector<uint8_t>>> {{{0x00, 0x09, 0x00}},
+                                                                               {{0x00, 0x09}, {0x00, 0x09}}}) {
+        FragmentedStream stream(inbound_after(controls), 2);
+        TnsPacketStream packets(stream, true, 64);
+        TtcChannel channel(packets, 64, 128);
+        ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)channel.Receive(); });
+    }
+}
+
 // Nothing in the framing says where a data response ends: a legacy session gets
 // no END_OF_RESPONSE, and fragments are not padded to the SDU. The statement
 // channel therefore joins fragments until the decoder reports a terminator, and
@@ -6043,8 +6074,8 @@ static void TestListenerEchoOfTheClientsConnectData() {
 // A node listener reached through a SCAN redirect asks for the CHECK_OOB probe and
 // answers it with a CONTROL packet whose header flags are 0x24, not the 0x20
 // 19c and Free send: the re-CONNECT's 0x04 redirect bit comes back with it.
-// Seen live; 0.3.0 refused it as an invalid CONTROL reply. The
-// type and the two-byte body are what the probe checks.
+// Seen live; 0.3.0 refused it as an invalid CONTROL reply. The probe does not
+// read the answer; TtcChannel::Receive skips it (TestTtcChannelSkipsOobAcknowledgement).
 static void TestOobProbeAfterRedirectAcceptsTheRedirectFlag() {
     const auto accept_then_control = [](uint8_t flags, std::vector<uint8_t> body) {
         auto wire = AcceptPacketBytes(true);
@@ -6066,17 +6097,27 @@ static void TestOobProbeAfterRedirectAcceptsTheRedirectFlag() {
     const std::vector<uint8_t> reset_marker {0x01, 0x00, 0x02};
     CHECK(std::search(node_bytes.begin(), node_bytes.end(), reset_marker.begin(), reset_marker.end()) != node_bytes.end());
 
-    // The plain 0x20 answer still works, and what the probe does check still
-    // holds: a CONTROL body of the wrong width, or a reply that is not CONTROL.
+    // The plain 0x20 answer works too.
     network.Answer("scan", 1521, accept_then_control(0x20, {0x00, 0x09}));
     (void)TnsClientConnection::Connect(RoutedConfig({{"scan"}}));
-    network.Answer("scan", 1521, accept_then_control(0x24, {0x00, 0x09, 0x00}));
-    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)TnsClientConnection::Connect(RoutedConfig({{"scan"}})); });
-    auto not_control = AcceptPacketBytes(true);
-    const auto marker = EncodeTnsPacket(TnsPacketType::MARKER, 0x24, {0x01, 0x00, 0x02}, true);
-    not_control.insert(not_control.end(), marker.begin(), marker.end());
-    network.Answer("scan", 1521, not_control);
-    ExpectError(ProtocolErrorKind::MALFORMED, [] { (void)TnsClientConnection::Connect(RoutedConfig({{"scan"}})); });
+}
+
+// A 19c server can also leave the CHECK_OOB probe unanswered: after ACCEPT it
+// sends nothing until the client's TTIPRO arrives. Seen live; 0.8.0 waited for
+// a CONTROL reply there and failed with "Oracle TCP read timed out" after 30 s,
+// while python-oracledb Thin connects. The connect completes without a read.
+static void TestOobProbeWithoutAnswer() {
+    FakeClock clock;
+    ScopedOracleConnectEnvironment environment(clock.Environment());
+    FakeNetwork network;
+    network.supports_urgent = true;
+    network.Answer("db", 1521, AcceptPacketBytes(true));
+    ScopedOracleTransportFactory installed(network.Factory());
+    auto connection = TnsClientConnection::Connect(RoutedConfig({{"db"}}));
+    CHECK(connection->State() == OracleConnectionState::TRANSPORT_CONNECTED);
+    const auto &bytes = network.written.back();
+    const std::vector<uint8_t> reset_marker {0x01, 0x00, 0x02};
+    CHECK(std::search(bytes.begin(), bytes.end(), reset_marker.begin(), reset_marker.end()) != bytes.end());
 }
 
 // Review regressions. A redirect chain keeps every level's untried addresses:
@@ -9703,6 +9744,7 @@ int main() {
     TestConnectHandshake();
     TestTtcChannel();
     TestTtcChannelShortPacketBoundary();
+    TestTtcChannelSkipsOobAcknowledgement();
     TestStatementChannelJoinsFragmentedResponse();
     TestSinkValueFailureDoesNotRequestAnotherFragment();
     TestStatementChannelJoinsFragmentedExecuteResponse();
@@ -9817,6 +9859,7 @@ int main() {
     TestRedirectChainKeepsEachLevelsAlternatives();
     TestListenerEchoOfTheClientsConnectData();
     TestOobProbeAfterRedirectAcceptsTheRedirectFlag();
+    TestOobProbeWithoutAnswer();
     TestBudgetHoldsThroughTheListenerExchange();
     TestSlowNameResolutionIsCutOffByTheBudget();
     TestResolverWorkersAreBounded();

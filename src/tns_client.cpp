@@ -29,20 +29,12 @@ void RunCheckOobProbe(ByteStream &stream, uint16_t negotiated_sdu) {
     // check. The listener's CONTROL response is only meaningful after this
     // exact marker shape.
     packets.Send({TnsPacketType::MARKER, 0, {0x01, 0x00, 0x02}});
-    const auto reply = packets.Receive();
-    // The two-byte CONTROL body is listener-version dependent (19c emits a
-    // different value than newer Free builds); it is an acknowledgement, not
-    // a negotiated value. Its type and width are the contract; the header
-    // flags are not. 19c and Free answer with flags 0x20, but a node listener
-    // reached through a SCAN redirect answers 0x24 — the 0x04 redirect bit of
-    // the re-CONNECT carried over — and python-oracledb Thin reads CONTROL
-    // packets without looking at their flags at all.
-    if (reply.type != TnsPacketType::CONTROL || reply.payload.size() != 2) {
-        throw ProtocolError(ProtocolErrorKind::MALFORMED,
-                            "Oracle CHECK_OOB probe returned invalid CONTROL reply (type " +
-                                std::to_string(static_cast<uint8_t>(reply.type)) + ", flags " +
-                                std::to_string(reply.flags) + ", payload bytes " + std::to_string(reply.payload.size()) + ")");
-    }
+    // The probe is not waited on. Some servers acknowledge it with a CONTROL
+    // packet (19c and Free with header flags 0x20, a node listener reached
+    // through a SCAN redirect with 0x24); others, 19c among them, send nothing
+    // and wait for TTIPRO, so a read here would never return. Like
+    // python-oracledb Thin, the client goes on to TTC at once, and
+    // TtcChannel::Receive skips the acknowledgement when one arrives.
 }
 
 
