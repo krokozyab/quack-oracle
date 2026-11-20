@@ -107,6 +107,8 @@ public:
     void Send(const TnsPacket &packet);
     void Send(const std::vector<TnsPacket> &packets);
     TnsPacket Receive();
+    // A TCP urgent byte on the underlying stream, outside the packet framing.
+    void SendUrgent(uint8_t value);
 
     //! What has crossed the connection so far, packet headers included. A round
     //! trip is a request after which a response was read.

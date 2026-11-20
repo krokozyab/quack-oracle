@@ -75,6 +75,10 @@ void TnsPacketStream::Send(const std::vector<TnsPacket> &packets) {
     awaiting_response = true;
 }
 
+void TnsPacketStream::SendUrgent(uint8_t value) {
+    stream.SendUrgent(value);
+}
+
 TnsPacket TnsPacketStream::Receive() {
     std::vector<uint8_t> wire(TNS_PACKET_HEADER_SIZE);
     ReadExact(stream, wire.data(), wire.size());

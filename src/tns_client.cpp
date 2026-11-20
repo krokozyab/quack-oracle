@@ -648,9 +648,9 @@ private:
 TnsClientConnection::TnsClientConnection(std::unique_ptr<ByteStream> stream_p, uint16_t negotiated_sdu_p,
                                          std::string connect_descriptor_p, std::string auth_connect_string_p,
                                          OracleClientIdentity client_identity_p, bool cancellation_supported,
-                                         bool end_of_response_negotiated_p)
+                                         bool end_of_response_negotiated_p, bool oob_probed)
     : stream(std::move(stream_p)), packets(std::make_unique<TnsPacketStream>(*stream, true, negotiated_sdu_p)),
-      ttc(std::make_unique<TtcChannel>(*packets, negotiated_sdu_p, 16U << 20U, cancellation_supported)),
+      ttc(std::make_unique<TtcChannel>(*packets, negotiated_sdu_p, 16U << 20U, cancellation_supported, oob_probed)),
       negotiated_sdu(negotiated_sdu_p), end_of_response_negotiated(end_of_response_negotiated_p),
       connect_descriptor(std::move(connect_descriptor_p)), auth_connect_string(std::move(auth_connect_string_p)),
       client_identity(std::move(client_identity_p)) {
@@ -685,7 +685,8 @@ std::unique_ptr<TnsClientConnection> TnsClientConnection::Connect(const Connecti
     auto connection = std::unique_ptr<TnsClientConnection>(new TnsClientConnection(
         std::move(accepted.stream), accepted.result.negotiated_sdu, accepted.descriptor,
         BuildAuthConnectString(effective_config, accepted.original),
-        CurrentOracleClientIdentity(effective_config.client_program), !uses_tls, accepted.result.end_of_response));
+        CurrentOracleClientIdentity(effective_config.client_program), !uses_tls, accepted.result.end_of_response,
+        accepted.result.check_oob));
     // The connect budget and cancellation keep holding through TTC negotiation
     // and O5LOGON, and are lifted when authentication completes.
     connection->end_establishment = [establishment] { establishment->Disarm(); };

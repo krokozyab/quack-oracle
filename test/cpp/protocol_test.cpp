@@ -890,6 +890,56 @@ static void TestTtcCancellation() {
     ExpectError(ProtocolErrorKind::UNSUPPORTED, [&] { tcps_channel.Cancel(); });
 }
 
+// Records each urgent byte with the number of bytes written before it.
+class UrgentRecordingStream : public FragmentedStream {
+public:
+    using FragmentedStream::FragmentedStream;
+    void SendUrgent(uint8_t value) override {
+        urgent.push_back({value, output.size()});
+    }
+    std::vector<std::pair<uint8_t, size_t>> urgent;
+};
+
+// While out-of-band breaks are in effect (the CHECK_OOB probe ran and the
+// server did not acknowledge it), Cancel sends a TCP urgent byte instead of the
+// in-band INTERRUPT marker. Seen live: a 19c server ignored the marker for the
+// whole of a 15 s call, and python-oracledb Thin cancels the same call with the
+// urgent byte in about a second; the server's RESET follows as before. A server
+// that acknowledged the probe still gets the in-band marker.
+static void TestTtcCancellationWithOobBreaks() {
+    std::vector<uint8_t> inbound = EncodeTnsPacket(TnsPacketType::MARKER, 0x20, {0x01, 0x00, 0x02}, true);
+    const auto terminal = EncodeTnsDataPackets({29}, true, 64);
+    inbound.insert(inbound.end(), terminal.front().begin(), terminal.front().end());
+    UrgentRecordingStream stream(inbound, 2);
+    TnsPacketStream packets(stream, true, 64);
+    TtcChannel channel(packets, 64, 128, true, true);
+    channel.Cancel();
+    CHECK(stream.urgent.size() == 1 && stream.urgent[0].first == 0x21 && stream.urgent[0].second == 0);
+    CHECK(channel.Receive() == std::vector<uint8_t>({29}));
+    // Nothing was written but the RESET that answers the server's.
+    FragmentedStream outbound(stream.output, 3);
+    TnsPacketStream outbound_packets(outbound, true, 64);
+    const auto reset = outbound_packets.Receive();
+    CHECK(reset.type == TnsPacketType::MARKER && reset.payload == std::vector<uint8_t>({0x01, 0x00, 0x02}));
+    CHECK(outbound.read_offset == outbound.input.size());
+
+    const std::vector<uint8_t> message {1, 6, 0, 'o', 'k', 0};
+    std::vector<uint8_t> acknowledged = EncodeTnsPacket(TnsPacketType::CONTROL, 0x20, {0x00, 0x09}, true);
+    for (const auto &packet : EncodeTnsDataPackets(message, true, 64, 0)) {
+        acknowledged.insert(acknowledged.end(), packet.begin(), packet.end());
+    }
+    UrgentRecordingStream acknowledged_stream(acknowledged, 2);
+    TnsPacketStream acknowledged_packets(acknowledged_stream, true, 64);
+    TtcChannel acknowledged_channel(acknowledged_packets, 64, 128, true, true);
+    CHECK(acknowledged_channel.Receive() == message);
+    acknowledged_channel.Cancel();
+    CHECK(acknowledged_stream.urgent.empty());
+    FragmentedStream sent(acknowledged_stream.output, 3);
+    TnsPacketStream sent_packets(sent, true, 64);
+    const auto interrupt = sent_packets.Receive();
+    CHECK(interrupt.type == TnsPacketType::MARKER && interrupt.payload == std::vector<uint8_t>({0x01, 0x00, 0x03}));
+}
+
 static void TestTtcErrorDiagnostics() {
     const std::vector<uint8_t> response = {TTC_MESSAGE_ERROR, 0, 1, 'O', 'R', 'A', '-', '0', '1', '0', '1', '7',
                                            ':', ' ', 'i', 'n', 'v', 'a', 'l', 'i', 'd', ' ', 'l', 'o', 'g', 'o', 'n'};
@@ -9749,6 +9799,7 @@ int main() {
     TestSinkValueFailureDoesNotRequestAnotherFragment();
     TestStatementChannelJoinsFragmentedExecuteResponse();
     TestTtcCancellation();
+    TestTtcCancellationWithOobBreaks();
     TestTtcErrorDiagnostics();
     TestTtcParameters();
     TestTtcAuthEncoding();
