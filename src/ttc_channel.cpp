@@ -167,7 +167,6 @@ void TtcChannel::Send(const std::vector<uint8_t> &request) {
 std::vector<uint8_t> TtcChannel::Receive() {
     size_t reset_count = 0;
     size_t empty_fragment_count = 0;
-    size_t control_count = 0;
     while (true) {
         const auto packet = packets.Receive();
         if (packet.type == TnsPacketType::CONTROL) {
@@ -175,11 +174,13 @@ std::vector<uint8_t> TtcChannel::Receive() {
             // one (see RunCheckOobProbe). Its two-byte body differs between
             // versions and its header flags can carry a redirect bit, so only its
             // type and width are checked. Such a server takes in-band interrupts.
-            if (packet.payload.size() != 2 || ++control_count > 1) {
+            // It comes once, ahead of the first TTC response, and only there.
+            if (packet.payload.size() != 2 || oob_acknowledged || first_response_received) {
                 throw ProtocolError(ProtocolErrorKind::MALFORMED,
                                     "Oracle sent an unexpected TNS CONTROL packet (payload bytes " +
                                         std::to_string(packet.payload.size()) + ")");
             }
+            oob_acknowledged = true;
             oob_breaks = false;
             continue;
         }
@@ -211,6 +212,7 @@ std::vector<uint8_t> TtcChannel::Receive() {
             if (complete->empty()) {
                 throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle sent an empty TTC message");
             }
+            first_response_received = true;
             return std::move(*complete);
         }
         // A non-final DATA fragment containing only flags cannot complete a
@@ -228,6 +230,7 @@ std::vector<uint8_t> TtcChannel::Receive() {
         // without END_OF_RESPONSE. A short packet cannot be an SDU-sized
         // continuation, so its TNS boundary completes this bootstrap message.
         if (packet.type == TnsPacketType::DATA && packet.payload.size() + TNS_PACKET_HEADER_SIZE < negotiated_sdu) {
+            first_response_received = true;
             return assembler.TakeBuffered();
         }
     }

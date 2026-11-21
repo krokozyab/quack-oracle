@@ -940,6 +940,30 @@ static void TestTtcCancellationWithOobBreaks() {
     CHECK(interrupt.type == TnsPacketType::MARKER && interrupt.payload == std::vector<uint8_t>({0x01, 0x00, 0x03}));
 }
 
+// The CHECK_OOB acknowledgement belongs ahead of the first TTC response. A
+// two-byte CONTROL packet later in the session is refused, and the
+// out-of-band breaks it would have switched off stay in effect.
+static void TestTtcChannelRefusesLateOobAcknowledgement() {
+    const std::vector<uint8_t> message {1, 6, 0, 'o', 'k', 0};
+    std::vector<uint8_t> inbound;
+    const auto append_message = [&] {
+        for (const auto &packet : EncodeTnsDataPackets(message, true, 64, 0)) {
+            inbound.insert(inbound.end(), packet.begin(), packet.end());
+        }
+    };
+    append_message();
+    const auto control = EncodeTnsPacket(TnsPacketType::CONTROL, 0x20, {0x00, 0x09}, true);
+    inbound.insert(inbound.end(), control.begin(), control.end());
+    append_message();
+    UrgentRecordingStream stream(inbound, 2);
+    TnsPacketStream packets(stream, true, 64);
+    TtcChannel channel(packets, 64, 128, true, true);
+    CHECK(channel.Receive() == message);
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)channel.Receive(); });
+    channel.Cancel();
+    CHECK(stream.urgent.size() == 1 && stream.urgent[0].first == 0x21);
+}
+
 static void TestTtcErrorDiagnostics() {
     const std::vector<uint8_t> response = {TTC_MESSAGE_ERROR, 0, 1, 'O', 'R', 'A', '-', '0', '1', '0', '1', '7',
                                            ':', ' ', 'i', 'n', 'v', 'a', 'l', 'i', 'd', ' ', 'l', 'o', 'g', 'o', 'n'};
@@ -9800,6 +9824,7 @@ int main() {
     TestStatementChannelJoinsFragmentedExecuteResponse();
     TestTtcCancellation();
     TestTtcCancellationWithOobBreaks();
+    TestTtcChannelRefusesLateOobAcknowledgement();
     TestTtcErrorDiagnostics();
     TestTtcParameters();
     TestTtcAuthEncoding();
