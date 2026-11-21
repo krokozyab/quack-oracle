@@ -67,6 +67,9 @@ private:
     uint8_t wire_field_version = 0;
     bool cancellation_supported;
     std::atomic<bool> oob_breaks;
+    // Receive's own state, like the assembler: one caller at a time, under the call lock.
+    bool oob_acknowledged = false;
+    bool first_response_received = false;
     std::atomic<bool> cancellation_requested {false};
     std::mutex outbound_mutex;
     std::recursive_mutex call_mutex;
