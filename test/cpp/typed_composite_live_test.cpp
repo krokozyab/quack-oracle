@@ -36,7 +36,7 @@ std::string Env(const char *name) {
     return value;
 }
 
-std::string Literal(const std::string &value) {
+std::string SqlLiteral(const std::string &value) {
     std::string result = "'";
     for (const auto c : value) {
         result += c == '\'' ? "''" : std::string(1, c);
@@ -102,8 +102,8 @@ std::string Refused(Connection &con, const std::string &sql, const std::string &
 }
 
 std::string Secret(const std::string &user, const std::string &password, int read_timeout = 60) {
-    return "TYPE oracle, HOST " + Literal(Env("ORA19C_HOST")) + ", PORT " + Env("ORA19C_PORT") + ", SERVICE_NAME " +
-           Literal(Env("ORA19C_SERVICE")) + ", USER " + Literal(user) + ", PASSWORD " + Literal(password) +
+    return "TYPE oracle, HOST " + SqlLiteral(Env("ORA19C_HOST")) + ", PORT " + Env("ORA19C_PORT") + ", SERVICE_NAME " +
+           SqlLiteral(Env("ORA19C_SERVICE")) + ", USER " + SqlLiteral(user) + ", PASSWORD " + SqlLiteral(password) +
            ", CONNECT_TIMEOUT 5, READ_TIMEOUT " + std::to_string(read_timeout);
 }
 

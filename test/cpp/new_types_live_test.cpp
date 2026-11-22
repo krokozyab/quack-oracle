@@ -37,7 +37,7 @@ std::string Env(const char *name) {
     return value;
 }
 
-std::string Literal(const std::string &value) {
+std::string SqlLiteral(const std::string &value) {
     std::string result = "'";
     for (const auto c : value) {
         result += c == '\'' ? "''" : std::string(1, c);
@@ -94,8 +94,8 @@ std::string Scalar(Connection &con, const std::string &sql, const std::string &s
 }
 
 std::string Secret(const std::string &user, const std::string &password) {
-    return "TYPE oracle, HOST " + Literal(Env("ORA19C_HOST")) + ", PORT " + Env("ORA19C_PORT") + ", SERVICE_NAME " +
-           Literal(Env("ORA19C_SERVICE")) + ", USER " + Literal(user) + ", PASSWORD " + Literal(password) +
+    return "TYPE oracle, HOST " + SqlLiteral(Env("ORA19C_HOST")) + ", PORT " + Env("ORA19C_PORT") + ", SERVICE_NAME " +
+           SqlLiteral(Env("ORA19C_SERVICE")) + ", USER " + SqlLiteral(user) + ", PASSWORD " + SqlLiteral(password) +
            ", CONNECT_TIMEOUT 5, READ_TIMEOUT 60";
 }
 
@@ -173,7 +173,7 @@ int main() {
         Run(admin, "CREATE SECRET rt (" + Secret(user, password) + ");", "runtime secret");
         Run(admin, "ATTACH 'rt' AS raw (TYPE oracle_scanner);", "attach");
         const auto dml = [&](const std::string &sql, const std::string &stage) {
-            Run(admin, "SELECT * FROM oracle_execute_transaction('raw', " + Literal(sql) + ");", stage);
+            Run(admin, "SELECT * FROM oracle_execute_transaction('raw', " + SqlLiteral(sql) + ");", stage);
         };
 
         // NCHAR and NVARCHAR2: ASCII, Latin-1, Cyrillic, CJK, and a character

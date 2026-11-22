@@ -34,7 +34,7 @@ std::string Env(const char *name) {
     return value;
 }
 
-std::string Literal(const std::string &value) {
+std::string SqlLiteral(const std::string &value) {
     std::string result = "'";
     for (const auto c : value) {
         result += c == '\'' ? "''" : std::string(1, c);
@@ -87,8 +87,8 @@ std::string Scalar(Connection &con, const std::string &sql, const std::string &s
 }
 
 std::string Connection_(const std::string &user, const std::string &password) {
-    return "TYPE oracle, HOST " + Literal(Env("ORA19C_HOST")) + ", PORT " + Env("ORA19C_PORT") + ", SERVICE_NAME " +
-           Literal(Env("ORA19C_SERVICE")) + ", USER " + Literal(user) + ", PASSWORD " + Literal(password) +
+    return "TYPE oracle, HOST " + SqlLiteral(Env("ORA19C_HOST")) + ", PORT " + Env("ORA19C_PORT") + ", SERVICE_NAME " +
+           SqlLiteral(Env("ORA19C_SERVICE")) + ", USER " + SqlLiteral(user) + ", PASSWORD " + SqlLiteral(password) +
            ", CONNECT_TIMEOUT 5, READ_TIMEOUT 60";
 }
 
@@ -101,7 +101,7 @@ struct Identity {
 Identity Who(DuckDB &db, const std::string &catalog, const std::string &stage) {
     Connection con(db);
     auto result = Run(con,
-                      "SELECT * FROM oracle_query_transaction(" + Literal(catalog) +
+                      "SELECT * FROM oracle_query_transaction(" + SqlLiteral(catalog) +
                           ", 'SELECT SYS_CONTEXT(''USERENV'',''SESSIONID'') AS ID, "
                           "SYS_CONTEXT(''USERENV'',''SID'') AS SID, USER AS U FROM DUAL');",
                       stage);
@@ -158,7 +158,7 @@ struct JoinedThread {
 
 std::string Items(DuckDB &db, const std::string &catalog, const std::string &stage) {
     Connection con(db);
-    return Scalar(con, "SELECT * FROM oracle_query_transaction(" + Literal(catalog) +
+    return Scalar(con, "SELECT * FROM oracle_query_transaction(" + SqlLiteral(catalog) +
                            ", 'SELECT COUNT(*) || '':'' || NVL(SUM(N), 0) AS S FROM ITEMS');",
                   stage);
 }

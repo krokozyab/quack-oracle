@@ -19,7 +19,7 @@ static std::string Env(const char *name) {
     return value;
 }
 
-static std::string Literal(const std::string &value) {
+static std::string SqlLiteral(const std::string &value) {
     std::string result = "'";
     for (const auto c : value) {
         result += c == '\'' ? "''" : std::string(1, c);
@@ -58,7 +58,7 @@ static unique_ptr<QueryResult> Run(Connection &con, const std::string &sql, cons
 }
 
 static std::string Scalar(Connection &con, const std::string &sql, const std::string &stage) {
-    auto result = Run(con, "SELECT * FROM oracle_query_transaction('tx', " + Literal(sql) + ");", stage);
+    auto result = Run(con, "SELECT * FROM oracle_query_transaction('tx', " + SqlLiteral(sql) + ");", stage);
     if (result->RowCount() != 1) {
         Failure(stage, "unexpected row count");
     }
@@ -72,24 +72,24 @@ static void Count(Connection &con, const std::string &expected, const std::strin
 }
 
 static void Dml(Connection &con, const std::string &sql, const std::string &stage) {
-    Run(con, "SELECT * FROM oracle_execute_transaction('tx', " + Literal(sql) + ");", stage);
+    Run(con, "SELECT * FROM oracle_execute_transaction('tx', " + SqlLiteral(sql) + ");", stage);
 }
 
 static std::string ConnectionOptions() {
         std::string connection;
         if (std::getenv("ODL_WALLET")) {
-            connection = "TNS_ALIAS " + Literal(Env("ODL_ALIAS")) + ", PROTOCOL 'tcps', WALLET_FILE " +
-                         Literal(Env("ODL_WALLET")) + ", TLS_SERVER_NAME " + Literal(Env("ODL_TLS_SERVER_NAME"));
+            connection = "TNS_ALIAS " + SqlLiteral(Env("ODL_ALIAS")) + ", PROTOCOL 'tcps', WALLET_FILE " +
+                         SqlLiteral(Env("ODL_WALLET")) + ", TLS_SERVER_NAME " + SqlLiteral(Env("ODL_TLS_SERVER_NAME"));
         } else {
-            connection = "HOST " + Literal(Env("ODL_HOST")) + ", PORT " + Env("ODL_PORT") +
-                         ", SERVICE_NAME " + Literal(Env("ODL_SERVICE"));
+            connection = "HOST " + SqlLiteral(Env("ODL_HOST")) + ", PORT " + Env("ODL_PORT") +
+                         ", SERVICE_NAME " + SqlLiteral(Env("ODL_SERVICE"));
         }
         return connection;
 }
 
 static void Configure(Connection &con, const std::string &user, const std::string &password) {
-    Run(con, "CREATE SECRET live (TYPE oracle, " + ConnectionOptions() + ", USER " + Literal(user) +
-             ", PASSWORD " + Literal(password) + ", CONNECT_TIMEOUT 5, READ_TIMEOUT 10);", "create_secret");
+    Run(con, "CREATE SECRET live (TYPE oracle, " + ConnectionOptions() + ", USER " + SqlLiteral(user) +
+             ", PASSWORD " + SqlLiteral(password) + ", CONNECT_TIMEOUT 5, READ_TIMEOUT 10);", "create_secret");
 }
 
 static void TransactionChecks(DuckDB &db, Connection &con) {
@@ -205,7 +205,7 @@ static void TransactionChecks(DuckDB &db, Connection &con) {
 }
 
 static void Admin(Connection &con, const std::string &sql, const std::string &stage) {
-    Run(con, "SELECT * FROM oracle_execute_admin('live', " + Literal(sql) + ");", stage);
+    Run(con, "SELECT * FROM oracle_execute_admin('live', " + SqlLiteral(sql) + ");", stage);
 }
 
 static void ATPChecks(Connection &admin) {
