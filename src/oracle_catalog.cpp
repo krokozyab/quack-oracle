@@ -3139,6 +3139,9 @@ void RegisterOracleAttachedCatalog(ExtensionLoader &loader) {
         },
         nullptr, nullptr, nullptr, LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
     loader.RegisterFunction(default_marker);
+    // In the catalog only so a plan that carries it can be read back by name
+    // (DuckDB's debug build round-trips every plan); the optimizer places it.
+    loader.RegisterFunction(OracleFinalizeAverageFunction());
     RegisterOracleOptimizer(loader.GetDatabaseInstance());
     // On by default. Once a filter is handed to a scan DuckDB removes it from
     // the plan, so the scan must apply it exactly: the filters this translator

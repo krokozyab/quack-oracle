@@ -634,6 +634,9 @@ struct OracleScanOpening {
 };
 //! Installs the plan rewrites for attached tables (src/oracle_optimizer.cpp).
 void RegisterOracleOptimizer(DatabaseInstance &db);
+//! The finalizer of an AVG computed from an Oracle SUM and COUNT. Registered so
+//! a plan holding it can be deserialized; only the optimizer places it.
+ScalarFunction OracleFinalizeAverageFunction();
 std::string OracleTopNClause(const OracleQueryBindData &bind);
 unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context, OracleQueryBindData &bind,
                                                          TableFunctionInitInput &input);

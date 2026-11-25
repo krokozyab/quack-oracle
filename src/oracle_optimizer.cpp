@@ -531,14 +531,8 @@ void PushAggregate(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &
                 LogicalType::BIGINT, ColumnBinding(get_index, ProjectionIndex(++index))));
             arguments.push_back(make_uniq<BoundConstantExpression>(Value::DOUBLE(average->second.first)));
             arguments.push_back(make_uniq<BoundConstantExpression>(Value::BOOLEAN(average->second.second)));
-            ScalarFunction function(
-                "oracle_finalize_average",
-                {LogicalType::HUGEINT, LogicalType::BIGINT, LogicalType::DOUBLE, LogicalType::BOOLEAN},
-                LogicalType::DOUBLE, FinalizeOracleAverage);
-            function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-            function.SetFallible();
-            reference =
-                make_uniq<BoundFunctionExpression>(BoundScalarFunction(function), std::move(arguments), nullptr);
+            reference = make_uniq<BoundFunctionExpression>(BoundScalarFunction(OracleFinalizeAverageFunction()),
+                                                           std::move(arguments), nullptr);
         }
         select.push_back(std::move(reference));
     }
@@ -1307,6 +1301,15 @@ void OptimizeOraclePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperat
 }
 
 } // namespace
+
+ScalarFunction OracleFinalizeAverageFunction() {
+    ScalarFunction function(Identifier("__oracle_scanner_finalize_average"),
+                            {LogicalType::HUGEINT, LogicalType::BIGINT, LogicalType::DOUBLE, LogicalType::BOOLEAN},
+                            LogicalType::DOUBLE, FinalizeOracleAverage);
+    function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+    function.SetFallible();
+    return function;
+}
 
 static OracleTopNMode ParseOracleTopNMode(const Value &value) {
     const auto mode = StringUtil::Lower(value.ToString());
