@@ -6940,6 +6940,39 @@ static void TestSessionPool() {
         lease.Poison();
     }
     CHECK(first->closes == 1 && pool.IdleCount() == 0 && pool.LiveCount() == 0);
+
+    // A session idle past probe_after answers the probe before it is leased;
+    // one that fails is closed and replaced, and one back sooner is not probed.
+    auto now = std::chrono::steady_clock::time_point {};
+    size_t probes = 0;
+    bool alive = true;
+    std::vector<std::shared_ptr<TestSession>> opened;
+    OracleSessionPool probed(
+        1,
+        [&] {
+            opened.push_back(std::make_shared<TestSession>());
+            return std::static_pointer_cast<OracleSession>(opened.back());
+        },
+        [&](OracleSession &) {
+            probes++;
+            if (!alive) {
+                throw ProtocolError(ProtocolErrorKind::TRUNCATED, "connection closed");
+            }
+        },
+        std::chrono::seconds(30), [&] { return now; });
+    { auto lease = probed.Acquire(); }
+    { auto lease = probed.Acquire(); }
+    CHECK(opened.size() == 1 && probes == 0);
+    now += std::chrono::seconds(31);
+    { auto lease = probed.Acquire(); }
+    CHECK(opened.size() == 1 && probes == 1);
+    now += std::chrono::seconds(31);
+    alive = false;
+    {
+        auto lease = probed.Acquire();
+        CHECK(&lease.Get() == opened.back().get());
+    }
+    CHECK(probes == 2 && opened.size() == 2 && opened[0]->closes == 1 && probed.LiveCount() == 1);
 }
 
 static void TestAuthCrypto() {

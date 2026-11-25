@@ -18,6 +18,7 @@
 
 #include "oracle_scanner/session_factory.hpp"
 #include "oracle_scanner/session_pool.hpp"
+#include "oracle_scanner/transaction_session_pool.hpp"
 
 #include <functional>
 #include <memory>
@@ -62,9 +63,12 @@ struct OraclePoolState final : ClientContextState {
         if (existing != pools.end()) {
             return *existing->second;
         }
-        auto pool = std::make_unique<OracleSessionPool>(maximum_sessions, [config, password]() {
-            return std::shared_ptr<OracleSession>(oracle_scanner::OpenOracleSession(config, password));
-        });
+        auto pool = std::make_unique<OracleSessionPool>(
+            maximum_sessions,
+            [config, password]() {
+                return std::shared_ptr<OracleSession>(oracle_scanner::OpenOracleSession(config, password));
+            },
+            oracle_scanner::OracleTransactionSessionPool::SelectFromDual);
         auto &reference = *pool;
         pools.emplace(key, std::move(pool));
         return reference;

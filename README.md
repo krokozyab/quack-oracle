@@ -936,7 +936,10 @@ the table does not need a primary key. The scan that finds them reads them
 `FOR UPDATE` on the transaction's session, so they stay locked until it commits or
 rolls back: a change another session commits meanwhile is waited for and then read,
 not overwritten, and a row it changes so that it no longer matches is left alone.
-Rows DuckDB reads and then filters out itself stay locked too.
+Rows DuckDB reads and then filters out itself stay locked too: a condition Oracle
+cannot be given (`LIKE`, a function call) reads the whole table `FOR UPDATE`, so
+other sessions wait on every row until you commit. Keep such updates in short
+transactions, or send the statement itself with `oracle_execute`.
 
 `UPDATE ... RETURNING` gives the rows as Oracle stored them after the change, and
 `DELETE ... RETURNING` the rows as they were when it deleted them:
@@ -1598,7 +1601,7 @@ response exceeding that count is rejected.
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| `oracle_session_pool_size` | `4` | How many authenticated Oracle sessions to keep and reuse for reads, per DuckDB connection per secret. `0` opens a fresh one every time. |
+| `oracle_session_pool_size` | `4` | How many authenticated Oracle sessions to keep and reuse for reads, per DuckDB connection per secret. A session idle for 30 seconds or more answers `SELECT 1 FROM DUAL` before it is reused, and is replaced if the server or a firewall closed it. `0` opens a fresh one every time. |
 | `oracle_statement_cache` | `true` | Reuse up to 20 fully fetched scalar query cursors per native session, within a 2 MiB accounting budget. False releases idle cursors and restores parse/describe on each execution. |
 | `oracle_transaction_pool_size` | `2` | How many idle sessions an attached catalog keeps between its transactions, so the next transaction need not connect and authenticate. Read at `ATTACH`; `0` opens a session per transaction. |
 | `oracle_unconstrained_number` | `'varchar'` | What a `NUMBER` with no declared precision becomes: `'varchar'`, `'double'` or `'decimal(38,9)'`-style. Set it before the query or the table's first use. See [section 9](#9-which-oracle-types-work). |

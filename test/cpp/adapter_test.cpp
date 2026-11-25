@@ -1893,6 +1893,8 @@ void TestWriteBindsFollowTheOracleColumnType() {
     CHECK(bind_for(number_column, duckdb::Value("12.34")).value == number_bind.value);
     unsupported(number_column, duckdb::Value::DOUBLE(1.5), "not exact");
     unconvertible(number_column, duckdb::Value("twelve"), "invalid character in Oracle NUMBER text");
+    // Text for a TIMESTAMP is wall time; an offset in it is refused, not dropped.
+    unconvertible(Column("AT", 180), duckdb::Value("2024-03-01 10:00:00+05:00"), "without a time zone");
 
     // Oracle stores an empty string as NULL and this client reads one back as
     // NULL, so binding it says the same thing rather than leaving it to the
@@ -2223,6 +2225,16 @@ void TestAutomaticCallBindsFromTheSignature() {
     // several.
     CHECK(wrong_arity->GetError().find("takes 3 arguments, not 1") != std::string::npos);
     CHECK(script->calls.size() == 1);
+
+    // A procedure with no arguments has no ALL_ARGUMENTS row; ALL_PROCEDURES
+    // answers for it with a row that carries no position, and it is callable.
+    WireRow no_arguments {Text("APP"), Text("PKG"), Text("RESET"), WireValue(), WireValue(),
+                          WireValue(), WireValue(), WireValue(), Number("0")};
+    script->rows = {no_arguments};
+    script->call_outputs.clear();
+    CHECK(!database.Query("SELECT * FROM oracle_call_auto('ora', 'pkg.reset', []::VARCHAR[]);")->HasError());
+    CHECK(script->calls.size() == 2 && script->calls[1].arguments.empty());
+    CHECK(script->calls[1].qualified_name == "\"APP\".\"PKG\".\"RESET\"");
 
     std::cout << "automatic calls bind from the resolved signature" << std::endl;
 }
@@ -5073,6 +5085,18 @@ void TestCallableArgumentsOfTheNewTypes() {
     // A local-zone value is bound as the TIMESTAMP of its UTC wall time.
     const auto local_zone = encode("timestamp_ltz", "2024-03-01 10:00:00+02");
     CHECK(local_zone.oracle_type == 180 && local_zone.value && local_zone.value->size() == 11);
+    // A plain TIMESTAMP is wall time: an offset or zone in the text is refused,
+    // not dropped from it.
+    CHECK(encode("timestamp", "2024-03-01 10:00:00").value);
+    for (const auto *zoned : {"2024-03-01 10:00:00+05:00", "2024-03-01 10:00:00 America/New_York"}) {
+        bool zone_refused = false;
+        try {
+            encode("timestamp", zoned);
+        } catch (const duckdb::BinderException &) {
+            zone_refused = true;
+        }
+        CHECK(zone_refused);
+    }
     const auto null_out = duckdb::EncodeOracleCallableArgument("nvarchar", BindDirection::BIND_OUT, duckdb::Value(),
                                                                "P", "test");
     CHECK(!null_out.value && null_out.character_set_form == 2);

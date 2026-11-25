@@ -58,23 +58,25 @@ void OracleSessionLease::Release() noexcept {
     poisoned = false;
 }
 
-OracleSessionPool::OracleSessionPool(size_t maximum_sessions_p, Factory factory_p)
-    : maximum_sessions(maximum_sessions_p), factory(std::move(factory_p)) {
-    if (maximum_sessions == 0 || !factory) {
+OracleSessionPool::OracleSessionPool(size_t maximum_sessions_p, Factory factory_p, Probe probe_p,
+                                     std::chrono::steady_clock::duration probe_after_p, Clock clock_p)
+    : maximum_sessions(maximum_sessions_p), factory(std::move(factory_p)), probe(std::move(probe_p)),
+      probe_after(probe_after_p), clock(std::move(clock_p)) {
+    if (maximum_sessions == 0 || !factory || !clock) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "Oracle session pool configuration is invalid");
     }
 }
 
 OracleSessionPool::~OracleSessionPool() {
-    std::vector<std::shared_ptr<OracleSession>> sessions;
+    std::vector<Idle> sessions;
     {
         std::lock_guard<std::mutex> guard(mutex);
         sessions.swap(idle);
         live_sessions -= sessions.size();
     }
-    for (auto &session : sessions) {
+    for (auto &entry : sessions) {
         try {
-            session->Close();
+            entry.session->Close();
         } catch (...) {
         }
     }
@@ -82,17 +84,38 @@ OracleSessionPool::~OracleSessionPool() {
 
 OracleSessionLease OracleSessionPool::Acquire() {
     std::shared_ptr<OracleSession> result;
-    {
-        std::lock_guard<std::mutex> guard(mutex);
-        if (!idle.empty()) {
-            result = std::move(idle.back());
-            idle.pop_back();
-        } else {
-            if (live_sessions == maximum_sessions) {
-                throw OracleSessionPoolExhausted();
+    for (;;) {
+        bool stale = false;
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            if (!idle.empty()) {
+                // The most recently returned: the least likely to have died idle.
+                result = std::move(idle.back().session);
+                stale = clock() - idle.back().since >= probe_after;
+                idle.pop_back();
+            } else {
+                if (live_sessions == maximum_sessions) {
+                    throw OracleSessionPoolExhausted();
+                }
+                live_sessions++;
             }
-            live_sessions++;
         }
+        if (!result || !stale || !probe) {
+            break;
+        }
+        try {
+            probe(*result);
+            break;
+        } catch (...) {
+        }
+        // Dead while it waited; nothing of the caller's has been sent on it.
+        try {
+            result->Close();
+        } catch (...) {
+        }
+        result.reset();
+        std::lock_guard<std::mutex> guard(mutex);
+        live_sessions--;
     }
     if (!result) {
         try {
@@ -124,8 +147,9 @@ void OracleSessionPool::Release(std::shared_ptr<OracleSession> session, bool poi
         live_sessions--;
         return;
     }
+    const auto now = clock();
     std::lock_guard<std::mutex> guard(mutex);
-    idle.push_back(std::move(session));
+    idle.push_back({std::move(session), now});
 }
 
 size_t OracleSessionPool::IdleCount() const {
