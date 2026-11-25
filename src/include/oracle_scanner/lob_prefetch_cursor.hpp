@@ -13,8 +13,11 @@ struct OracleLobPrefetchLimits {
     uint32_t prefix_units = 4096;
     size_t maximum_content_bytes = (std::numeric_limits<size_t>::max)() / 2;
     size_t maximum_row_bytes = 1U << 20U;
-    size_t maximum_batch_bytes = 4U << 20U;
-    uint32_t maximum_rows = 128;
+    // Rows at their declared widths, so the bound is the worst case. 4 MiB and
+    // 128 rows held a 50-column scan to about 60 rows a round trip; 48 MiB stays
+    // under the 64 MiB response limit, and 2048 is what a scan asks for.
+    size_t maximum_batch_bytes = 48U << 20U;
+    uint32_t maximum_rows = 2048;
 };
 
 inline bool SupportsLobPrefetchColumns(const std::vector<OracleColumn> &columns, uint8_t field_version) {
@@ -37,7 +40,7 @@ inline uint32_t BoundedLobPrefetchRows(const std::vector<OracleColumn> &columns,
     if (!SupportsLobPrefetchColumns(columns,12) || desired == 0 || limits.prefix_units > 32768 ||
         limits.maximum_content_bytes == 0 || limits.maximum_row_bytes == 0 ||
         limits.maximum_batch_bytes < limits.maximum_row_bytes || limits.maximum_rows == 0 ||
-        limits.maximum_rows > 128 || limits.maximum_batch_bytes > (64U << 20U)) {
+        limits.maximum_rows > 2048 || limits.maximum_batch_bytes > (64U << 20U)) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED,"invalid bounded LOB prefetch cursor profile");
     }
     size_t per_row = 0;

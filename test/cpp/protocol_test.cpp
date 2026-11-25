@@ -7514,16 +7514,16 @@ static void TestLobPrefetchScalarBudget() {
     OracleLobPrefetchLimits limits;
     std::vector<OracleColumn> columns(240, text);
     columns.push_back(lob);
-    CHECK(BoundedLobPrefetchRows(columns, 128, limits) == 4);
+    CHECK(BoundedLobPrefetchRows(columns, 2048, limits) == 51);
     columns.insert(columns.end(), 40, text);
     bool refused = false;
     try { BoundedLobPrefetchRows(columns, 2, limits); }
     catch (const ProtocolError &error) { refused = error.Kind() == ProtocolErrorKind::LIMIT_EXCEEDED; }
     CHECK(refused);
     text.byte_width = 0;
-    CHECK(BoundedLobPrefetchRows({lob, text}, 128, limits) == 29);
+    CHECK(BoundedLobPrefetchRows({lob, text}, 2048, limits) == 350);
     text.omitted_from_row_data = true;
-    CHECK(BoundedLobPrefetchRows({lob, text}, 128, limits) == 128);
+    CHECK(BoundedLobPrefetchRows({lob, text}, 4096, limits) == 2048);
     text.omitted_from_row_data = false;
     text.byte_width = (std::numeric_limits<uint32_t>::max)();
     refused = false;
