@@ -138,18 +138,24 @@ void OracleSessionPool::Release(std::shared_ptr<OracleSession> session, bool poi
     if (!session) {
         return;
     }
-    if (poisoned) {
+    if (!poisoned) {
         try {
-            session->Close();
+            const auto now = clock();
+            std::lock_guard<std::mutex> guard(mutex);
+            // The one step that can fail, taken before the session moves.
+            idle.reserve(idle.size() + 1);
+            idle.push_back({std::move(session), now});
+            return;
         } catch (...) {
+            // No room to keep it idle: it is closed below, as a poisoned one is.
         }
-        std::lock_guard<std::mutex> guard(mutex);
-        live_sessions--;
-        return;
     }
-    const auto now = clock();
+    try {
+        session->Close();
+    } catch (...) {
+    }
     std::lock_guard<std::mutex> guard(mutex);
-    idle.push_back({std::move(session), now});
+    live_sessions--;
 }
 
 size_t OracleSessionPool::IdleCount() const {

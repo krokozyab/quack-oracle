@@ -61,10 +61,12 @@ struct OraclePoolState final : ClientContextState {
         if (existing != pools.end()) {
             return *existing->second;
         }
+        // Shared, so copying the factory copies a pointer and cannot throw.
+        const auto login = std::make_shared<const std::pair<ConnectionConfig, std::string>>(config, password);
         auto pool = std::make_unique<OracleSessionPool>(
             maximum_sessions,
-            [config, password]() {
-                return std::shared_ptr<OracleSession>(oracle_scanner::OpenOracleSession(config, password));
+            [login]() {
+                return std::shared_ptr<OracleSession>(oracle_scanner::OpenOracleSession(login->first, login->second));
             },
             oracle_scanner::OracleTransactionSessionPool::SelectFromDual);
         auto &reference = *pool;
