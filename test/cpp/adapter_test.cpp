@@ -213,6 +213,9 @@ struct FakeScript {
     std::optional<oracle_scanner::ProtocolErrorKind> fetch_failure;
     std::string fetch_failure_message;
     bool batch_should_fail = false;
+    // Fail the ExecuteBatch with this 1-based number (0: none), counted in batches.
+    size_t batch_fail_at = 0;
+    size_t batches = 0;
     bool execute_should_fail = false;
     bool honor_connect_cancelled = false;
     bool commit_should_fail = false;
@@ -621,6 +624,12 @@ public:
         script->counted_executes.push_back(sql);
         script->write_sessions.push_back(session_id);
         script->batch_rows = rows;
+        if (script->batch_fail_at && ++script->batches == script->batch_fail_at) {
+            throw oracle_scanner::ProtocolError(oracle_scanner::ProtocolErrorKind::INVALID_STATE,
+                                                "ORA-00001: unique constraint violated", 1);
+        } else if (!script->batch_fail_at) {
+            ++script->batches;
+        }
         if (script->batch_should_fail) {
             throw oracle_scanner::ProtocolError(*script->fetch_failure, script->fetch_failure_message);
         }
@@ -5778,6 +5787,45 @@ void TestAttachedMergesRefuseUnsafeKeyEquality() {
     }
 }
 
+// An INSERT larger than one chunk goes to Oracle in several batches: every row
+// arrives, the count is the whole count, and a batch that fails after others
+// succeeded fails the statement and its transaction.
+void TestAttachedInsertSpansSeveralBatches() {
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+    script->routes.push_back({"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("ITEMS")}}}});
+    script->routes.push_back({"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}});
+    script->routes.push_back(
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {{Text("ITEMS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("N")},
+           {Text("ITEMS"), Text("LABEL"), Text("VARCHAR2"), Number("20"), WireValue(), WireValue(), Text("Y")}}}});
+    script->routes.push_back({"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}});
+    script->tables["ITEMS"] = {{Column("ID", 2, 10, 0), Column("LABEL", 1)}, {}};
+    script->affected_rows = 1;
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS ora (TYPE oracle_scanner); SET threads = 1;");
+    const std::string insert = "INSERT INTO ora.main.ITEMS SELECT i, 'x' FROM range(5000) t(i)";
+    const auto before = script->counted_executes.size();
+    auto inserted = database.Query(insert);
+    CHECK(!inserted->HasError() && inserted->GetValue(0, 0).ToString() == "5000");
+    CHECK(script->counted_executes.size() - before >= 3);
+
+    // The second batch fails after the first succeeded.
+    script->batch_fail_at = 2;
+    script->batches = 0;
+    database.Run("BEGIN;");
+    auto failed = database.Query(insert);
+    CHECK(failed->HasError() && failed->GetError().find("ORA-00001") != std::string::npos);
+    CHECK(database.Query("INSERT INTO ora.main.ITEMS VALUES (1, 'y')")->HasError());
+    database.Run("ROLLBACK;");
+    script->batch_fail_at = 0;
+    CHECK(!database.Query("INSERT INTO ora.main.ITEMS VALUES (1, 'y')")->HasError());
+    std::cout << "an INSERT spans several batches and fails on a failed one" << std::endl;
+}
+
 void TestAttachedWritesAgainstAFakeSession() {
     const auto text_columns = [](std::initializer_list<const char *> names) {
         std::vector<OracleColumn> result;
@@ -7880,6 +7928,7 @@ int main() {
     TestAttachedUpsertsUseOracleMerge();
     TestAttachedMergesRefuseUnsafeKeyEquality();
     TestAttachedWritesAgainstAFakeSession();
+    TestAttachedInsertSpansSeveralBatches();
     TestAttachedCatalogNamesTheNewTypes();
     TestInsertBindsMatchTheValuePath();
     TestAttachToAnotherSchema();
