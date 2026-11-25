@@ -4125,6 +4125,72 @@ void TestLargeScalarFetchKeepsRowsAndLocalFilters() {
 // not each ask Oracle, but they do not count toward the limit on schemas: past
 // 4096 of them a real schema still resolves.
 // Oracle refuses COUNT over a LONG column (ORA-00997), so DuckDB counts it.
+// Oracle dates before 1582-10-15 are Julian and have no year 0; DuckDB's are
+// proleptic Gregorian with astronomical years. A value read, written, bound or
+// compared crosses between the two at the same day.
+void TestOracleJulianDatesMeetDuckDBGregorianDates() {
+    // Oracle 19c's own day numbers, TO_CHAR(TO_DATE(d, 'YYYY-MM-DD BC'), 'J').
+    struct Day {
+        int32_t year, month, day;
+        int64_t oracle_day;
+    };
+    const std::vector<Day> days = {{2000, 1, 1, 2451545},  {1582, 10, 15, 2299161}, {1582, 10, 4, 2299160},
+                                   {1500, 2, 29, 2268992}, {1, 1, 1, 1721424},      {-1, 12, 31, 1721057},
+                                   {-1, 1, 1, 1720693},    {-2, 1, 1, 1720328},     {-4, 1, 1, 1719597},
+                                   {-5, 1, 1, 1719232},    {-101, 1, 1, 1684168},   {-1001, 1, 1, 1355443},
+                                   {-4708, 1, 1, 1461},    {-4711, 1, 1, 366},      {-4712, 12, 31, 365},
+                                   {-4712, 3, 1, 60},      {-4712, 2, 28, 59},      {-4712, 1, 1, 1}};
+    for (const auto &expected : days) {
+        duckdb::date_t date;
+        CHECK(duckdb::OracleCalendarToDate(expected.year, expected.month, expected.day, date));
+        CHECK(int64_t(date.days) + 2440588 == expected.oracle_day);
+        int32_t year;
+        int32_t month;
+        int32_t day;
+        duckdb::DateToOracleCalendar(date, year, month, day);
+        CHECK(year == expected.year && month == expected.month && day == expected.day);
+    }
+    duckdb::date_t refused;
+    CHECK(!duckdb::OracleCalendarToDate(1582, 10, 10, refused));
+    CHECK(!duckdb::OracleCalendarToDate(0, 6, 1, refused));
+    // Every Oracle day from its first to past the change comes back as itself.
+    duckdb::date_t first;
+    duckdb::date_t last;
+    CHECK(duckdb::OracleCalendarToDate(-4712, 1, 1, first) && duckdb::OracleCalendarToDate(1585, 1, 1, last));
+    for (auto day_number = first.days; day_number <= last.days; day_number++) {
+        int32_t year;
+        int32_t month;
+        int32_t day;
+        duckdb::DateToOracleCalendar(duckdb::date_t(day_number), year, month, day);
+        duckdb::date_t back;
+        if (year == 0) {
+            continue; // the 366 days between Oracle's 1 BC and AD 1
+        }
+        if (!duckdb::OracleCalendarToDate(year, month, day, back) || back.days != day_number) {
+            CHECK(false && "a day did not come back");
+            break;
+        }
+    }
+
+    // Read: the Julian leap day of 1500 is DuckDB's 1500-03-10.
+    oracle_scanner::OracleDateTime leap;
+    leap.year = 1500;
+    leap.month = 2;
+    leap.day = 29;
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {Column("D", 12)};
+    script->rows = {{oracle_scanner::EncodeOracleDate(leap)}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    auto read = database.Query("SELECT D FROM oracle_query('ora', 'SELECT d FROM t')");
+    CHECK(!read->HasError() && read->GetValue(0, 0).ToString() == "1500-03-10 00:00:00");
+    // Write: the same day goes back as Oracle's 1500-02-29.
+    const auto bind =
+        duckdb::OracleBindForColumn(duckdb::Value::DATE(duckdb::Date::FromDate(1500, 3, 10)), Column("D", 12), "1");
+    CHECK(bind.value == oracle_scanner::EncodeOracleDate(leap));
+    std::cout << "Oracle's Julian dates meet DuckDB's Gregorian ones at the same day" << std::endl;
+}
+
 void TestCountOfALongColumnStaysLocal() {
     auto script = std::make_shared<FakeScript>();
     script->routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
@@ -7834,6 +7900,7 @@ int main() {
     TestDirectConversionFailureKeepsSessionUsable();
     TestUnselectedLobKeepsLargeScalarFetches();
     TestWideDirectScanFallsBackBeforeFetching();
+    TestOracleJulianDatesMeetDuckDBGregorianDates();
     TestCountOfALongColumnStaysLocal();
     TestMissingSchemasDoNotExhaustTheSchemaLimit();
     TestNestedOracleJoinsAndAggregates();

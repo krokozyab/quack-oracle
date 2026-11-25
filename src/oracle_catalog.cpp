@@ -956,7 +956,10 @@ struct OracleAttachedState {
             if (column.oracle_type == 12 || column.oracle_type == 180) {
                 const auto value = column.oracle_type == 12 ? oracle_scanner::DecodeOracleDate(raw)
                                                             : oracle_scanner::DecodeOracleTimestamp(raw);
-                const auto day = Date::FromDate(value.year, value.month, value.day);
+                date_t day;
+                if (!OracleCalendarToDate(value.year, value.month, value.day, day)) {
+                    return std::nullopt;
+                }
                 return static_cast<double>(day.days) * 86400.0 + value.hour * 3600.0 + value.minute * 60.0 +
                        value.second + value.nanosecond / 1e9;
             }
@@ -2318,12 +2321,13 @@ MakeOracleTransactionPool(ClientContext &context, const ConnectionConfig &config
     }
     auto pooled = config;
     pooled.io_deadline = nullptr;
+    // Shared, so copying the opener copies a pointer and cannot throw.
+    const auto login = std::make_shared<const std::pair<ConnectionConfig, std::string>>(std::move(pooled), password);
     return std::make_shared<oracle_scanner::OracleTransactionSessionPool>(
-        static_cast<size_t>(size),
-        [pooled, password](std::shared_ptr<oracle_scanner::OracleIoDeadlineBinding> binding) {
-            auto opened = pooled;
+        static_cast<size_t>(size), [login](std::shared_ptr<oracle_scanner::OracleIoDeadlineBinding> binding) {
+            auto opened = login->first;
             opened.io_deadline_binding = std::move(binding);
-            return std::shared_ptr<OracleSession>(OpenOracleSession(opened, password));
+            return std::shared_ptr<OracleSession>(OpenOracleSession(opened, login->second));
         });
 }
 

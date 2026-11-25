@@ -267,7 +267,7 @@ std::string OracleLiteral(const Value &constant, const OracleColumn &column) {
             date_t date;
             dtime_t time;
             Timestamp::Convert(micros, date, time);
-            Date::Convert(date, year, month, day);
+            DateToOracleCalendar(date, year, month, day);
             Time::Convert(time, hour, minute, second, microseconds);
         } else {
             const auto value = TimestampValue::Get(constant);
@@ -277,7 +277,7 @@ std::string OracleLiteral(const Value &constant, const OracleColumn &column) {
             date_t date;
             dtime_t time;
             Timestamp::Convert(value, date, time);
-            Date::Convert(date, year, month, day);
+            DateToOracleCalendar(date, year, month, day);
             Time::Convert(time, hour, minute, second, microseconds);
         }
         if (year < 1 || year > 9999) {

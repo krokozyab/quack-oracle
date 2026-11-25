@@ -90,6 +90,11 @@ auto TranslatingOracleErrors(const char *operation, FUNCTION function) -> declty
 
 //! Refuses any column this client cannot read, then returns its DuckDB type.
 LogicalType TypeFor(const OracleColumn &column);
+//! An Oracle calendar date (Julian before 1582-10-15, no year 0) as the DuckDB
+//! date with Oracle's day number; false when either calendar has no such day.
+bool OracleCalendarToDate(int32_t year, int32_t month, int32_t day, date_t &result);
+//! The Oracle calendar fields of a DuckDB date, for a value or literal sent to Oracle.
+void DateToOracleCalendar(date_t date, int32_t &year, int32_t &month, int32_t &day);
 std::unique_ptr<OracleCursor> OpenOracleScalarRead(OracleSession &session, const std::string &sql,
                                                 const std::vector<OracleColumn> &columns);
 

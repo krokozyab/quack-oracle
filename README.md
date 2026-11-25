@@ -1633,7 +1633,7 @@ handshake and an authentication round trip: against a cloud endpoint that was
 | `NUMBER(p,s)` | `DECIMAL(p,s)` | up to p = 38; negative scale uses `BIGINT` up to 18 effective digits, then `DECIMAL(p-s,0)` up to 38; `NUMBER(2,4)` is `DECIMAL(4,4)` |
 | `NUMBER` (unconstrained) | `VARCHAR` | exact only as text; see `oracle_unconstrained_number` below |
 | `VARCHAR2`, `CHAR` | `VARCHAR` | UTF-8, whatever the database character set is |
-| `DATE` | `TIMESTAMP` | an Oracle `DATE` carries a time, so it is not a DuckDB `DATE` |
+| `DATE` | `TIMESTAMP` | an Oracle `DATE` carries a time, so it is not a DuckDB `DATE`. See the calendar note below |
 | `TIMESTAMP(0–6)` | `TIMESTAMP` | |
 | `TIMESTAMP(7–9)` | `TIMESTAMP_NS` | |
 | `TIMESTAMP WITH TIME ZONE` | `VARCHAR` | keeps its offset, which `TIMESTAMPTZ` would drop; the time is on that offset's clock, as Oracle prints it (`2026-03-28 15:30:00+03:00`) |
@@ -1651,6 +1651,14 @@ handshake and an authentication round trip: against a cloud endpoint that was
 | `XMLTYPE` | `VARCHAR` | the document as text (`XMLSERIALIZE ... NO INDENT`); written back through `XMLPARSE(DOCUMENT ...)`. An attached table only |
 | `ROWID`, `UROWID` | `VARCHAR` | the 18 characters `ROWIDTOCHAR` gives; a logical UROWID is refused |
 | `LONG`, `LONG RAW` | `VARCHAR`, `BLOB` | up to 1 MiB a value |
+
+**Dates before 1582-10-15.** Oracle keeps them in the Julian calendar; DuckDB keeps
+every date in the proleptic Gregorian one. A value crosses at the same day, the one
+`TO_CHAR(d, 'J')` numbers, so Oracle's `1500-02-29` reads as `1500-03-10` and is
+written back as `1500-02-29`, and date arithmetic agrees on both sides. Oracle counts
+BC days as though there were a year 0, so DuckDB labels a BC date one year earlier
+than Oracle prints it: Oracle's `0001-12-31 BC` is DuckDB's `0002-12-29 (BC)`. A
+DuckDB date in its year 1 BC, a year Oracle has no days in, is refused when written.
 
 Anything else — `BFILE`, object and collection types — is **refused when the query is
 bound**, with a message naming the column and the reason. It is never decoded

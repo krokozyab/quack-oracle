@@ -193,7 +193,7 @@ OracleCallableBind EncodeOracleCallableArgument(const std::string &type_name,
             int32_t year;
             int32_t month;
             int32_t day;
-            Date::Convert(date, year, month, day);
+            DateToOracleCalendar(date, year, month, day);
             return {12, 7,
                     oracle_scanner::EncodeOracleDate({year, static_cast<uint8_t>(month), static_cast<uint8_t>(day)})};
         } catch (const std::exception &) {
@@ -223,7 +223,7 @@ OracleCallableBind EncodeOracleCallableArgument(const std::string &type_name,
             int32_t minute;
             int32_t second;
             int32_t microseconds;
-            Date::Convert(date, year, month, day);
+            DateToOracleCalendar(date, year, month, day);
             Time::Convert(time, hour, minute, second, microseconds);
             return {180, 11,
                     oracle_scanner::EncodeOracleTimestamp(

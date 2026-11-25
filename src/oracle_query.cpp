@@ -488,7 +488,7 @@ std::vector<oracle_scanner::OracleBind> PositionalBinds(const Value &value, cons
             int32_t year;
             int32_t month;
             int32_t day;
-            Date::Convert(date, year, month, day);
+            DateToOracleCalendar(date, year, month, day);
             binds.push_back(oracle_scanner::OracleBind {std::to_string(index + 1), 12, oracle_scanner::BindDirection::BIND_IN,
                              oracle_scanner::EncodeOracleDate({year, static_cast<uint8_t>(month),
                                                                static_cast<uint8_t>(day)})});
@@ -507,7 +507,7 @@ std::vector<oracle_scanner::OracleBind> PositionalBinds(const Value &value, cons
             int32_t minute;
             int32_t second;
             int32_t microseconds;
-            Date::Convert(date, year, month, day);
+            DateToOracleCalendar(date, year, month, day);
             Time::Convert(time, hour, minute, second, microseconds);
             binds.push_back(oracle_scanner::OracleBind {std::to_string(index + 1), 180, oracle_scanner::BindDirection::BIND_IN,
                              oracle_scanner::EncodeOracleTimestamp(
@@ -579,7 +579,7 @@ std::vector<oracle_scanner::OracleBind> NamedBinds(const Value &value, const cha
             int32_t year;
             int32_t month;
             int32_t day;
-            Date::Convert(date, year, month, day);
+            DateToOracleCalendar(date, year, month, day);
             binds.push_back(oracle_scanner::OracleBind {name, 12, oracle_scanner::BindDirection::BIND_IN,
                              oracle_scanner::EncodeOracleDate({year, static_cast<uint8_t>(month),
                                                                static_cast<uint8_t>(day)})});
@@ -598,7 +598,7 @@ std::vector<oracle_scanner::OracleBind> NamedBinds(const Value &value, const cha
             int32_t minute;
             int32_t second;
             int32_t microseconds;
-            Date::Convert(date, year, month, day);
+            DateToOracleCalendar(date, year, month, day);
             Time::Convert(time, hour, minute, second, microseconds);
             binds.push_back(oracle_scanner::OracleBind {name, 180, oracle_scanner::BindDirection::BIND_IN,
                              oracle_scanner::EncodeOracleTimestamp(
