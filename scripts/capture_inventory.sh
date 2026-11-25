@@ -42,6 +42,7 @@ captures = [
     ("ttidty_negotiation_table", "src/include/oracle_scanner/ttc_data_types_template.hpp",
      "ORACLE_19C_TTC_DATA_TYPES_TEMPLATE"),
     ("lob_row_one_clob", "test/cpp/protocol_test.cpp", "lob_row_one_clob"),
+    ("jdbc_lob_prefetch_define_char", "test/cpp/protocol_test.cpp", "jdbc_lob_prefetch_define_char"),
     ("lob_rows_with_bit_vector", "test/cpp/protocol_test.cpp", "lob_rows_with_bit_vector"),
     ("lob_get_length_response", "test/cpp/protocol_test.cpp", "lob_get_length_response"),
     ("lob_read_clob_response", "test/cpp/protocol_test.cpp", "lob_read_clob_response"),

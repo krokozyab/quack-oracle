@@ -50,6 +50,7 @@ one that records what a server sent.
 | `dml_end_of_call_one_row` | 59 | Oracle 19c, the end-of-call of `INSERT INTO t (id, label) VALUES (:1, :2)` run once | `d0ab7d8deca67ff7128421c88549b207001da719618ddfebd3349a785a1ba6c5` |
 | `dml_end_of_call_three_rows` | 61 | Oracle 19c, the same statement run as three array-DML iterations | `a65853b671faf597dc98ff07266a5403f4c966fe5e8b9a7798ced2a36d232668` |
 | `ttidty_negotiation_table` | 2642 | Oracle 19c, the TTIDTY/FDO capability request of a python-oracledb Thin pre-auth connection | `f264d0cdacb3465e48fe5cd71be86a42318f9a4056bf91bc776018323b367320` |
+| `jdbc_lob_prefetch_define_char` | 126 | Oracle JDBC Thin 23.7.0.25.01 against Oracle 19c, `setLobPrefetchSize(4096)` and fetch size 10: the LOB prefetch define for `SELECT id, ch5, c` (NUMBER, CHAR(5), CLOB), recorded after login through a forwarding proxy; the CHAR column is defined as VARCHAR2 | `122b53a9116f47ffaf87aa58e5b25d053c5e591acb475290f576af9f426420fa` |
 | `lob_row_one_clob` | 196 | Oracle 19c, fetch response for a single-row `SELECT` of one CLOB column | `b093b740172362a0c1db3493f07b67e02d0423f284bf4fdaa0c204e7642f758e` |
 | `lob_rows_with_bit_vector` | 558 | Oracle 19c, fetch response for four rows of one CLOB column, where every row after the first arrives behind a BIT_VECTOR | `883809d2ce8d76825afcebf4cdc61fc4bd793f621a00035eb5065fa6c5891dde` |
 | `lob_get_length_response` | 151 | Oracle 19c, the LOB_OP GET_LENGTH response for a ten-character CLOB | `79ca06d9b2b0e87a50d055cf9247c91aeed04705fcd32e83c1fa03c33e6f40a0` |

@@ -7503,6 +7503,54 @@ static void TestLobPrefetchMaterializer() {
     UnicodeBoundary();
 }
 
+// JDBC Thin 23.7 against 19c, setLobPrefetchSize(4096), fetch size 10:
+// the define it sends for `SELECT id, ch5, c` (NUMBER, CHAR(5), CLOB). The CHAR
+// column is defined as VARCHAR2, as the omitted CHAR of the 19.3 captures was.
+// The one other difference from those captures is 23.7's: a CLOB entry says
+// 4000 where 19.3 said 0, and this encoder keeps 19.3's.
+static void TestLobPrefetchDefinesACharAsVarchar2() {
+    const std::vector<uint8_t> jdbc_lob_prefetch_define_char {
+        0x03, 0x5e, 0x0a, 0x02, 0x80, 0x50, 0x01, 0x02, 0x00, 0x00, 0x01, 0x01,
+        0x0d, 0x00, 0x00, 0x00, 0x00, 0x04, 0x7f, 0xff, 0xff, 0xff, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x03, 0x00, 0x00, 0x01, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x00, 0x00, 0x04, 0x7f, 0xff,
+        0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x69, 0x01, 0x00, 0x00,
+        0x01, 0x03, 0x00, 0x00, 0x03, 0x01, 0xff, 0xfc, 0x00, 0x01, 0x10, 0x00,
+        0x00, 0x02, 0x03, 0x69, 0x01, 0x00, 0x00, 0x70, 0x03, 0x00, 0x00, 0x02,
+        0x0f, 0xa0, 0x00, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03,
+        0x69, 0x01, 0x02, 0x10, 0x00, 0x00
+    };
+    OracleColumn number;
+    number.oracle_type = 2;
+    OracleColumn fixed;
+    fixed.oracle_type = 96;
+    fixed.character_set_form = 1;
+    fixed.byte_width = 5;
+    OracleColumn clob;
+    clob.oracle_type = 112;
+    clob.character_set_form = 1;
+    const std::vector<OracleColumn> columns {number, fixed, clob};
+    CHECK(SupportsLobPrefetchColumns(columns, 12));
+    auto expected = jdbc_lob_prefetch_define_char;
+    const std::vector<uint8_t> clob_23 {0x70, 0x03, 0x00, 0x00, 0x02, 0x0f, 0xa0};
+    const auto at = std::search(expected.begin(), expected.end(), clob_23.begin(), clob_23.end());
+    CHECK(at != expected.end());
+    const auto offset = at - expected.begin();
+    expected.erase(expected.begin() + offset + 4, expected.begin() + offset + 7);
+    expected.insert(expected.begin() + offset + 4, 0x00);
+    OracleLobPrefetchLimits limits;
+    CHECK(EncodeLobPrefetchDefine(0x0a, 2, columns, 10, 12, limits) == expected);
+    // Counted as a VARCHAR2 is, an unknown width at the define's 131068 bytes.
+    fixed.byte_width = 0;
+    OracleColumn text;
+    text.oracle_type = 1;
+    text.character_set_form = 1;
+    CHECK(BoundedLobPrefetchRows({number, fixed, clob}, 2048, limits) == 350);
+    CHECK(BoundedLobPrefetchRows({number, text, clob}, 2048, limits) == 350);
+}
+
 static void TestLobPrefetchScalarBudget() {
     OracleColumn lob;
     lob.oracle_type = 112;
@@ -10003,6 +10051,7 @@ int main() {
     TestEasyConnectAndTnsNamesFolder();
     TestLobPrefetchMaterializer();
     TestLobPrefetchScalarBudget();
+    TestLobPrefetchDefinesACharAsVarchar2();
     TestLobPrefetchDecoderResumes();
     TestTransactionPoolReusesAfterAConfirmedEnd();
     TestTransactionPoolClosesWhatIsNotClean();
