@@ -6058,10 +6058,30 @@ static std::string EchoedConnectData(const std::string &host) {
     return BuildConnectDescriptor(echoed);
 }
 
+// A Windows program path, parentheses and '=' included, cannot break the
+// CONNECT descriptor: the CID carries it with those and spaces as '?', the
+// way python-oracledb's sanitize() does (checked against it).
+static void TestClientIdentityIsSanitizedInTheDescriptor() {
+    ConnectionConfig config;
+    config.host = "db.example";
+    config.service_name = "svc";
+    config.client_program = "C:\\Program Files (x86)\\Duck=DB\\duckdb.exe";
+    const auto descriptor = BuildConnectDescriptor(config);
+    CHECK(descriptor.find("(PROGRAM=C:\\Program?Files??x86?\\Duck?DB\\duckdb.exe)") != std::string::npos);
+    ValidateRedirectReconnectData(descriptor);
+    // A listener that redirects echoes this data back, and this client parses
+    // the echo: an unbalanced parenthesis in a path would make every redirected
+    // connect fail there. 19c and 23ai listeners accept either form themselves.
+    config.client_program = "/opt/Duck(DB/duckdb";
+    ValidateRedirectReconnectData(BuildConnectDescriptor(config));
+    std::cout << "a program path with parentheses stays inside its CID" << std::endl;
+}
+
 static void TestListenerEchoOfTheClientsConnectData() {
     const auto reconnect = EchoedConnectData("scan.example");
     CHECK(reconnect.find("(CONNECTION_ID=q0N+/Zy1AbCdEfGhIjKlMn==)") != std::string::npos);
-    CHECK(reconnect.find("/Applications/My Tools/duckdb") != std::string::npos);
+    // Spaces and parentheses in the CID are '?', as python-oracledb sends them.
+    CHECK(reconnect.find("/Applications/My?Tools/duckdb") != std::string::npos);
     // The strict grammar still refuses it — which is right for a descriptor a
     // user typed — and the listener grammar accepts it.
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)ParseConnectDescriptor(reconnect); });
@@ -9987,6 +10007,7 @@ int main() {
     TestLoadBalanceShufflesEachConnection();
     TestRedirectChainKeepsEachLevelsAlternatives();
     TestListenerEchoOfTheClientsConnectData();
+    TestClientIdentityIsSanitizedInTheDescriptor();
     TestOobProbeAfterRedirectAcceptsTheRedirectFlag();
     TestOobProbeWithoutAnswer();
     TestBudgetHoldsThroughTheListenerExchange();
