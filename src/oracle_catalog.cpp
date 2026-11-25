@@ -441,7 +441,10 @@ struct OracleAttachedState {
         OracleColumn column {name,
                              oracle_type,
                              static_cast<uint32_t>(byte_width),
-                             number(row[offset + 3], 0),
+                             // INTEGER and NUMBER(*,s) have no DATA_PRECISION but a scale;
+                             // the describe reports them as precision 38, so must this.
+                             type == "NUMBER" && !row[offset + 3] && row[offset + 4] ? int16_t(38)
+                                                                                     : number(row[offset + 3], 0),
                              number(row[offset + 4], 0),
                              std::string(row[offset + 5]->begin(), row[offset + 5]->end()) == "Y",
                              character_set_form};
@@ -2517,10 +2520,21 @@ void OraclePinSnapshot(ClientContext &context, const std::string &catalog_name, 
     state->pinned_scn = scn;
 }
 
+// A statement that fails can leave the channel mid-message, so the pooled
+// session it ran on must not answer the next one.
+std::vector<std::vector<std::string>> PooledTextRows(OracleSessionHandle &session, const std::string &sql) {
+    try {
+        return TextRows(session.Get(), sql);
+    } catch (...) {
+        session.Poison();
+        throw;
+    }
+}
+
 std::string OracleCurrentScn(ClientContext &context, const std::string &catalog_name) {
     auto target = ResolveOracleWriteTarget(context, catalog_name);
     auto session = AcquireOracleReadSession(context, std::string(), target.catalog_name, target.config, target.password);
-    const auto rows = TextRows(session.Get(), "SELECT dbms_flashback.get_system_change_number FROM dual");
+    const auto rows = PooledTextRows(session, "SELECT dbms_flashback.get_system_change_number FROM dual");
     if (rows.size() != 1 || rows[0].size() != 1 || rows[0][0].empty()) {
         throw IOException("Oracle returned no change number");
     }
@@ -2556,7 +2570,7 @@ std::string OracleQuerySnapshot(ClientContext &context, const OracleQueryBindDat
     try {
         auto session = AcquireOracleReadSession(context, bind.secret_name, bind.catalog_name, bind.config, bind.password);
         const auto before = session->IoStats();
-        const auto rows = TextRows(session.Get(), "SELECT dbms_flashback.get_system_change_number FROM dual");
+        const auto rows = PooledTextRows(session, "SELECT dbms_flashback.get_system_change_number FROM dual");
         if (rows.size() != 1 || rows[0].size() != 1 || rows[0][0].empty()) {
             throw IOException("Oracle returned no change number");
         }
@@ -2578,14 +2592,14 @@ std::string OracleSnapshotOfHeapTable(ClientContext &context, const OracleQueryB
         auto session = AcquireOracleReadSession(context, bind.secret_name, bind.catalog_name, bind.config, bind.password);
         auto scn = OracleQuerySnapshot(context, bind);
         if (scn.empty()) {
-            const auto scn_rows = TextRows(session.Get(), "SELECT dbms_flashback.get_system_change_number FROM dual");
+            const auto scn_rows = PooledTextRows(session, "SELECT dbms_flashback.get_system_change_number FROM dual");
             if (scn_rows.size() != 1 || scn_rows[0].size() != 1 || scn_rows[0][0].empty()) {
                 return std::string();
             }
             scn = scn_rows[0][0];
         }
         const bool own = bind.schema_name.empty();
-        const auto kind = TextRows(session.Get(), std::string("SELECT iot_type, temporary, cluster_name FROM ") +
+        const auto kind = PooledTextRows(session, std::string("SELECT iot_type, temporary, cluster_name FROM ") +
                                                  (own ? "user_tables" : "all_tables") +
                                                  " WHERE table_name = " + TextLiteral(bind.object_name) +
                                                  (own ? std::string() : " AND owner = " + TextLiteral(bind.schema_name)));

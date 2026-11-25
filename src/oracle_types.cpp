@@ -9,6 +9,7 @@
 #include "duckdb/common/vector/array_vector.hpp"
 #include "duckdb/common/vector/list_vector.hpp"
 #include "duckdb/common/operator/decimal_cast_operators.hpp"
+#include "duckdb/common/operator/add.hpp"
 #include "duckdb/common/types/time.hpp"
 #include "oracle_scanner/oracle_vector.hpp"
 #include "oracle_scanner/oson.hpp"
@@ -298,7 +299,13 @@ Value TimestampValueFor(const OracleColumn &column, const oracle_scanner::Oracle
         throw ConversionException("Oracle timestamp %s is outside the nanosecond range DuckDB can represent",
                                   FormatDateTime(value));
     }
-    return Value::TIMESTAMPNS(timestamp_ns_t(nanoseconds + static_cast<int64_t>(value.nanosecond)));
+    // The whole seconds can fit and the fraction still carry past the end.
+    if (!TryAddOperator::Operation(nanoseconds, static_cast<int64_t>(value.nanosecond), nanoseconds) ||
+        !timestamp_t(nanoseconds).IsFinite()) {
+        throw ConversionException("Oracle timestamp %s is outside the nanosecond range DuckDB can represent",
+                                  FormatDateTime(value));
+    }
+    return Value::TIMESTAMPNS(timestamp_ns_t(nanoseconds));
 }
 
 

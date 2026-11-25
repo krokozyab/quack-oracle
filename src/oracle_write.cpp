@@ -1794,13 +1794,6 @@ PhysicalOperator &PlanOracleUpdate(ClientContext &, PhysicalPlanGenerator &plann
             assignments += ", ";
         }
         assignments += KeywordHelper::WriteQuotedAndEscaped(columns[position].name, '"') + " = ";
-        if (op.expressions[index]->GetExpressionType() == ExpressionType::VALUE_DEFAULT) {
-            // Oracle's own DEFAULT for the column, which is the right answer and
-            // not the same as the NULL this catalog would otherwise supply: it
-            // does not read DATA_DEFAULT from the dictionary.
-            assignments += "DEFAULT";
-            continue;
-        }
         if (op.expressions[index]->GetExpressionType() != ExpressionType::BOUND_REF) {
             throw NotImplementedException("Oracle UPDATE cannot evaluate this SET expression");
         }

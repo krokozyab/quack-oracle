@@ -3252,6 +3252,18 @@ static void TestTransientSnapshotAndRowIdQueriesBypassCursorCache() {
     }
 }
 
+static void TestRowLockingQueriesAreRecognised() {
+    for (const auto *sql : {"SELECT id FROM t FOR UPDATE", "select id from t where id = 1 for\n update nowait",
+                           "SELECT id FROM t FOR /* lock */ UPDATE OF id SKIP LOCKED"}) {
+        CHECK(OracleQueryLocksRows(sql));
+    }
+    for (const auto *sql : {"SELECT id FROM t", "SELECT 'FOR UPDATE' FROM dual", "SELECT q'[for update]' FROM dual",
+                           "SELECT id FROM t -- FOR UPDATE", "SELECT \"FOR\" \"UPDATE\" FROM t",
+                           "SELECT updated FROM t WHERE last_for = 1"}) {
+        CHECK(!OracleQueryLocksRows(sql));
+    }
+}
+
 static void TestPreparedQueryReparsesOnlySafeInvalidations() {
     using namespace oracle_scanner_test;
     const std::vector<OracleBind> binds = {{"n", 2, BindDirection::BIND_IN, EncodeOracleNumber("7"), 22}};
@@ -9889,6 +9901,7 @@ int main() {
     TestStatementRegistry();
     TestPreparedQueryCacheOwnershipAndBounds();
     TestTransientSnapshotAndRowIdQueriesBypassCursorCache();
+    TestRowLockingQueriesAreRecognised();
     TestPreparedQueryReexecuteWireAndState();
     TestPreparedQueryReparsesOnlySafeInvalidations();
     TestTtcStatementChannel();

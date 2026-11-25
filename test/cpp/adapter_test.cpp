@@ -116,6 +116,8 @@ OracleColumn Column(const std::string &name, uint16_t oracle_type, int16_t preci
 struct FakeResponse {
     std::vector<OracleColumn> columns;
     std::vector<WireRow> rows;
+    // Fetching this answer fails the way a cut-off response does.
+    std::optional<oracle_scanner::ProtocolErrorKind> failure = std::nullopt;
 };
 
 // A dictionary fixture for the combined heap/identity/SCN planning exchange.
@@ -387,6 +389,9 @@ public:
         }
         if (script->fetch_failure) {
             throw oracle_scanner::ProtocolError(*script->fetch_failure, script->fetch_failure_message);
+        }
+        if (answer && answer->failure) {
+            throw oracle_scanner::ProtocolError(*answer->failure, "injected route failure");
         }
         OracleBatch batch;
         batch.columns = Columns();
@@ -1783,6 +1788,14 @@ void TestNamedCallRequestAndOutputs() {
     CHECK(request.arguments[0].direction == oracle_scanner::BindDirection::BIND_IN);
     CHECK(request.arguments[1].direction == oracle_scanner::BindDirection::BIND_OUT);
     CHECK(request.arguments[1].oracle_type == 2 && request.arguments[2].oracle_type == 1);
+    // The procedure's work is committed, as oracle_execute's is; a failed call
+    // commits nothing and its session takes the work with it.
+    CHECK(script->commits == 1);
+    script->call_should_fail = true;
+    CHECK(database.Query("SELECT * FROM oracle_call_named('ora', 'app.compute', "
+                         "[{name: 'i', direction: 'in', type: 'number', value: '3'}])")
+              ->HasError());
+    CHECK(script->commits == 1);
 }
 
 // A REF CURSOR result becomes a connection-local handle that oracle_cursor
@@ -1800,6 +1813,7 @@ void TestCursorHandlesAreConsumedOnce() {
     CHECK(handles->RowCount() == 1);
     const auto handle = handles->GetValue(0, 0).ToString();
     CHECK(handle.rfind("oracle:", 0) == 0);
+    CHECK(script->commits == 1);
 
     auto rows = database.Query("SELECT * FROM oracle_cursor('" + handle + "')");
     CHECK(!rows->HasError());
@@ -1809,6 +1823,15 @@ void TestCursorHandlesAreConsumedOnce() {
     // silently reopening or reusing a closed cursor.
     auto again = database.Query("SELECT * FROM oracle_cursor('" + handle + "')");
     CHECK(again->HasError());
+
+    // A prepared read binds the handle once, so a second EXECUTE has nothing to
+    // read and says so instead of dereferencing the spent cursor.
+    auto fresh = database.Query("SELECT * FROM oracle_call_cursors('ora', 'app.open_one', ['c'])");
+    CHECK(!fresh->HasError());
+    database.Run("PREPARE read_handle AS SELECT * FROM oracle_cursor('" + fresh->GetValue(0, 0).ToString() + "')");
+    CHECK(database.Query("EXECUTE read_handle")->RowCount() == 1);
+    auto spent = database.Query("EXECUTE read_handle");
+    CHECK(spent->HasError() && spent->GetError().find("has been read") != std::string::npos);
 }
 
 // The scan owns its session: once the query result is gone the session is gone
@@ -2272,6 +2295,29 @@ void TestAttachedScanRefusesChangedNumericShape() {
     std::cout << "attached scans and pushed aggregates refuse stale numeric precision and scale" << std::endl;
 }
 
+// USER_TAB_COLUMNS gives INTEGER no DATA_PRECISION but a scale of 0, and the
+// describe calls the same column NUMBER(38): the two must agree or no scan runs.
+void TestAttachedIntegerColumnMatchesItsDescribe() {
+    auto script = std::make_shared<FakeScript>();
+    script->routes = {
+        {"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}},
+        {"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("INT_T")}}}},
+        {"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}},
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {{Text("INT_T"), Text("V"), Text("NUMBER"), Number("22"), std::nullopt, Number("0"), Text("Y")}}}},
+        {"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}}};
+    script->tables["INT_T"] = {{Column("V", 2, 38, 0)}, {{Number("7")}}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS o(TYPE oracle_scanner); SET oracle_parallel_scan=1;");
+    auto result = database.Query("SELECT V FROM o.INT_T");
+    CHECK(!result->HasError() && result->GetValue(0, 0).ToString() == "7");
+    CHECK(result->GetTypes()[0] == duckdb::LogicalType::DECIMAL(38, 0));
+    std::cout << "an attached INTEGER column reads as NUMBER(38)" << std::endl;
+}
+
 void TestAttachedScanRefusesChangedTemporalAndCharacterShape() {
     struct Shape { const char *type; uint16_t wire; int16_t precision; int16_t scale; };
     for (const auto &shape : {Shape {"NUMBER", 2, 10, 0}, Shape {"NUMBER", 2, 0, 0}, Shape {"TIMESTAMP(6)", 180, 0, 6},
@@ -2413,6 +2459,99 @@ void TestReadSessionsArePooledPerConnection() {
     }
 
     std::cout << "read sessions are pooled per connection" << std::endl;
+}
+
+// oracle_query opens its cursor at bind and the scan consumes it, so each
+// EXECUTE of a prepared statement binds again and reads the rows again.
+void TestPreparedOracleQueryRunsOnEveryExecute() {
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {Column("label", 1)};
+    script->rows = {{Text("only")}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("PREPARE twice AS SELECT * FROM oracle_query('ora', 'SELECT label FROM app.items')");
+    for (int run = 0; run < 2; run++) {
+        auto result = database.Query("EXECUTE twice");
+        CHECK(!result->HasError() && result->RowCount() == 1 && result->GetValue(0, 0).ToString() == "only");
+    }
+    std::cout << "a prepared oracle_query reads again on every EXECUTE" << std::endl;
+}
+
+// A change-number read that fails mid-answer must not hand its session back to
+// the pool: the next statement on it would read what is left of that answer.
+void TestFailedSnapshotReadDropsItsPooledSession() {
+    auto script = std::make_shared<FakeScript>();
+    script->routes = {
+        {"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}},
+        {"get_system_change_number", {{Column("SCN", 2)}, {{Number("100")}}, oracle_scanner::ProtocolErrorKind::TRUNCATED}},
+        {"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("ITEMS")}}}},
+        {"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}},
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {{Text("ITEMS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("N")}}}},
+        {"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}}};
+    script->tables["ITEMS"] = {{Column("ID", 2, 10, 0)}, {{Number("1")}}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner); SET oracle_session_pool_size = 1; "
+                 "SET oracle_parallel_scan = 1; SET oracle_consistent_read = true;");
+    CHECK(database.Query("SELECT ID FROM o.ITEMS")->HasError());
+    script->routes[1].second.failure.reset();
+    const auto opened = script->sessions_opened;
+    CHECK(!database.Query("SELECT ID FROM o.ITEMS")->HasError());
+    CHECK(script->sessions_opened > opened);
+    std::cout << "a failed change-number read drops its pooled session" << std::endl;
+}
+
+// Whole seconds can fit DuckDB's nanosecond range while the fraction carries
+// past its end; that is a range error, not a wrap to 1677.
+void TestNanosecondTimestampAtTheEndOfTheRangeIsRefused() {
+    auto column = Column("ts", 180);
+    column.scale = 9;
+    oracle_scanner::OracleDateTime moment;
+    moment.year = 2262;
+    moment.month = 4;
+    moment.day = 11;
+    moment.hour = 23;
+    moment.minute = 47;
+    moment.second = 16;
+    moment.nanosecond = 900000000;
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {column};
+    script->rows = {{oracle_scanner::EncodeOracleTimestamp(moment, false)}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    auto result = database.Query("SELECT * FROM oracle_query('ora', 'SELECT ts FROM t')");
+    CHECK(result->HasError() && result->GetError().find("outside the nanosecond range") != std::string::npos);
+    std::cout << "a nanosecond timestamp past 2262 is refused, not wrapped" << std::endl;
+}
+
+// A pooled session must not outlive what opened it: a secret replaced under
+// the same name (a rotated password) gets sessions of its own, and a query that
+// took row locks has its session closed, which ends the transaction holding them.
+void TestReadPoolFollowsReplacedSecretAndDropsLockingSessions() {
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {Column("label", 1)};
+    script->rows = {{Text("only")}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("SET oracle_session_pool_size = 2;");
+    const auto query = "SELECT * FROM oracle_query('ora', 'SELECT label FROM app.items')";
+    CHECK(!database.Query(query)->HasError());
+    CHECK(!database.Query(query)->HasError());
+    CHECK(script->sessions_opened == 1);
+    database.Run("CREATE OR REPLACE SECRET ora (TYPE oracle, HOST '127.0.0.1', PORT 1521, "
+                 "SERVICE_NAME 'service', USER 'app_user', PASSWORD 'rotated');");
+    CHECK(!database.Query(query)->HasError());
+    CHECK(script->sessions_opened == 2);
+    // The idle session runs the locking query and is closed after it, so the
+    // next query finds the pool empty.
+    CHECK(!database.Query("SELECT * FROM oracle_query('ora', 'SELECT label FROM app.items FOR UPDATE')")->HasError());
+    CHECK(script->sessions_opened == 2);
+    CHECK(!database.Query(query)->HasError());
+    CHECK(script->sessions_opened == 3);
+    std::cout << "the read pool follows a replaced secret and drops sessions holding row locks" << std::endl;
 }
 
 // The attached catalog, end to end, with no database. Every path here —
@@ -5303,7 +5442,8 @@ void TestAttachedUpsertsUseOracleMerge() {
             "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT),(91,DEFAULT) ON CONFLICT DO NOTHING;",
             "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT),(91,NULL) ON CONFLICT DO NOTHING;",
             "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT) ON CONFLICT(ID) DO UPDATE SET LABEL=excluded.LABEL;",
-            "INSERT OR REPLACE INTO ora.main.ITEMS VALUES (90,DEFAULT);"}) {
+            "INSERT OR REPLACE INTO ora.main.ITEMS VALUES (90,DEFAULT);",
+            "UPDATE ora.main.ITEMS SET LABEL=DEFAULT WHERE ID=1;"}) {
         const auto writes = script->counted_executes.size();
         auto result = database.Query(sql);
         CHECK(result->HasError() && result->GetError().find("explicit DEFAULT") != std::string::npos);
@@ -5659,22 +5799,26 @@ void TestParallelScanRangesDoNotOverflow() {
         CHECK(!database.Query("SELECT count(*) FROM oracle_scan_parallel('ora', 'items', 'id', shards => " +
                               std::to_string(item.shards) + ");")
                    ->HasError());
-        std::vector<std::pair<long long, long long>> ranges;
+        // Half-open [begin, next) ranges and an open last one, so a key between
+        // two whole numbers (a plain NUMBER can hold 1.5) is in a shard too.
+        std::vector<std::pair<long long, std::optional<long long>>> ranges;
         for (const auto &statement : script->queries) {
             const auto low_at = statement.find("\"ID\" >= ");
-            const auto high_at = statement.find("\"ID\" <= ");
-            if (statement.find("AS OF SCN") != std::string::npos && low_at != std::string::npos && high_at != std::string::npos) {
-                ranges.emplace_back(std::stoll(statement.substr(low_at + 8)), std::stoll(statement.substr(high_at + 8)));
+            const auto high_at = statement.find("\"ID\" < ");
+            CHECK(statement.find("\"ID\" <= ") == std::string::npos);
+            if (statement.find("AS OF SCN") != std::string::npos && low_at != std::string::npos) {
+                ranges.emplace_back(std::stoll(statement.substr(low_at + 8)),
+                                    high_at == std::string::npos ? std::nullopt
+                                                                 : std::optional<long long>(std::stoll(statement.substr(high_at + 7))));
             }
         }
         std::sort(ranges.begin(), ranges.end());
         CHECK(!ranges.empty());
-        CHECK(ranges.front().first == std::stoll(item.low) && ranges.back().second == std::stoll(item.high));
-        for (size_t index = 0; index < ranges.size(); index++) {
-            CHECK(ranges[index].first <= ranges[index].second);
-            if (index != 0) {
-                CHECK(ranges[index].first == ranges[index - 1].second + 1);
-            }
+        CHECK(ranges.front().first == std::stoll(item.low) && !ranges.back().second);
+        CHECK(ranges.back().first <= std::stoll(item.high));
+        for (size_t index = 0; index + 1 < ranges.size(); index++) {
+            CHECK(ranges[index].second && *ranges[index].second == ranges[index + 1].first);
+            CHECK(ranges[index].first < *ranges[index].second);
         }
     }
     std::cout << "parallel scan ranges cover every key once, at the extremes too" << std::endl;
@@ -5714,10 +5858,11 @@ void TestParallelScanShardsOneSnapshot() {
         // make this several moments rather than one snapshot.
         CHECK(statement.find("AS OF SCN 991144 ") != std::string::npos);
         const auto low_at = statement.find("\"ID\" >= ");
-        const auto high_at = statement.find("\"ID\" <= ");
-        CHECK(low_at != std::string::npos && high_at != std::string::npos);
+        const auto high_at = statement.find("\"ID\" < ");
+        CHECK(low_at != std::string::npos);
         const auto low = std::stoll(statement.substr(low_at + 8));
-        const auto high = std::stoll(statement.substr(high_at + 8));
+        // Half-open; the last shard has no upper end and runs to the maximum.
+        const auto high = high_at == std::string::npos ? 100LL : std::stoll(statement.substr(high_at + 7)) - 1;
         CHECK(low <= high);
         for (auto key = low; key <= high; key++) {
             CHECK(key >= 1 && key <= 100);
@@ -6760,6 +6905,12 @@ void TestRawCatalogTransactionsPinReadsAndWrites() {
     database.Run("BEGIN;");
     database.Run("SELECT * FROM oracle_execute_transaction('tx', 'DELETE FROM items');");
     database.Run("COMMIT;");
+    // A write declares itself, so DuckDB's READ ONLY transaction refuses it.
+    database.Run("BEGIN TRANSACTION READ ONLY;");
+    const auto read_only_writes = script->counted_executes.size();
+    CHECK(database.Query("SELECT * FROM oracle_execute_transaction('tx', 'DELETE FROM items');")->HasError());
+    CHECK(script->counted_executes.size() == read_only_writes);
+    database.Run("ROLLBACK;");
     CHECK(script->sessions_opened == opened + 2 && script->commits == commits + 1);
 
     // Invalid DDL must fail before opening an Oracle session.
@@ -6831,6 +6982,15 @@ void TestRawCatalogTransactionsPinReadsAndWrites() {
     database.Run("BEGIN;");
     database.Run("SELECT * FROM oracle_execute_transaction('tx', 'INSERT INTO items VALUES (7)');");
     database.Run("ROLLBACK;");
+    // The open maps the columns the way the bind did, setting included, or every
+    // unconstrained NUMBER reads as a changed type.
+    database.Run("SET oracle_unconstrained_number = 'double';");
+    database.Run("BEGIN;");
+    auto doubled = database.Query("SELECT * FROM oracle_query_transaction('tx', 'SELECT 42 FROM dual');");
+    CHECK(!doubled->HasError() && doubled->GetTypes()[0] == duckdb::LogicalType::DOUBLE &&
+          doubled->GetValue(0, 0).GetValue<double>() == 42);
+    database.Run("ROLLBACK;");
+    database.Run("RESET oracle_unconstrained_number;");
     std::cout << "raw catalog reads and writes follow commit/rollback and reject failed transaction reuse" << std::endl;
 }
 
@@ -7406,11 +7566,16 @@ int main() {
     TestUnknownSecretIsRejected();
     TestScanReleasesItsSession();
     TestReadSessionsArePooledPerConnection();
+    TestReadPoolFollowsReplacedSecretAndDropsLockingSessions();
+    TestPreparedOracleQueryRunsOnEveryExecute();
+    TestFailedSnapshotReadDropsItsPooledSession();
+    TestNanosecondTimestampAtTheEndOfTheRangeIsRefused();
     TestStatementCacheSettingKeepsSessionPoolBounded();
     TestPreparedQueryRecoveryKeepsWriteSessionUsable();
     TestAttachedCatalogAgainstAFakeSession();
     TestAttachedScanRefusesChangedWireTypes();
     TestAttachedScanRefusesChangedNumericShape();
+    TestAttachedIntegerColumnMatchesItsDescribe();
     TestAttachedScanRefusesChangedTemporalAndCharacterShape();
     TestAttachedDdlRefreshesAndCompensates();
     TestAttachedUpsertsUseOracleMerge();

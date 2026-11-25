@@ -1222,6 +1222,10 @@ SELECT * FROM oracle_call_auto('ora', 'APP.CALCULATE_TOTAL', ['42', NULL]);
 You get back `(name, value, cursor_handle)` rows, with a function's return
 value first, named `return_value`.
 
+A call that succeeds is committed, as `oracle_execute` and `oracle_plsql` are;
+one that fails is rolled back. Inside a DuckDB transaction on an `ATTACH`,
+`oracle_call_named_transaction` leaves the commit to that transaction.
+
 ### The explicit way
 
 When you want to state the shape yourself, use `oracle_call_named` (or

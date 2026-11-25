@@ -19,6 +19,7 @@
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/operator/logical_update.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 #include <functional>
 #include <map>
@@ -1222,7 +1223,22 @@ void PushDistinctCounts(OptimizerExtensionInput &input, unique_ptr<LogicalOperat
     PushAggregate(input, op, replacer);
 }
 
-void RejectExplicitOracleInsertDefaults(LogicalOperator &plan) {
+void RejectExplicitOracleDefaults(LogicalOperator &plan) {
+    // DuckDB binds UPDATE ... SET col = DEFAULT to this catalog's default, a NULL
+    // marker, not to Oracle's DEFAULT; writing it would store NULL.
+    if (plan.type == LogicalOperatorType::LOGICAL_UPDATE &&
+        plan.Cast<LogicalUpdate>().table.catalog.GetCatalogType() == "oracle_scanner") {
+        LogicalOperatorVisitor::EnumerateExpressions(*plan.children[0], [&](unique_ptr<Expression> *expression) {
+            ExpressionIterator::EnumerateExpression(*expression, [&](unique_ptr<Expression> &part) {
+                if (part->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
+                    part->Cast<BoundFunctionExpression>().Function().GetName() ==
+                        Identifier("__oracle_scanner_default")) {
+                    throw NotImplementedException("Oracle UPDATE does not support explicit DEFAULT values; "
+                                                  "use oracle_execute with Oracle SQL");
+                }
+            });
+        });
+    }
     if (plan.type == LogicalOperatorType::LOGICAL_INSERT) {
         auto &insert = plan.Cast<LogicalInsert>();
         if (insert.table.catalog.GetCatalogType() == "oracle_scanner" && !insert.children.empty()) {
@@ -1255,12 +1271,12 @@ void RejectExplicitOracleInsertDefaults(LogicalOperator &plan) {
         }
     }
     for (auto &child : plan.children) {
-        RejectExplicitOracleInsertDefaults(*child);
+        RejectExplicitOracleDefaults(*child);
     }
 }
 
 void PreOptimizeOraclePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
-    RejectExplicitOracleInsertDefaults(*plan);
+    RejectExplicitOracleDefaults(*plan);
     RewriteOracleMerges(input, plan);
     Value enabled;
     if (input.context.TryGetCurrentSetting("oracle_aggregate_pushdown", enabled) && !enabled.IsNull() &&
