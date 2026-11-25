@@ -223,6 +223,7 @@ struct FakeScript {
     // (until it fails or closes), and a rollback that fails.
     bool sessions_reusable = false;
     std::string query_failure_fragment;
+    std::optional<uint32_t> query_failure_code;
     bool rollback_should_fail = false;
     size_t session_closes = 0;
     // USER of the secret each session was opened from, in opening order, and
@@ -572,7 +573,7 @@ public:
         }
         if (!script->query_failure_fragment.empty() && sql.find(script->query_failure_fragment) != std::string::npos) {
             throw oracle_scanner::ProtocolError(oracle_scanner::ProtocolErrorKind::MALFORMED,
-                                               "injected dictionary read failure");
+                                               "injected dictionary read failure", script->query_failure_code);
         }
         return std::make_unique<FakeCursor>(script, sql);
     }
@@ -4718,6 +4719,16 @@ void TestAttachedScanReadsInRowidRanges() {
     script->query_failure_fragment.clear();
     database.Run("SELECT count(*) FROM o.main.FACTS;");
     CHECK(script->sessions_opened == warm_sessions + 1);
+    // No DBA_EXTENTS (ORA-00942) keeps the lease, and later scans stop asking.
+    script->query_failure_fragment = "dba_extents";
+    script->query_failure_code = 942U;
+    database.Run("SELECT count(*) FROM o.main.FACTS;");
+    CHECK(script->sessions_opened == warm_sessions + 1);
+    script->query_failure_fragment.clear();
+    script->queries.clear();
+    database.Run("SELECT count(*) FROM o.main.FACTS;");
+    CHECK(std::none_of(script->queries.begin(), script->queries.end(),
+                       [](const std::string &query) { return query.find("dba_extents") != std::string::npos; }));
     // Once the transaction has written, the one session that sees its rows reads, as one stream.
     database.Run("BEGIN;");
     database.Run("INSERT INTO o.main.FACTS VALUES (5);");

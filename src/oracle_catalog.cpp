@@ -1211,6 +1211,14 @@ public:
         return {state->epoch->identity, state->epoch->version.load()};
     }
 
+    bool RangesRefused() const {
+        return ranges_refused.load();
+    }
+
+    void RefuseRanges() const {
+        ranges_refused = true;
+    }
+
     static unique_ptr<OracleAttachedTableEntry> Create(ClientContext &context, Catalog &catalog,
                                                         SchemaCatalogEntry &schema,
                                                         shared_ptr<OracleAttachedState> state,
@@ -1394,6 +1402,8 @@ private:
     shared_ptr<OracleAttachedState> state;
     std::string object_name;
     std::vector<OracleColumn> oracle_columns;
+    // shortcut: a table refused range planning stays serial until it is re-read, even if granted later.
+    mutable std::atomic<bool> ranges_refused {false};
 };
 
 class OracleAttachedTableGenerator final : public DefaultGenerator {
@@ -2893,6 +2903,10 @@ OracleParallelPlan PlanParallelAttachedScan(ClientContext &context, const Oracle
             return {};
         }
     }
+    const auto *entry = bind.table_entry ? dynamic_cast<const OracleAttachedTableEntry *>(bind.table_entry.get()) : nullptr;
+    if (entry && entry->RangesRefused()) {
+        return {};
+    }
     OracleSessionHandle session;
     std::string cache_key;
     const auto started = std::chrono::steady_clock::now();
@@ -2931,7 +2945,6 @@ OracleParallelPlan PlanParallelAttachedScan(ClientContext &context, const Oracle
         (void)UnsignedPlanNumber(scn);
         const auto select_list = aggregate_select.empty() ? ProjectedSelectList(bind, selected) : aggregate_select;
         Value enabled;
-        const auto *entry = bind.table_entry ? dynamic_cast<const OracleAttachedTableEntry *>(bind.table_entry.get()) : nullptr;
         const bool caching = entry && context.TryGetCurrentSetting("oracle_scan_plan_cache", enabled) &&
                              !enabled.IsNull() && BooleanValue::Get(enabled);
         if (caching) {
@@ -3030,6 +3043,20 @@ OracleParallelPlan PlanParallelAttachedScan(ClientContext &context, const Oracle
         result.planning_nanoseconds = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - started).count());
         return result;
+    } catch (const oracle_scanner::ProtocolError &error) {
+        // ORA-00904/00942/01031: no EXECUTE on DBMS_FLASHBACK, no DBA_EXTENTS or no
+        // FLASHBACK. The server ended that call, so the session stays usable; asking
+        // again on every scan would only repeat the refusal.
+        const auto code = error.OracleCode();
+        if (code == 904U || code == 942U || code == 1031U) {
+            if (entry) {
+                entry->RefuseRanges();
+            }
+        } else {
+            session.Poison();
+        }
+        InvalidateOracleScanPlan(context, cache_key);
+        return {};
     } catch (const std::exception &) {
         session.Poison();
         InvalidateOracleScanPlan(context, cache_key);
