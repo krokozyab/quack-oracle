@@ -234,6 +234,12 @@ struct FakeScript {
     // A cursor whose SQL holds this fragment waits in its fetch until it is
     // cancelled (up to 5 s), then fails as Oracle's ORA-01013 does.
     std::string block_fetch_until_cancel;
+    // With block_fetch_until_cancel: the first fetch of the cursor that waits.
+    size_t block_fetch_from = 1;
+    // Hand out at most the requested rows a fetch, as a real cursor does,
+    // rather than every row on the first.
+    bool honor_fetch_size = false;
+    std::atomic<size_t> fetches {0};
     size_t blocked_statements = 0;
     // Cancelling the session ends its blocked statement with ORA-01013, the way
     // a server answers a break; false makes a server that never answers, so
@@ -387,6 +393,8 @@ public:
     }
 
     OracleBatch Fetch(size_t requested) override {
+        fetch_calls++;
+        script->fetches++;
         WaitIfFetchBlocked();
         {
             std::lock_guard<std::mutex> guard(script->record_lock);
@@ -404,6 +412,21 @@ public:
         }
         OracleBatch batch;
         batch.columns = Columns();
+        if (script->honor_fetch_size && !answer) {
+            const auto arena = std::make_shared<oracle_scanner::OracleRowArena>();
+            const auto &source_rows = script->rows;
+            for (; next_row < source_rows.size() && batch.rows.size() < requested; next_row++) {
+                const auto &source = source_rows[next_row];
+                oracle_scanner::OracleRowData row(source.size(), arena);
+                for (size_t column = 0; column < source.size(); column++) {
+                    row.SetOwned(column, source[column]);
+                }
+                batch.rows.push_back(std::move(row));
+            }
+            batch.exhausted = next_row == source_rows.size();
+            exhausted = batch.exhausted;
+            return batch;
+        }
         if (!drained) {
             const auto arena = std::make_shared<oracle_scanner::OracleRowArena>();
             for (const auto &source : answer ? answer->rows : script->rows) {
@@ -480,7 +503,7 @@ private:
     void WaitIfFetchBlocked() {
         {
             std::lock_guard<std::mutex> guard(script->record_lock);
-            if (script->block_fetch_until_cancel.empty() ||
+            if (script->block_fetch_until_cancel.empty() || fetch_calls < script->block_fetch_from ||
                 cursor_sql.find(script->block_fetch_until_cancel) == std::string::npos) {
                 return;
             }
@@ -496,6 +519,8 @@ private:
     std::shared_ptr<FakeScript> script;
     std::string cursor_sql;
     std::atomic<bool> cancelled {false};
+    std::atomic<size_t> fetch_calls {0};
+    size_t next_row = 0;
     FakeResponse projected;
     const FakeResponse *answer = nullptr;
     bool drained = false;
@@ -7464,6 +7489,47 @@ void TestInterruptReachesAPlainScanFetch() {
     std::cout << "a plain scan's fetch obeys the interrupt" << std::endl;
 }
 
+// A serial scan asks for its next batch while DuckDB converts this one. The
+// rows still arrive whole and in order, a LIMIT that ends the scan with a fetch
+// in flight leaves the connection usable, and an interrupt reaches a fetch that
+// is running in the background.
+void TestSerialScanFetchesAhead() {
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {Column("ID", 2, 10, 0)};
+    for (int id = 1; id <= 10000; id++) {
+        script->rows.push_back({Number(std::to_string(id))});
+    }
+    script->honor_fetch_size = true;
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    const std::string scan = "oracle_query('ora', 'SELECT id FROM app.items')";
+    auto all = database.Query("SELECT count(*), sum(ID), bool_and(ID = position) FROM (SELECT ID, "
+                              "row_number() OVER () AS position FROM " +
+                              scan + ")");
+    CHECK(!all->HasError() && all->GetValue(0, 0).ToString() == "10000" &&
+          all->GetValue(1, 0).ToString() == "50005000" && all->GetValue(2, 0).ToString() == "true");
+    const auto before_few = script->fetches.load();
+    auto few = database.Query("SELECT ID FROM " + scan + " LIMIT 3");
+    CHECK(!few->HasError() && few->RowCount() == 3 && few->GetValue(0, 2).ToString() == "3");
+    // The first batch, and the next one asked for before the first was used.
+    CHECK(script->fetches.load() - before_few == 2);
+    auto again = database.Query("SELECT count(*) FROM " + scan);
+    CHECK(!again->HasError() && again->GetValue(0, 0).ToString() == "10000");
+
+    script->block_fetch_until_cancel = "SELECT id";
+    script->block_fetch_from = 2;
+    const auto cancels = script->cancel_requests;
+    const auto outcome = InterruptAfterStart(database, "SELECT count(*) FROM " + scan);
+    if (outcome.first.find("INTERRUPT") == std::string::npos || outcome.second >= std::chrono::seconds(1)) {
+        std::cerr << "background fetch: " << outcome.first << " after " << outcome.second.count() << " ms\n";
+    }
+    CHECK(outcome.first.find("INTERRUPT") != std::string::npos && outcome.second < std::chrono::seconds(1));
+    CHECK(script->cancel_requests == cancels + 1);
+    script->block_fetch_until_cancel.clear();
+    CHECK(!database.Query("SELECT count(*) FROM " + scan)->HasError());
+    std::cout << "a serial scan fetches ahead and still stops on an interrupt" << std::endl;
+}
+
 void TestInterruptWithoutCancelAnswer() {
     auto script = std::make_shared<FakeScript>();
     script->columns = {Column("ID", 2)};
@@ -7707,6 +7773,7 @@ int main() {
     TestInterruptReachesEveryTransactionPath();
     TestInterruptCancelsStandaloneCalls();
     TestInterruptReachesAPlainScanFetch();
+    TestSerialScanFetchesAhead();
     TestInterruptWithoutCancelAnswer();
     TestQueryTypeMappingAndValues();
     TestWriteOracleValueMatchesValueFor();

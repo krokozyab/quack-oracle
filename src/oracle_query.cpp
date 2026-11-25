@@ -4087,8 +4087,13 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
                         }
                     }
                     try {
-                        return state.deferred ? state.cursor->Fetch(STANDARD_VECTOR_SIZE)
-                                              : state.cursor->FetchPacked(state.fetch_rows);
+                        if (state.deferred) {
+                            return state.cursor->Fetch(STANDARD_VECTOR_SIZE);
+                        }
+                        if (state.next_batch.valid()) {
+                            return state.next_batch.get();
+                        }
+                        return state.cursor->FetchPacked(state.fetch_rows);
                     } catch (...) {
                         if (interrupt) {
                             interrupt->Stop();
@@ -4111,6 +4116,16 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
                 throw;
             }
             fetch_interrupt.reset();
+            // A serial scan asks for the next batch now and reads it on another
+            // thread while this one is converted and stored: the server's work
+            // and the round trip overlap DuckDB's. A transaction's scan shares
+            // its session, and a parallel scan already overlaps its sessions.
+            if (!local && !state.parallel && state.catalog_name.empty() && !state.deferred && typed_chunks.empty() &&
+                !batch.exhausted && state.cursor) {
+                auto *cursor = state.cursor.get();
+                const auto rows = state.fetch_rows;
+                state.next_batch = std::async(std::launch::async, [cursor, rows] { return cursor->FetchPacked(rows); });
+            }
             const auto fetching_ns = elapsed(fetch_started);
             state.metrics.fetch_nanoseconds += fetching_ns;
             if (local && state.top_n_feedback) {

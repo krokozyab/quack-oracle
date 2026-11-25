@@ -27,6 +27,8 @@
 #include <memory>
 #include <mutex>
 #include <atomic>
+#include <chrono>
+#include <future>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -373,6 +375,26 @@ struct OracleQueryGlobalState final : GlobalTableFunctionState {
         : session(std::move(session_p)), cursor(std::move(cursor_p)), columns(std::move(columns_p)),
           types(std::move(types_p)), output_columns(std::move(output_columns_p)), chunk_columns(chunk_columns_p) {
     }
+    // A fetch still running when the scan ends early (LIMIT, an error, an
+    // interrupt) is cancelled and waited for before the cursor goes, and its
+    // session, left mid-call, is not given back to the pool.
+    ~OracleQueryGlobalState() override {
+        if (!next_batch.valid()) {
+            return;
+        }
+        if (next_batch.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+            try {
+                cursor->Cancel();
+            } catch (...) {
+            }
+        }
+        try {
+            // Its rows are not wanted; whether it ended cleanly is.
+            static_cast<void>(next_batch.get());
+        } catch (...) {
+            session.Poison();
+        }
+    }
 
     // Keep the session before the cursor: member destruction is reverse order,
     // so the cursor can queue its remote close while its session is still live,
@@ -406,6 +428,9 @@ struct OracleQueryGlobalState final : GlobalTableFunctionState {
     size_t buffer_position = 0;
     std::vector<std::shared_ptr<DataChunk>> typed_chunks;
     size_t typed_rows = 0;
+    //! A serial scan fetches its next batch while DuckDB converts and stores this
+    //! one, so the round trip and the server's work overlap the client's.
+    std::future<oracle_scanner::OracleBatch> next_batch;
     //! Set when heavy columns are fetched for the rows that pass the local filter only.
     std::unique_ptr<OracleDeferredColumns> deferred;
 
