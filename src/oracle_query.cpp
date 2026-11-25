@@ -4024,76 +4024,93 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
         if (position == (typed_chunks.empty() ? batch.RowCount() : typed_rows)) {
             typed_chunks.clear();
             typed_rows = 0;
-            batch = TranslatingOracleErrors("oracle_query could not fetch from Oracle", [&] {
-                if (state.direct_scalar && state.chunk_columns == state.columns.size() &&
-                    OracleTypedSink::Fits(state.columns, state.types, state.fetch_rows)) {
-                    std::exception_ptr conversion_error;
-                    try {
-                        OracleTypedSink sink(context, state.columns, state.types, typed_chunks, state.fetch_rows);
-                        oracle_scanner::OracleFetchResult result;
-                        auto &cursor = local ? local->cursor : state.cursor;
-                        if (cursor->FetchInto(state.fetch_rows, sink, result)) {
-                            sink.Finish(result.rows);
-                            conversion_error = sink.ConversionError();
-                            if (!conversion_error) {
-                                typed_rows = result.rows;
-                                state.metrics.direct_batches++;
-                                oracle_scanner::OracleBatch direct;
-                                direct.exhausted = result.exhausted;
-                                return direct;
+            // A plain scan's fetch obeys Ctrl-C as a transaction's does: the
+            // cursor's cancel stops the statement on the server. The watcher
+            // lives for this one fetch, so it never meets the next range's cursor.
+            std::optional<OracleCallerInterruptScope> fetch_interrupt;
+            if (!interrupt) {
+                auto &cursor = local ? local->cursor : state.cursor;
+                fetch_interrupt.emplace(context, [&cursor] { cursor->Cancel(); });
+            }
+            try {
+                batch = TranslatingOracleErrors("oracle_query could not fetch from Oracle", [&] {
+                    if (state.direct_scalar && state.chunk_columns == state.columns.size() &&
+                        OracleTypedSink::Fits(state.columns, state.types, state.fetch_rows)) {
+                        std::exception_ptr conversion_error;
+                        try {
+                            OracleTypedSink sink(context, state.columns, state.types, typed_chunks, state.fetch_rows);
+                            oracle_scanner::OracleFetchResult result;
+                            auto &cursor = local ? local->cursor : state.cursor;
+                            if (cursor->FetchInto(state.fetch_rows, sink, result)) {
+                                sink.Finish(result.rows);
+                                conversion_error = sink.ConversionError();
+                                if (!conversion_error) {
+                                    typed_rows = result.rows;
+                                    state.metrics.direct_batches++;
+                                    oracle_scanner::OracleBatch direct;
+                                    direct.exhausted = result.exhausted;
+                                    return direct;
+                                }
                             }
+                        } catch (...) {
+                            if (local) {
+                                local->session.Poison();
+                                InvalidateOracleScanPlan(context, state.plan_cache_key);
+                            } else {
+                                if (interrupt) {
+                                    interrupt->Stop();
+                                }
+                                state.session.Poison();
+                                if (!state.catalog_name.empty()) {
+                                    state.cursor.reset();
+                                    PoisonTransactionSession(context, state.catalog_name);
+                                }
+                            }
+                            throw;
                         }
-                    } catch (...) {
-                        if (local) {
-                            local->session.Poison();
-                            InvalidateOracleScanPlan(context, state.plan_cache_key);
-                        } else {
+                        // The complete reply has been consumed. A value that DuckDB
+                        // cannot represent does not make the Oracle session unusable.
+                        if (conversion_error) {
                             if (interrupt) {
                                 interrupt->Stop();
                             }
-                            state.session.Poison();
-                            if (!state.catalog_name.empty()) {
-                                state.cursor.reset();
-                                PoisonTransactionSession(context, state.catalog_name);
-                            }
+                            std::rethrow_exception(conversion_error);
                         }
-                        throw;
                     }
-                    // The complete reply has been consumed. A value that DuckDB
-                    // cannot represent does not make the Oracle session unusable.
-                    if (conversion_error) {
+                    if (local) {
+                        try {
+                            return local->cursor->FetchPacked(state.fetch_rows);
+                        } catch (...) {
+                            local->session.Poison();
+                            InvalidateOracleScanPlan(context, state.plan_cache_key);
+                            throw;
+                        }
+                    }
+                    try {
+                        return state.deferred ? state.cursor->Fetch(STANDARD_VECTOR_SIZE)
+                                              : state.cursor->FetchPacked(state.fetch_rows);
+                    } catch (...) {
                         if (interrupt) {
                             interrupt->Stop();
                         }
-                        std::rethrow_exception(conversion_error);
-                    }
-                }
-                if (local) {
-                    try {
-                        return local->cursor->FetchPacked(state.fetch_rows);
-                    } catch (...) {
-                        local->session.Poison();
-                        InvalidateOracleScanPlan(context, state.plan_cache_key);
+                        // Same rule as at bind: a failed fetch leaves the channel in a
+                        // state this side cannot describe, so the session is not reused.
+                        state.session.Poison();
+                        if (!state.catalog_name.empty()) {
+                            state.cursor.reset();
+                            PoisonTransactionSession(context, state.catalog_name);
+                        }
                         throw;
                     }
+                });
+            } catch (...) {
+                if (fetch_interrupt) {
+                    fetch_interrupt->Stop();
                 }
-                try {
-                    return state.deferred ? state.cursor->Fetch(STANDARD_VECTOR_SIZE)
-                                          : state.cursor->FetchPacked(state.fetch_rows);
-                } catch (...) {
-                    if (interrupt) {
-                        interrupt->Stop();
-                    }
-                    // Same rule as at bind: a failed fetch leaves the channel in a
-                    // state this side cannot describe, so the session is not reused.
-                    state.session.Poison();
-                    if (!state.catalog_name.empty()) {
-                        state.cursor.reset();
-                        PoisonTransactionSession(context, state.catalog_name);
-                    }
-                    throw;
-                }
-            });
+                ThrowIfInterrupted(context);
+                throw;
+            }
+            fetch_interrupt.reset();
             const auto fetching_ns = elapsed(fetch_started);
             state.metrics.fetch_nanoseconds += fetching_ns;
             if (local && state.top_n_feedback) {

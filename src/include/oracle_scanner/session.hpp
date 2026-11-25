@@ -66,6 +66,11 @@ struct OracleColumn {
     // collation, under which BINARY_CI makes 'a' equal 'A', so equality on it
     // is not DuckDB's. Never set on a describe.
     bool compared_as_bytes = false;
+    // Set by a catalog when the database character set is not Unicode (not
+    // AL32UTF8 or UTF8). Oracle converts a statement's text into that set and
+    // puts '?' or '¿' for what it cannot hold, so a non-ASCII literal could
+    // match other rows than DuckDB's would. Never set on a describe.
+    bool ascii_literals_only = false;
     // For TIMESTAMP WITH LOCAL TIME ZONE (231): a fetched value is the wall time
     // in the database time zone (DBTIMEZONE), the form Oracle stores it in, not
     // the session's. This is that zone's offset from UTC in minutes, set by the

@@ -231,6 +231,9 @@ struct FakeScript {
     // A statement containing this fragment waits, the way one waiting on a row
     // lock does, until the deadline of the caller it is bound to expires.
     std::string block_until_deadline;
+    // A cursor whose SQL holds this fragment waits in its fetch until it is
+    // cancelled (up to 5 s), then fails as Oracle's ORA-01013 does.
+    std::string block_fetch_until_cancel;
     size_t blocked_statements = 0;
     // Cancelling the session ends its blocked statement with ORA-01013, the way
     // a server answers a break; false makes a server that never answers, so
@@ -343,14 +346,16 @@ static bool ProjectScriptedTable(const FakeScript &script, const std::string &sq
 class FakeCursor final : public OracleCursor {
 public:
     FakeCursor(std::shared_ptr<FakeScript> script_p, const std::string &sql = std::string())
-        : script(std::move(script_p)) {
+        : script(std::move(script_p)), cursor_sql(sql) {
         // The catalog's collation probes also read the dictionary views other
         // routes name (`FROM user_tab_columns`); only a route written for them answers.
         const bool collation_probe = sql.find("collation IS NOT NULL") != std::string::npos ||
-                                     sql.find("FROM nls_session_parameters") != std::string::npos;
+                                     sql.find("FROM nls_session_parameters") != std::string::npos ||
+                                     sql.find("FROM nls_database_parameters") != std::string::npos;
         for (const auto &route : script->routes) {
             if (collation_probe && route.first.find("collation") == std::string::npos &&
-                route.first.find("nls_session_parameters") == std::string::npos) {
+                route.first.find("nls_session_parameters") == std::string::npos &&
+                route.first.find("nls_database_parameters") == std::string::npos) {
                 continue;
             }
             if (sql.find(route.first) != std::string::npos) {
@@ -368,6 +373,9 @@ public:
         if (sql.find("FROM nls_session_parameters WHERE parameter = 'NLS_COMP'") != std::string::npos) {
             projected = {{Column("VALUE", 1)}, {{Text("BINARY")}}};
             answer = &projected;
+        } else if (sql.find("FROM nls_database_parameters WHERE parameter = 'NLS_CHARACTERSET'") != std::string::npos) {
+            projected = {{Column("VALUE", 1)}, {{Text("AL32UTF8")}}};
+            answer = &projected;
         } else if (sql.find("collation IS NOT NULL") != std::string::npos) {
             projected = {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("COLLATION", 1)}, {}};
             answer = &projected;
@@ -379,6 +387,7 @@ public:
     }
 
     OracleBatch Fetch(size_t requested) override {
+        WaitIfFetchBlocked();
         {
             std::lock_guard<std::mutex> guard(script->record_lock);
             script->maximum_fetch_request = (std::max)(script->maximum_fetch_request, requested);
@@ -455,7 +464,11 @@ public:
         return true;
     }
 
+    // Called from the interrupt watcher while another thread waits in Fetch.
     void Cancel() override {
+        std::lock_guard<std::mutex> guard(script->record_lock);
+        script->cancel_requests++;
+        cancelled = true;
     }
 
     void Close() override {
@@ -464,7 +477,25 @@ public:
     }
 
 private:
+    void WaitIfFetchBlocked() {
+        {
+            std::lock_guard<std::mutex> guard(script->record_lock);
+            if (script->block_fetch_until_cancel.empty() ||
+                cursor_sql.find(script->block_fetch_until_cancel) == std::string::npos) {
+                return;
+            }
+        }
+        const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < limit && !cancelled.exchange(false)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        throw oracle_scanner::ProtocolError(oracle_scanner::ProtocolErrorKind::INVALID_STATE,
+                                            "ORA-01013: user requested cancel of current operation", 1013);
+    }
+
     std::shared_ptr<FakeScript> script;
+    std::string cursor_sql;
+    std::atomic<bool> cancelled {false};
     FakeResponse projected;
     const FakeResponse *answer = nullptr;
     bool drained = false;
@@ -3874,6 +3905,23 @@ void TestTextComparesByTheSessionCollation() {
         CHECK(!database.Query("SELECT LABEL, count(*) FROM o.main.ITEMS GROUP BY LABEL;")->HasError());
         CHECK(!pushed(script, "GROUP BY"));
     }
+    {
+        // A database that is not Unicode turns what it cannot hold into '?' or
+        // '¿', so a non-ASCII literal stays in DuckDB; an ASCII one still goes.
+        auto script = script_for("BINARY");
+        script->routes.push_back({"nls_database_parameters", {text_columns({"VALUE"}), {{Text("WE8MSWIN1252")}}}});
+        auto factory = InstallFake(script);
+        TestDatabase database;
+        database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner);");
+        CHECK(!database.Query("SELECT ID FROM o.main.ITEMS WHERE LABEL = 'beta';")->HasError());
+        CHECK(pushed(script, "\"LABEL\" = 'beta'"));
+        auto other = database.Query("SELECT ID FROM o.main.ITEMS WHERE LABEL = 'Жbeta';");
+        CHECK(!other->HasError() && other->RowCount() == 0);
+        CHECK(!pushed(script, "\"LABEL\" ="));
+        auto listed = database.Query("SELECT ID FROM o.main.ITEMS WHERE LABEL IN ('beta', 'é');");
+        CHECK(!listed->HasError() && listed->RowCount() == 1);
+        CHECK(!pushed(script, "\"LABEL\" IN"));
+    }
     std::cout << "text equality and grouping go to Oracle only where it compares by bytes" << std::endl;
 }
 
@@ -4038,6 +4086,36 @@ void TestLargeScalarFetchKeepsRowsAndLocalFilters() {
             CHECK(script->direct_fetches == calls);
         }
     }
+}
+
+// Names that are not schemas are remembered so a binder's repeated lookups do
+// not each ask Oracle, but they do not count toward the limit on schemas: past
+// 4096 of them a real schema still resolves.
+void TestMissingSchemasDoNotExhaustTheSchemaLimit() {
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+    script->routes.push_back({"username = 'EXTRA'", {{Column("USERNAME", 1)}, {{Text("EXTRA")}}}});
+    script->routes.push_back({"FROM all_users", {{Column("USERNAME", 1)}, {}}});
+    script->routes.push_back({"FROM user_tables", {{Column("TABLE_NAME", 1)}, {}}});
+    script->routes.push_back({"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}});
+    script->routes.push_back({"FROM all_tables", {{Column("TABLE_NAME", 1)}, {{Text("LINKS_B")}}}});
+    script->routes.push_back({"FROM all_views", {{Column("VIEW_NAME", 1)}, {}}});
+    script->routes.push_back(
+        {"FROM all_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {{Text("LINKS_B"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("Y")}}}});
+    script->routes.push_back({"FROM all_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}});
+    script->tables["LINKS_B"] = {{Column("ID", 2, 10, 0)}, {{Number("7")}}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner); SET oracle_parallel_scan = 1;");
+    for (int index = 0; index < 4100; index++) {
+        CHECK(database.Query("SELECT * FROM o.NOPE" + std::to_string(index) + ".LINKS_B")->HasError());
+    }
+    auto found = database.Query("SELECT ID FROM o.EXTRA.LINKS_B");
+    CHECK(!found->HasError() && found->GetValue(0, 0).ToString() == "7");
+    std::cout << "missing schemas do not exhaust the schema limit" << std::endl;
 }
 
 void TestNestedOracleJoinsAndAggregates() {
@@ -7326,6 +7404,27 @@ void TestInterruptCancelsStandaloneCalls() {
 // A server that never answers the cancel: the call is given up once
 // ORACLE_CANCEL_GRACE (2 s) has passed, as before there was a cancel, and the
 // caller still gets DuckDB's interrupt.
+// A plain scan's fetch obeys the interrupt too: its cursor is cancelled, the
+// query ends in DuckDB's interrupt at once, and the connection goes on.
+void TestInterruptReachesAPlainScanFetch() {
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {Column("ID", 2)};
+    script->rows = {{Number("1")}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    script->block_fetch_until_cancel = "SLOW_FETCH";
+    const auto outcome = InterruptAfterStart(
+        database, "SELECT * FROM oracle_query('ora', 'SELECT id FROM app.items /* SLOW_FETCH */');");
+    if (outcome.first.find("INTERRUPT") == std::string::npos || outcome.second >= std::chrono::seconds(1)) {
+        std::cerr << "plain scan fetch: " << outcome.first << " after " << outcome.second.count() << " ms\n";
+    }
+    CHECK(outcome.first.find("INTERRUPT") != std::string::npos && outcome.second < std::chrono::seconds(1));
+    CHECK(script->cancel_requests == 1);
+    script->block_fetch_until_cancel.clear();
+    CHECK(!database.Query("SELECT * FROM oracle_query('ora', 'SELECT id FROM app.items')")->HasError());
+    std::cout << "a plain scan's fetch obeys the interrupt" << std::endl;
+}
+
 void TestInterruptWithoutCancelAnswer() {
     auto script = std::make_shared<FakeScript>();
     script->columns = {Column("ID", 2)};
@@ -7568,6 +7667,7 @@ int main() {
     TestTransactionPoolsDoNotMixSecrets();
     TestInterruptReachesEveryTransactionPath();
     TestInterruptCancelsStandaloneCalls();
+    TestInterruptReachesAPlainScanFetch();
     TestInterruptWithoutCancelAnswer();
     TestQueryTypeMappingAndValues();
     TestWriteOracleValueMatchesValueFor();
@@ -7628,6 +7728,7 @@ int main() {
     TestDirectConversionFailureKeepsSessionUsable();
     TestUnselectedLobKeepsLargeScalarFetches();
     TestWideDirectScanFallsBackBeforeFetching();
+    TestMissingSchemasDoNotExhaustTheSchemaLimit();
     TestNestedOracleJoinsAndAggregates();
     TestExactAveragePartialPushdown();
     TestDistinctCountPushesOnlyEquivalentEquality();

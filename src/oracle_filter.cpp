@@ -333,6 +333,9 @@ std::string OracleLiteral(const Value &constant, const OracleColumn &column) {
         }
         std::string literal = "'";
         for (const auto character : text) {
+            if (column.ascii_literals_only && static_cast<unsigned char>(character) >= 0x80) {
+                Refuse("a non-ASCII string constant on a database whose character set is not Unicode");
+            }
             if (character == '\'') {
                 literal.push_back('\'');
             }

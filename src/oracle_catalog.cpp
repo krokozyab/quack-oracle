@@ -207,6 +207,9 @@ struct OracleAttachedState {
     // Whether the session compares text by bytes (NLS_COMP = BINARY), read once at
     // ATTACH. False when it could not be read: equality on text then stays in DuckDB.
     bool nls_comp_binary = false;
+    // Whether the database character set is Unicode, read with NLS_COMP. False
+    // when it could not be read: non-ASCII text literals then stay in DuckDB.
+    bool database_unicode = false;
 
     void RefreshMetadataLocked() const {
         const auto version = epoch->version.load();
@@ -449,6 +452,7 @@ struct OracleAttachedState {
         // A column that declares a collation of its own is settled afterwards, by
         // ApplyCollationsLocked; this is the default, NLS_COMP's.
         column.compared_as_bytes = nls_comp_binary;
+        column.ascii_literals_only = !database_unicode;
         return column;
     }
 
@@ -510,9 +514,18 @@ struct OracleAttachedState {
             nls_comp_binary = !batch.rows.empty() && !batch.rows[0].empty() && batch.rows[0][0] &&
                               std::string(batch.rows[0][0]->begin(), batch.rows[0][0]->end()) == "BINARY";
             cursor->Close();
+            auto charset =
+                session->Query("SELECT value FROM nls_database_parameters WHERE parameter = 'NLS_CHARACTERSET'", {});
+            const auto set = charset->Fetch(1);
+            const auto name = !set.rows.empty() && !set.rows[0].empty() && set.rows[0][0]
+                                  ? std::string(set.rows[0][0]->begin(), set.rows[0][0]->end())
+                                  : std::string();
+            database_unicode = name == "AL32UTF8" || name == "UTF8";
+            charset->Close();
             session.Finish();
         } catch (const std::exception &) {
             nls_comp_binary = false;
+            database_unicode = false;
         }
     }
 
@@ -2159,10 +2172,17 @@ public:
         if (cached != schema_aliases.end()) {
             return cached->second;
         }
+        // A miss is remembered until the next DDL through this ATTACH, which
+        // can create the schema; DETACH and ATTACH see one created elsewhere.
+        const auto version = state->epoch->version.load();
+        if (missing_version != version) {
+            missing_schemas.clear();
+            missing_version = version;
+        }
         if (missing_schemas.count(requested)) {
             return nullptr;
         }
-        if (schema_aliases.size() + missing_schemas.size() >= 4096) {
+        if (schema_aliases.size() >= 4096) {
             throw BinderException("Oracle ATTACH exceeds the 4096 named-schema limit");
         }
         auto scoped = make_shared_ptr<OracleAttachedState>();
@@ -2172,12 +2192,15 @@ public:
         scoped->transaction_pool = state->transaction_pool;
         scoped->current_schema = state->current_schema;
         scoped->nls_comp_binary = state->nls_comp_binary;
+        scoped->database_unicode = state->database_unicode;
         scoped->epoch = state->epoch;
         scoped->named_schema = true;
         scoped->owner = requested;
         if (!known_owner && requested != state->current_schema && requested != state->owner &&
             !scoped->ResolveOwner(true)) {
-            missing_schemas.insert(requested);
+            if (missing_schemas.size() < 4096) {
+                missing_schemas.insert(requested);
+            }
             return nullptr;
         }
         const auto system = CatalogTransaction::GetSystemTransaction(GetDatabase());
@@ -2269,6 +2292,7 @@ private:
     bool schemas_discovered = false;
     std::unordered_map<std::string, OracleSchemaEntry *> schema_aliases;
     std::unordered_set<std::string> missing_schemas;
+    idx_t missing_version = 0;
 };
 
 constexpr int64_t ORACLE_TRANSACTION_POOL_DEFAULT_SIZE = 2;
