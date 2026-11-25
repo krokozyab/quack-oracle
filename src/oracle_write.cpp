@@ -332,7 +332,8 @@ oracle_scanner::OracleDateTime DateTimeFromValue(const Value &value, const Oracl
         timestamp_ns_t parsed;
         // Strict, so text carrying an offset or a zone is refused rather than
         // written as its wall time with the zone dropped.
-        if (Timestamp::TryConvertTimestamp(text.c_str(), text.size(), parsed, false, true) != TimestampCastResult::SUCCESS) {
+        if (Timestamp::TryConvertTimestamp(text.c_str(), text.size(), parsed, false, true) !=
+            TimestampCastResult::SUCCESS) {
             RefuseValue(column, "'" + text + "' is not an ISO date or timestamp without a time zone");
         }
         auto microseconds = parsed.value / 1000;

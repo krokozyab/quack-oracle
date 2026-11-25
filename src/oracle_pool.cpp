@@ -38,12 +38,10 @@ namespace {
 // check) must not keep logging in the old way, which with a wrong password
 // counts towards the account's lockout.
 std::string PoolKey(const std::string &secret_name, const ConnectionConfig &config, const std::string &password) {
-    const auto credentials =
-        std::hash<std::string> {}(password + '\x1f' + config.wallet_password + '\x1f' + config.wallet_pem_file + '\x1f' +
-                                  config.tls_ca_file + '\x1f' + config.tls_server_cert_dn + '\x1f' +
-                                  config.tls_server_name + '\x1f' + config.tls_sni_name + '\x1f' +
-                                  config.client_identifier + '\x1f' + config.module + '\x1f' + config.action +
-                                  '\x1f' + config.client_info);
+    const auto credentials = std::hash<std::string> {}(
+        password + '\x1f' + config.wallet_password + '\x1f' + config.wallet_pem_file + '\x1f' + config.tls_ca_file +
+        '\x1f' + config.tls_server_cert_dn + '\x1f' + config.tls_server_name + '\x1f' + config.tls_sni_name + '\x1f' +
+        config.client_identifier + '\x1f' + config.module + '\x1f' + config.action + '\x1f' + config.client_info);
     // The target key names every configured address, the service and the
     // routing policy — never where one connect happened to land — so two
     // sessions share a pool only when they would be opened the same way.

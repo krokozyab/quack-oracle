@@ -177,8 +177,8 @@ bool OracleQueryLocksRows(const std::string &sql) {
             after_for = false;
         } else if (std::isalpha(static_cast<unsigned char>(sql[index])) || sql[index] == '_') {
             std::string word;
-            while (index < sql.size() && (std::isalnum(static_cast<unsigned char>(sql[index])) ||
-                   sql[index] == '_' || sql[index] == '$' || sql[index] == '#')) {
+            while (index < sql.size() && (std::isalnum(static_cast<unsigned char>(sql[index])) || sql[index] == '_' ||
+                                          sql[index] == '$' || sql[index] == '#')) {
                 word += static_cast<char>(std::toupper(static_cast<unsigned char>(sql[index++])));
             }
             if (after_for && word == "UPDATE") {

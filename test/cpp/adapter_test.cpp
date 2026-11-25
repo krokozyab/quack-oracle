@@ -1792,8 +1792,9 @@ void TestNamedCallRequestAndOutputs() {
     // commits nothing and its session takes the work with it.
     CHECK(script->commits == 1);
     script->call_should_fail = true;
-    CHECK(database.Query("SELECT * FROM oracle_call_named('ora', 'app.compute', "
-                         "[{name: 'i', direction: 'in', type: 'number', value: '3'}])")
+    CHECK(database
+              .Query("SELECT * FROM oracle_call_named('ora', 'app.compute', "
+                     "[{name: 'i', direction: 'in', type: 'number', value: '3'}])")
               ->HasError());
     CHECK(script->commits == 1);
 }
@@ -2229,7 +2230,7 @@ void TestAutomaticCallBindsFromTheSignature() {
     // A procedure with no arguments has no ALL_ARGUMENTS row; ALL_PROCEDURES
     // answers for it with a row that carries no position, and it is callable.
     WireRow no_arguments {Text("APP"), Text("PKG"), Text("RESET"), WireValue(), WireValue(),
-                          WireValue(), WireValue(), WireValue(), Number("0")};
+                          WireValue(), WireValue(), WireValue(),   Number("0")};
     script->rows = {no_arguments};
     script->call_outputs.clear();
     CHECK(!database.Query("SELECT * FROM oracle_call_auto('ora', 'pkg.reset', []::VARCHAR[]);")->HasError());
@@ -2495,7 +2496,8 @@ void TestFailedSnapshotReadDropsItsPooledSession() {
     auto script = std::make_shared<FakeScript>();
     script->routes = {
         {"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}},
-        {"get_system_change_number", {{Column("SCN", 2)}, {{Number("100")}}, oracle_scanner::ProtocolErrorKind::TRUNCATED}},
+        {"get_system_change_number",
+         {{Column("SCN", 2)}, {{Number("100")}}, oracle_scanner::ProtocolErrorKind::TRUNCATED}},
         {"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("ITEMS")}}}},
         {"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}},
         {"FROM user_tab_columns",
@@ -5458,16 +5460,16 @@ void TestAttachedUpsertsUseOracleMerge() {
                  "ON t.ID=s.ID WHEN NOT MATCHED THEN INSERT(ID,LABEL) VALUES(s.ID,s.LABEL);");
     database.Run("INSERT INTO ora.main.ITEMS VALUES (70,'a'),(70,'b') ON CONFLICT DO NOTHING;");
 
-    for (const auto *sql : {
-            "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT);",
-            "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT),(91,NULL);",
-            "INSERT INTO ora.main.ITEMS(ID,LABEL) VALUES (90,DEFAULT) RETURNING ID;",
-            "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT) ON CONFLICT DO NOTHING;",
-            "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT),(91,DEFAULT) ON CONFLICT DO NOTHING;",
-            "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT),(91,NULL) ON CONFLICT DO NOTHING;",
-            "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT) ON CONFLICT(ID) DO UPDATE SET LABEL=excluded.LABEL;",
-            "INSERT OR REPLACE INTO ora.main.ITEMS VALUES (90,DEFAULT);",
-            "UPDATE ora.main.ITEMS SET LABEL=DEFAULT WHERE ID=1;"}) {
+    for (const auto *sql :
+         {"INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT);",
+          "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT),(91,NULL);",
+          "INSERT INTO ora.main.ITEMS(ID,LABEL) VALUES (90,DEFAULT) RETURNING ID;",
+          "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT) ON CONFLICT DO NOTHING;",
+          "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT),(91,DEFAULT) ON CONFLICT DO NOTHING;",
+          "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT),(91,NULL) ON CONFLICT DO NOTHING;",
+          "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT) ON CONFLICT(ID) DO UPDATE SET LABEL=excluded.LABEL;",
+          "INSERT OR REPLACE INTO ora.main.ITEMS VALUES (90,DEFAULT);",
+          "UPDATE ora.main.ITEMS SET LABEL=DEFAULT WHERE ID=1;"}) {
         const auto writes = script->counted_executes.size();
         auto result = database.Query(sql);
         CHECK(result->HasError() && result->GetError().find("explicit DEFAULT") != std::string::npos);
@@ -5832,8 +5834,9 @@ void TestParallelScanRangesDoNotOverflow() {
             CHECK(statement.find("\"ID\" <= ") == std::string::npos);
             if (statement.find("AS OF SCN") != std::string::npos && low_at != std::string::npos) {
                 ranges.emplace_back(std::stoll(statement.substr(low_at + 8)),
-                                    high_at == std::string::npos ? std::nullopt
-                                                                 : std::optional<long long>(std::stoll(statement.substr(high_at + 7))));
+                                    high_at == std::string::npos
+                                        ? std::nullopt
+                                        : std::optional<long long>(std::stoll(statement.substr(high_at + 7))));
             }
         }
         std::sort(ranges.begin(), ranges.end());

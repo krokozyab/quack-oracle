@@ -438,16 +438,13 @@ struct OracleAttachedState {
         if (byte_width < 0) {
             throw IOException("Oracle ATTACH received negative USER_TAB_COLUMNS DATA_LENGTH");
         }
-        OracleColumn column {name,
-                             oracle_type,
-                             static_cast<uint32_t>(byte_width),
+        OracleColumn column {name, oracle_type, static_cast<uint32_t>(byte_width),
                              // INTEGER and NUMBER(*,s) have no DATA_PRECISION but a scale;
                              // the describe reports them as precision 38, so must this.
                              type == "NUMBER" && !row[offset + 3] && row[offset + 4] ? int16_t(38)
                                                                                      : number(row[offset + 3], 0),
                              number(row[offset + 4], 0),
-                             std::string(row[offset + 5]->begin(), row[offset + 5]->end()) == "Y",
-                             character_set_form};
+                             std::string(row[offset + 5]->begin(), row[offset + 5]->end()) == "Y", character_set_form};
         column.xml = xml;
         // A column that declares a collation of its own is settled afterwards, by
         // ApplyCollationsLocked; this is the default, NLS_COMP's.
@@ -2599,10 +2596,10 @@ std::string OracleSnapshotOfHeapTable(ClientContext &context, const OracleQueryB
             scn = scn_rows[0][0];
         }
         const bool own = bind.schema_name.empty();
-        const auto kind = PooledTextRows(session, std::string("SELECT iot_type, temporary, cluster_name FROM ") +
-                                                 (own ? "user_tables" : "all_tables") +
-                                                 " WHERE table_name = " + TextLiteral(bind.object_name) +
-                                                 (own ? std::string() : " AND owner = " + TextLiteral(bind.schema_name)));
+        const auto kind = PooledTextRows(
+            session, std::string("SELECT iot_type, temporary, cluster_name FROM ") +
+                         (own ? "user_tables" : "all_tables") + " WHERE table_name = " + TextLiteral(bind.object_name) +
+                         (own ? std::string() : " AND owner = " + TextLiteral(bind.schema_name)));
         if (kind.size() != 1 || !kind[0][0].empty() || kind[0][1] != "N" || !kind[0][2].empty()) {
             return std::string();
         }
