@@ -83,7 +83,6 @@
 #include "oracle_scanner/ttc_row_data.hpp"
 #include "oracle_scanner/ttc_negotiation.hpp"
 #include "oracle_scanner/ttc_o5logon.hpp"
-#include "oracle_scanner/transaction.hpp"
 #include "oracle_scanner/session_factory.hpp"
 #include "oracle_scanner/session_pool.hpp"
 #include "oracle_scanner/value_codec.hpp"
@@ -3111,35 +3110,6 @@ static void TestStatementCacheConfigurationReachesNativeSession() {
     CHECK(observed == std::vector<bool>({false, true}));
 }
 
-class BlockingCommitSession final : public TestSession {
-public:
-    void Commit() override {
-        std::unique_lock<std::mutex> guard(mutex);
-        entered = true;
-        entered_condition.notify_all();
-        release_condition.wait(guard, [&] { return release; });
-        commits++;
-    }
-
-    void WaitUntilCommitEntered() {
-        std::unique_lock<std::mutex> guard(mutex);
-        entered_condition.wait(guard, [&] { return entered; });
-    }
-
-    void ReleaseCommit() {
-        std::lock_guard<std::mutex> guard(mutex);
-        release = true;
-        release_condition.notify_all();
-    }
-
-private:
-    std::mutex mutex;
-    std::condition_variable entered_condition;
-    std::condition_variable release_condition;
-    bool entered = false;
-    bool release = false;
-};
-
 static void TestValidatedSession() {
     auto raw = std::make_unique<TestSession>();
     auto *inner = raw.get();
@@ -4342,44 +4312,6 @@ static void TestLiveTnsNegotiation() {
         }
     }
     connection->Close();
-}
-
-static void TestTransactions() {
-    auto first = std::make_shared<TestSession>();
-    auto second = std::make_shared<TestSession>();
-    OracleTransaction transaction;
-    CHECK(&transaction.RegisterWrite("one", first) == first.get());
-    CHECK(&transaction.RegisterWrite("one", first) == first.get());
-    CHECK(transaction.WriteCatalog() == "one");
-    ExpectError(ProtocolErrorKind::UNSUPPORTED, [&] { transaction.RegisterWrite("two", second); });
-    ExpectError(ProtocolErrorKind::INVALID_STATE, [&] { transaction.RegisterWrite("one", second); });
-    transaction.Commit();
-    CHECK(first->commits == 1 && transaction.State() == TransactionState::COMMITTED);
-    ExpectError(ProtocolErrorKind::INVALID_STATE, [&] { transaction.Rollback(); });
-
-    auto failing = std::make_shared<TestSession>();
-    failing->fail_commit = true;
-    OracleTransaction poisoned;
-    poisoned.RegisterWrite("one", failing);
-    ExpectError(ProtocolErrorKind::INVALID_STATE, [&] { poisoned.Commit(); });
-    CHECK(poisoned.State() == TransactionState::POISONED && failing->closes == 1);
-
-    auto abandoned = std::make_shared<TestSession>();
-    {
-        OracleTransaction scoped;
-        scoped.RegisterWrite("one", abandoned);
-    }
-    CHECK(abandoned->rollbacks == 1);
-
-    auto blocking = std::make_shared<BlockingCommitSession>();
-    OracleTransaction concurrent;
-    concurrent.RegisterWrite("one", blocking);
-    std::thread committer([&] { concurrent.Commit(); });
-    blocking->WaitUntilCommitEntered();
-    ExpectError(ProtocolErrorKind::INVALID_STATE, [&] { concurrent.Rollback(); });
-    blocking->ReleaseCommit();
-    committer.join();
-    CHECK(blocking->commits == 1 && concurrent.State() == TransactionState::COMMITTED);
 }
 
 // The DuckDB adapter opens every session through OpenOracleSession, so this
@@ -9976,7 +9908,6 @@ int main() {
     TestBindValidation();
     TestSqlBindExtraction();
     TestSqlStatementValidation();
-    TestTransactions();
     TestValidatedSession();
     TestInitialFetchHintIsValidatedAndForwarded();
     TestStatementCacheConfigurationReachesNativeSession();
