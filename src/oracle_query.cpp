@@ -3178,7 +3178,10 @@ static size_t OracleScanFetchRows(ClientContext &context, const OracleQueryBindD
         }
         width += 16 + MaxValue<size_t>(column.byte_width, 32);
     }
-    return MinValue<size_t>(requested, MaxValue<size_t>(1, (8U << 20U) / MaxValue<size_t>(width, 1)));
+    // Every row at its declared width must still fit one response (64 MiB), so
+    // the estimate is the worst case; real VARCHAR2(4000) values are usually far
+    // shorter. 8 MiB here made a 50-column table fetch 144 rows a round trip.
+    return MinValue<size_t>(requested, MaxValue<size_t>(1, (48U << 20U) / MaxValue<size_t>(width, 1)));
 }
 
 namespace {
