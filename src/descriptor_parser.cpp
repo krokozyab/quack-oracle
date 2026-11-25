@@ -693,15 +693,26 @@ std::string FindTnsAliasDescriptor(const std::string &tnsnames, const std::strin
             cursor++;
         }
         if (cursor < end && tnsnames[cursor] != '#' && tnsnames[cursor] != ';') {
-            const auto name_begin = cursor;
-            while (cursor < end && !std::isspace(static_cast<unsigned char>(tnsnames[cursor])) && tnsnames[cursor] != '=') {
-                cursor++;
+            // One entry may carry several names: "a, b = (DESCRIPTION=...)".
+            const auto equals = tnsnames.find('=', cursor);
+            bool named = false;
+            if (equals != std::string::npos && equals < end) {
+                size_t name_begin = cursor;
+                while (name_begin <= equals) {
+                    auto name_end = tnsnames.find(',', name_begin);
+                    if (name_end == std::string::npos || name_end > equals) {
+                        name_end = equals;
+                    }
+                    auto name = tnsnames.substr(name_begin, name_end - name_begin);
+                    const auto first = name.find_first_not_of(" \t");
+                    const auto last = name.find_last_not_of(" \t");
+                    name = first == std::string::npos ? std::string() : name.substr(first, last - first + 1);
+                    named = named || (!name.empty() && Upper(name) == expected);
+                    name_begin = name_end + 1;
+                }
+                cursor = equals;
             }
-            const auto name = tnsnames.substr(name_begin, cursor - name_begin);
-            while (cursor < end && std::isspace(static_cast<unsigned char>(tnsnames[cursor]))) {
-                cursor++;
-            }
-            if (Upper(name) == expected && cursor < end && tnsnames[cursor] == '=') {
+            if (named) {
                 cursor++;
                 while (cursor < tnsnames.size() && std::isspace(static_cast<unsigned char>(tnsnames[cursor]))) {
                     cursor++;

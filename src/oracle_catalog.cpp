@@ -2737,9 +2737,12 @@ std::vector<OracleColumn> ProjectedDescribe(const OracleQueryBindData &bind, con
         const auto &dictionary = bind.columns[selected[index]];
         const auto &actual = columns[index];
         const auto character_form = [](const OracleColumn &column) {
-            return (column.oracle_type == 1 || column.oracle_type == 96 || column.oracle_type == 112) &&
+            // The dictionary gives a character column no form; the describe says 1.
+            return (column.oracle_type == 1 || column.oracle_type == 96 || column.oracle_type == 112 ||
+                    column.oracle_type == 8) &&
                            column.character_set_form == 0
-                       ? uint8_t(1) : column.character_set_form;
+                       ? uint8_t(1)
+                       : column.character_set_form;
         };
         const auto number_scale = [](const OracleColumn &column) {
             // Unconstrained NUMBER is described with either 0 or -127 scale.

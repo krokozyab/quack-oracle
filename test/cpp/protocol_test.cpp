@@ -293,6 +293,15 @@ static void TestWalletArchive() {
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)ReadWalletPemArchive(missing_path); });
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)FindTnsAliasDescriptor(tnsnames, "missing"); });
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)FindTnsAliasDescriptor(duplicate_aliases, "unit_low"); });
+    // One entry, several names, as tnsnames.ora allows.
+    const std::string shared_entry =
+        "unit_a, unit_b =\n  (DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=h)(PORT=1521))"
+        "(CONNECT_DATA=(SERVICE_NAME=s)))\nunit_c,unit_d=(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)"
+        "(HOST=h2)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=s2)))\n";
+    CHECK(ParseConnectDescriptor(FindTnsAliasDescriptor(shared_entry, "unit_a")).service_name == "s");
+    CHECK(ParseConnectDescriptor(FindTnsAliasDescriptor(shared_entry, "UNIT_B")).service_name == "s");
+    CHECK(ParseConnectDescriptor(FindTnsAliasDescriptor(shared_entry, "unit_d")).service_name == "s2");
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)FindTnsAliasDescriptor(shared_entry, "unit"); });
     WriteWalletArchiveForTest(duplicate_path, {{"ewallet.pem", pem}, {"ewallet.pem", pem}});
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)ReadWalletPemArchive(duplicate_path); });
     WriteWalletArchiveForTest(nested_path, {{"wallet/ewallet.pem", pem}});
@@ -2249,7 +2258,8 @@ static std::string PemOf(const std::function<int(BIO *)> &writer) {
 
 // A self-signed certificate that is also its own trust root, so a test can hand
 // it to the client as the CA and get a chain of one.
-static Identity MakeIdentity(const std::string &common_name, long not_before_seconds, long not_after_seconds) {
+static Identity MakeIdentity(const std::string &common_name, long not_before_seconds, long not_after_seconds,
+                             const std::string &organization = std::string()) {
     std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> key_context(
         EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr), EVP_PKEY_CTX_free);
     CHECK(key_context && EVP_PKEY_keygen_init(key_context.get()) == 1);
@@ -2268,6 +2278,11 @@ static Identity MakeIdentity(const std::string &common_name, long not_before_sec
     auto *name = X509_get_subject_name(certificate.get());
     CHECK(X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
                                       reinterpret_cast<const unsigned char *>(common_name.c_str()), -1, -1, 0) == 1);
+    if (!organization.empty()) {
+        CHECK(X509_NAME_add_entry_by_txt(name, "O", MBSTRING_UTF8,
+                                         reinterpret_cast<const unsigned char *>(organization.c_str()), -1, -1,
+                                         0) == 1);
+    }
     CHECK(X509_set_issuer_name(certificate.get(), name) == 1);
     X509V3_CTX extension_context;
     X509V3_set_ctx_nodb(&extension_context);
@@ -2529,6 +2544,18 @@ static void TestLocalTlsCertificateVerification() {
         tls.ca_pem_contents = valid.certificate_pem;
         tls.expected_server_dn = "CN=oracle-scanner.invalid";
         ExpectConnectFailure(ConnectFailure::TLS_VERIFICATION, [&] { (void)OpenSslByteStream::Connect("127.0.0.1", server.Port(), 5, 5, true, tls); });
+    }
+    // A subject with non-ASCII text matches the DN as written, not its \XX escapes.
+    {
+        const auto named = local_tls::MakeIdentity(server_name, -60, 3600, "Jörg Örebro AB");
+        local_tls::Server server(named);
+        TlsConfiguration tls;
+        tls.server_name = server_name;
+        tls.ca_pem_contents = named.certificate_pem;
+        tls.expected_server_dn = "CN=" + server_name + ",O=Jörg Örebro AB";
+        auto stream = OpenSslByteStream::Connect("127.0.0.1", server.Port(), 5, 5, true, tls);
+        CHECK(stream);
+        stream->Close();
     }
 }
 #endif // !_WIN32

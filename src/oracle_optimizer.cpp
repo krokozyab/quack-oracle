@@ -51,6 +51,9 @@ namespace duckdb {
 
 namespace {
 
+// A column this path reads as itself: no LOB, LONG, JSON, VECTOR or XML.
+bool PlainColumn(const OracleColumn &column);
+
 // Rows past this are not worth asking Oracle to rank for: the statement says how
 // many rows to return, and a client-side heap of that size is no longer cheap.
 constexpr idx_t MAX_PUSHED_TOP_N = 100000;
@@ -317,6 +320,11 @@ bool PlanPushedAggregate(ClientContext &context, LogicalAggregate &aggregate, Lo
 		const auto &source = bind.columns[column];
 		const auto type = MappedType(source);
 		if (name == "count" && wanted == LogicalType::BIGINT) {
+            if (!PlainColumn(source)) {
+                // Oracle refuses COUNT over LONG (ORA-00997); LOBs, JSON and
+                // VECTOR are not compared by value either. DuckDB counts them.
+                return false;
+            }
             if (call.IsDistinct()) {
                 const bool text_key = type.id() == LogicalTypeId::VARCHAR && source.oracle_type == 1 &&
                                       source.character_set_form != 2 && !source.xml && source.compared_as_bytes;

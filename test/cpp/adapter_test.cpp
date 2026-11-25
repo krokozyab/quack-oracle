@@ -3879,6 +3879,14 @@ void TestTextComparesByTheSessionCollation() {
         auto code = database.Query("SELECT ID FROM o.main.ITEMS WHERE CODE = 'beta';");
         CHECK(!code->HasError() && code->RowCount() == 1 && code->GetValue(0, 0).ToString() == "1");
         CHECK(!pushed(script, "\"CODE\" ="));
+        // The snapshot marker a pushed statement rewrites, and a constant past
+        // Oracle's 4000-byte literal, are compared by DuckDB instead.
+        auto marker = database.Query("SELECT ID FROM o.main.ITEMS WHERE LABEL = 'beta /*SCN*/';");
+        CHECK(!marker->HasError() && marker->RowCount() == 0);
+        CHECK(!pushed(script, "/*SCN*/"));
+        auto longer = database.Query("SELECT ID FROM o.main.ITEMS WHERE LABEL = '" + std::string(4001, 'x') + "';");
+        CHECK(!longer->HasError() && longer->RowCount() == 0);
+        CHECK(!pushed(script, "xxxx"));
         // Grouping needs only equality: by LABEL in Oracle, by CODE in DuckDB.
         database.Run("SET oracle_aggregate_pushdown = true;");
         script->routes.insert(script->routes.begin(),
@@ -4091,6 +4099,37 @@ void TestLargeScalarFetchKeepsRowsAndLocalFilters() {
 // Names that are not schemas are remembered so a binder's repeated lookups do
 // not each ask Oracle, but they do not count toward the limit on schemas: past
 // 4096 of them a real schema still resolves.
+// Oracle refuses COUNT over a LONG column (ORA-00997), so DuckDB counts it.
+void TestCountOfALongColumnStaysLocal() {
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+    script->routes.push_back({"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("NOTES")}}}});
+    script->routes.push_back({"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}});
+    script->routes.push_back(
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {{Text("NOTES"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("N")},
+           {Text("NOTES"), Text("BODY"), Text("LONG"), Number("0"), WireValue(), WireValue(), Text("Y")}}}});
+    script->routes.push_back({"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}});
+    // Described as Oracle describes a LONG: a character column, form 1.
+    auto body = Column("BODY", 8);
+    body.character_set_form = 1;
+    script->tables["NOTES"] = {
+        {Column("ID", 2, 10, 0), body},
+        {{Number("1"), Text("first")}, {Number("2"), WireValue()}, {Number("3"), Text("third")}}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner); SET oracle_aggregate_pushdown = true; "
+                 "SET oracle_parallel_scan = 1;");
+    auto counted = database.Query("SELECT count(BODY) FROM o.main.NOTES");
+    CHECK(!counted->HasError() && counted->GetValue(0, 0).ToString() == "2");
+    for (const auto &query : script->queries) {
+        CHECK(query.find("COUNT(\"BODY\")") == std::string::npos);
+    }
+    std::cout << "COUNT over a LONG column is counted by DuckDB" << std::endl;
+}
+
 void TestMissingSchemasDoNotExhaustTheSchemaLimit() {
     auto script = std::make_shared<FakeScript>();
     script->routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
@@ -7728,6 +7767,7 @@ int main() {
     TestDirectConversionFailureKeepsSessionUsable();
     TestUnselectedLobKeepsLargeScalarFetches();
     TestWideDirectScanFallsBackBeforeFetching();
+    TestCountOfALongColumnStaysLocal();
     TestMissingSchemasDoNotExhaustTheSchemaLimit();
     TestNestedOracleJoinsAndAggregates();
     TestExactAveragePartialPushdown();
