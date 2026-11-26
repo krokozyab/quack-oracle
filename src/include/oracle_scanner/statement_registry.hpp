@@ -21,7 +21,8 @@ struct OracleStatementHandle {
 // from a validated server response and is never guessed by this registry.
 class OracleStatementRegistry {
 public:
-    explicit OracleStatementRegistry(size_t maximum_open_statements = 64);
+    static constexpr size_t default_maximum_open_statements = 64;
+    explicit OracleStatementRegistry(size_t maximum_open_statements = default_maximum_open_statements);
 
     OracleStatementHandle Open(OracleSqlKind kind);
     void BindRemoteCursor(OracleStatementHandle handle, uint32_t remote_cursor_id);

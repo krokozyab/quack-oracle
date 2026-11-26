@@ -618,8 +618,9 @@ std::unique_ptr<OpenSslByteStream> OpenSslByteStream::Connect(const std::string 
                                          "Oracle TLS peer sent no certificate");
             }
             const BioPtr rendered(BIO_new(BIO_s_mem()), BIO_free);
-            if (!rendered ||
-                X509_NAME_print_ex(rendered.get(), X509_get_subject_name(peer.get()), 0, XN_FLAG_RFC2253) < 0) {
+            if (!rendered || X509_NAME_print_ex(rendered.get(), X509_get_subject_name(peer.get()), 0,
+                                                // UTF-8 as itself, not \C3\B6, so it compares with the DN as written.
+                                                XN_FLAG_RFC2253 & ~ASN1_STRFLGS_ESC_MSB) < 0) {
                 throw ProtocolError(ProtocolErrorKind::INVALID_STATE,
                                     "Oracle TLS peer certificate subject could not be read");
             }

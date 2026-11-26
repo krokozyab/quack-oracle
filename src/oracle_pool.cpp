@@ -18,7 +18,9 @@
 
 #include "oracle_scanner/session_factory.hpp"
 #include "oracle_scanner/session_pool.hpp"
+#include "oracle_scanner/transaction_session_pool.hpp"
 
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -31,15 +33,21 @@ using oracle_scanner::OracleSessionPool;
 namespace {
 
 // What a pooled session must agree on before it can answer a second statement.
-// The password is deliberately not part of it: it is never copied anywhere it
-// does not already have to be, and a caller reaching this key already holds the
-// connection whose credentials opened the session.
-std::string PoolKey(const std::string &secret_name, const ConnectionConfig &config) {
+// The password and the TLS/wallet settings take part only as a hash: a secret
+// replaced under the same name (a rotated password, a tightened certificate
+// check) must not keep logging in the old way, which with a wrong password
+// counts towards the account's lockout.
+std::string PoolKey(const std::string &secret_name, const ConnectionConfig &config, const std::string &password) {
+    const auto credentials = std::hash<std::string> {}(
+        password + '\x1f' + config.wallet_password + '\x1f' + config.wallet_pem_file + '\x1f' + config.tls_ca_file +
+        '\x1f' + config.tls_server_cert_dn + '\x1f' + config.tls_server_name + '\x1f' + config.tls_sni_name + '\x1f' +
+        config.client_identifier + '\x1f' + config.module + '\x1f' + config.action + '\x1f' + config.client_info);
     // The target key names every configured address, the service and the
     // routing policy — never where one connect happened to land — so two
     // sessions share a pool only when they would be opened the same way.
     return secret_name + "\x1f" + oracle_scanner::ConnectionTargetKey(config) + "\x1f" + config.user + "\x1f" +
-           (config.protocol == oracle_scanner::TransportProtocol::TCPS ? "tcps" : "tcp");
+           (config.protocol == oracle_scanner::TransportProtocol::TCPS ? "tcps" : "tcp") + "\x1f" +
+           std::to_string(credentials);
 }
 
 struct OraclePoolState final : ClientContextState {
@@ -53,9 +61,14 @@ struct OraclePoolState final : ClientContextState {
         if (existing != pools.end()) {
             return *existing->second;
         }
-        auto pool = std::make_unique<OracleSessionPool>(maximum_sessions, [config, password]() {
-            return std::shared_ptr<OracleSession>(oracle_scanner::OpenOracleSession(config, password));
-        });
+        // Shared, so copying the factory copies a pointer and cannot throw.
+        const auto login = std::make_shared<const std::pair<ConnectionConfig, std::string>>(config, password);
+        auto pool = std::make_unique<OracleSessionPool>(
+            maximum_sessions,
+            [login]() {
+                return std::shared_ptr<OracleSession>(oracle_scanner::OpenOracleSession(login->first, login->second));
+            },
+            oracle_scanner::OracleTransactionSessionPool::SelectFromDual);
         auto &reference = *pool;
         pools.emplace(key, std::move(pool));
         return reference;
@@ -115,7 +128,7 @@ OracleSessionHandle AcquireOracleReadSession(ClientContext &context, const std::
     const auto maximum_sessions = ConfiguredPoolSize(context);
     if (maximum_sessions > 0) {
         auto state = context.registered_state->GetOrCreate<OraclePoolState>("oracle_scanner.session_pool");
-        auto &pool = state->PoolFor(PoolKey(secret_name, config), maximum_sessions, config, password);
+        auto &pool = state->PoolFor(PoolKey(secret_name, config, password), maximum_sessions, config, password);
         try {
             handle.lease = pool.Acquire();
             handle.Get().SetStatementCacheEnabled(config.statement_cache);

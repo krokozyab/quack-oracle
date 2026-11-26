@@ -77,6 +77,7 @@ set(EXTENSION_SOURCES
     src/oracle_parallel.cpp
     src/ttc_fetch_response.cpp
     src/lob_prefetch_fetch.cpp
+    src/ttc_row_shape.cpp
     src/ttc_describe.cpp
     src/ttc_execute_response.cpp
     src/ttc_cursor.cpp
@@ -104,7 +105,6 @@ set(EXTENSION_SOURCES
     src/connect_plan.cpp
     src/statement_registry.cpp
     src/call_registry.cpp
-    src/transaction.cpp
     src/session_pool.cpp
     src/transaction_session_pool.cpp)
 
@@ -161,6 +161,7 @@ if(ORACLE_SCANNER_BUILD_TESTS)
                  src/native_session.cpp
                  src/ttc_fetch_response.cpp
                  src/lob_prefetch_fetch.cpp
+                 src/ttc_row_shape.cpp
                  src/ttc_describe.cpp
                  src/ttc_execute_response.cpp
                  src/ttc_cursor.cpp
@@ -188,7 +189,6 @@ if(ORACLE_SCANNER_BUILD_TESTS)
     src/connect_plan.cpp
                  src/statement_registry.cpp
                  src/call_registry.cpp
-                 src/transaction.cpp
                  src/session_pool.cpp
                  src/transaction_session_pool.cpp)
   target_link_libraries(oracle_scanner_protocol_test PRIVATE OpenSSL::SSL OpenSSL::Crypto duckdb_miniz)

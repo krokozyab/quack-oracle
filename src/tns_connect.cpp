@@ -44,11 +44,12 @@ std::vector<TnsPacket> BuildTnsConnectPackets(const std::string &descriptor, con
     StoreUInt16(payload, 16, static_cast<uint16_t>(descriptor.size()));
     StoreUInt16(payload, 18, static_cast<uint16_t>(CONNECT_HEADER_TOTAL_SIZE));
     StoreUInt32(payload, 20, 0); // no extra receive buffer reservation
+    // NSI flags, sent twice as current thin clients do: security renegotiation
+    // plus no native authentication.
     payload[24] = 0x84;
-    payload[25] = 0x84; // protocol capabilities used by current thin clients
+    payload[25] = 0x84;
     payload[52] = 0x20;
     payload[56] = 0x20;
-    payload[25] = 0x84; // security renegotiation plus no native authentication
     payload[65] = options.supports_oob ? 0x01 : 0x00;
     if (descriptor_is_inline) {
         std::copy(descriptor.begin(), descriptor.end(), payload.begin() + CONNECT_FIXED_PAYLOAD_SIZE);

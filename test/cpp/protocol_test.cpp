@@ -83,7 +83,6 @@
 #include "oracle_scanner/ttc_row_data.hpp"
 #include "oracle_scanner/ttc_negotiation.hpp"
 #include "oracle_scanner/ttc_o5logon.hpp"
-#include "oracle_scanner/transaction.hpp"
 #include "oracle_scanner/session_factory.hpp"
 #include "oracle_scanner/session_pool.hpp"
 #include "oracle_scanner/value_codec.hpp"
@@ -294,6 +293,15 @@ static void TestWalletArchive() {
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)ReadWalletPemArchive(missing_path); });
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)FindTnsAliasDescriptor(tnsnames, "missing"); });
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)FindTnsAliasDescriptor(duplicate_aliases, "unit_low"); });
+    // One entry, several names, as tnsnames.ora allows.
+    const std::string shared_entry =
+        "unit_a, unit_b =\n  (DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=h)(PORT=1521))"
+        "(CONNECT_DATA=(SERVICE_NAME=s)))\nunit_c,unit_d=(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)"
+        "(HOST=h2)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=s2)))\n";
+    CHECK(ParseConnectDescriptor(FindTnsAliasDescriptor(shared_entry, "unit_a")).service_name == "s");
+    CHECK(ParseConnectDescriptor(FindTnsAliasDescriptor(shared_entry, "UNIT_B")).service_name == "s");
+    CHECK(ParseConnectDescriptor(FindTnsAliasDescriptor(shared_entry, "unit_d")).service_name == "s2");
+    ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)FindTnsAliasDescriptor(shared_entry, "unit"); });
     WriteWalletArchiveForTest(duplicate_path, {{"ewallet.pem", pem}, {"ewallet.pem", pem}});
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)ReadWalletPemArchive(duplicate_path); });
     WriteWalletArchiveForTest(nested_path, {{"wallet/ewallet.pem", pem}});
@@ -2250,7 +2258,8 @@ static std::string PemOf(const std::function<int(BIO *)> &writer) {
 
 // A self-signed certificate that is also its own trust root, so a test can hand
 // it to the client as the CA and get a chain of one.
-static Identity MakeIdentity(const std::string &common_name, long not_before_seconds, long not_after_seconds) {
+static Identity MakeIdentity(const std::string &common_name, long not_before_seconds, long not_after_seconds,
+                             const std::string &organization = std::string()) {
     std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> key_context(
         EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr), EVP_PKEY_CTX_free);
     CHECK(key_context && EVP_PKEY_keygen_init(key_context.get()) == 1);
@@ -2269,6 +2278,11 @@ static Identity MakeIdentity(const std::string &common_name, long not_before_sec
     auto *name = X509_get_subject_name(certificate.get());
     CHECK(X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
                                       reinterpret_cast<const unsigned char *>(common_name.c_str()), -1, -1, 0) == 1);
+    if (!organization.empty()) {
+        CHECK(X509_NAME_add_entry_by_txt(name, "O", MBSTRING_UTF8,
+                                         reinterpret_cast<const unsigned char *>(organization.c_str()), -1, -1,
+                                         0) == 1);
+    }
     CHECK(X509_set_issuer_name(certificate.get(), name) == 1);
     X509V3_CTX extension_context;
     X509V3_set_ctx_nodb(&extension_context);
@@ -2530,6 +2544,18 @@ static void TestLocalTlsCertificateVerification() {
         tls.ca_pem_contents = valid.certificate_pem;
         tls.expected_server_dn = "CN=oracle-scanner.invalid";
         ExpectConnectFailure(ConnectFailure::TLS_VERIFICATION, [&] { (void)OpenSslByteStream::Connect("127.0.0.1", server.Port(), 5, 5, true, tls); });
+    }
+    // A subject with non-ASCII text matches the DN as written, not its \XX escapes.
+    {
+        const auto named = local_tls::MakeIdentity(server_name, -60, 3600, "Jörg Örebro AB");
+        local_tls::Server server(named);
+        TlsConfiguration tls;
+        tls.server_name = server_name;
+        tls.ca_pem_contents = named.certificate_pem;
+        tls.expected_server_dn = "CN=" + server_name + ",O=Jörg Örebro AB";
+        auto stream = OpenSslByteStream::Connect("127.0.0.1", server.Port(), 5, 5, true, tls);
+        CHECK(stream);
+        stream->Close();
     }
 }
 #endif // !_WIN32
@@ -3111,35 +3137,6 @@ static void TestStatementCacheConfigurationReachesNativeSession() {
     CHECK(observed == std::vector<bool>({false, true}));
 }
 
-class BlockingCommitSession final : public TestSession {
-public:
-    void Commit() override {
-        std::unique_lock<std::mutex> guard(mutex);
-        entered = true;
-        entered_condition.notify_all();
-        release_condition.wait(guard, [&] { return release; });
-        commits++;
-    }
-
-    void WaitUntilCommitEntered() {
-        std::unique_lock<std::mutex> guard(mutex);
-        entered_condition.wait(guard, [&] { return entered; });
-    }
-
-    void ReleaseCommit() {
-        std::lock_guard<std::mutex> guard(mutex);
-        release = true;
-        release_condition.notify_all();
-    }
-
-private:
-    std::mutex mutex;
-    std::condition_variable entered_condition;
-    std::condition_variable release_condition;
-    bool entered = false;
-    bool release = false;
-};
-
 static void TestValidatedSession() {
     auto raw = std::make_unique<TestSession>();
     auto *inner = raw.get();
@@ -3249,6 +3246,18 @@ static void TestTransientSnapshotAndRowIdQueriesBypassCursorCache() {
     for (const auto *sql : {"SELECT id FROM t", "SELECT 'AS OF SCN' FROM dual", "SELECT q'[ROWID]' FROM dual",
                            "SELECT my_rowid FROM t /* AS OF SCN 1 */"}) {
         CHECK(!OracleQueryUsesTransientCursor(sql));
+    }
+}
+
+static void TestRowLockingQueriesAreRecognised() {
+    for (const auto *sql : {"SELECT id FROM t FOR UPDATE", "select id from t where id = 1 for\n update nowait",
+                            "SELECT id FROM t FOR /* lock */ UPDATE OF id SKIP LOCKED"}) {
+        CHECK(OracleQueryLocksRows(sql));
+    }
+    for (const auto *sql : {"SELECT id FROM t", "SELECT 'FOR UPDATE' FROM dual", "SELECT q'[for update]' FROM dual",
+                            "SELECT id FROM t -- FOR UPDATE", "SELECT \"FOR\" \"UPDATE\" FROM t",
+                            "SELECT updated FROM t WHERE last_for = 1"}) {
+        CHECK(!OracleQueryLocksRows(sql));
     }
 }
 
@@ -4330,44 +4339,6 @@ static void TestLiveTnsNegotiation() {
         }
     }
     connection->Close();
-}
-
-static void TestTransactions() {
-    auto first = std::make_shared<TestSession>();
-    auto second = std::make_shared<TestSession>();
-    OracleTransaction transaction;
-    CHECK(&transaction.RegisterWrite("one", first) == first.get());
-    CHECK(&transaction.RegisterWrite("one", first) == first.get());
-    CHECK(transaction.WriteCatalog() == "one");
-    ExpectError(ProtocolErrorKind::UNSUPPORTED, [&] { transaction.RegisterWrite("two", second); });
-    ExpectError(ProtocolErrorKind::INVALID_STATE, [&] { transaction.RegisterWrite("one", second); });
-    transaction.Commit();
-    CHECK(first->commits == 1 && transaction.State() == TransactionState::COMMITTED);
-    ExpectError(ProtocolErrorKind::INVALID_STATE, [&] { transaction.Rollback(); });
-
-    auto failing = std::make_shared<TestSession>();
-    failing->fail_commit = true;
-    OracleTransaction poisoned;
-    poisoned.RegisterWrite("one", failing);
-    ExpectError(ProtocolErrorKind::INVALID_STATE, [&] { poisoned.Commit(); });
-    CHECK(poisoned.State() == TransactionState::POISONED && failing->closes == 1);
-
-    auto abandoned = std::make_shared<TestSession>();
-    {
-        OracleTransaction scoped;
-        scoped.RegisterWrite("one", abandoned);
-    }
-    CHECK(abandoned->rollbacks == 1);
-
-    auto blocking = std::make_shared<BlockingCommitSession>();
-    OracleTransaction concurrent;
-    concurrent.RegisterWrite("one", blocking);
-    std::thread committer([&] { concurrent.Commit(); });
-    blocking->WaitUntilCommitEntered();
-    ExpectError(ProtocolErrorKind::INVALID_STATE, [&] { concurrent.Rollback(); });
-    blocking->ReleaseCommit();
-    committer.join();
-    CHECK(blocking->commits == 1 && concurrent.State() == TransactionState::COMMITTED);
 }
 
 // The DuckDB adapter opens every session through OpenOracleSession, so this
@@ -6087,10 +6058,30 @@ static std::string EchoedConnectData(const std::string &host) {
     return BuildConnectDescriptor(echoed);
 }
 
+// A Windows program path, parentheses and '=' included, cannot break the
+// CONNECT descriptor: the CID carries it with those and spaces as '?', the
+// way python-oracledb's sanitize() does (checked against it).
+static void TestClientIdentityIsSanitizedInTheDescriptor() {
+    ConnectionConfig config;
+    config.host = "db.example";
+    config.service_name = "svc";
+    config.client_program = "C:\\Program Files (x86)\\Duck=DB\\duckdb.exe";
+    const auto descriptor = BuildConnectDescriptor(config);
+    CHECK(descriptor.find("(PROGRAM=C:\\Program?Files??x86?\\Duck?DB\\duckdb.exe)") != std::string::npos);
+    ValidateRedirectReconnectData(descriptor);
+    // A listener that redirects echoes this data back, and this client parses
+    // the echo: an unbalanced parenthesis in a path would make every redirected
+    // connect fail there. 19c and 23ai listeners accept either form themselves.
+    config.client_program = "/opt/Duck(DB/duckdb";
+    ValidateRedirectReconnectData(BuildConnectDescriptor(config));
+    std::cout << "a program path with parentheses stays inside its CID" << std::endl;
+}
+
 static void TestListenerEchoOfTheClientsConnectData() {
     const auto reconnect = EchoedConnectData("scan.example");
     CHECK(reconnect.find("(CONNECTION_ID=q0N+/Zy1AbCdEfGhIjKlMn==)") != std::string::npos);
-    CHECK(reconnect.find("/Applications/My Tools/duckdb") != std::string::npos);
+    // Spaces and parentheses in the CID are '?', as python-oracledb sends them.
+    CHECK(reconnect.find("/Applications/My?Tools/duckdb") != std::string::npos);
     // The strict grammar still refuses it — which is right for a descriptor a
     // user typed — and the listener grammar accepts it.
     ExpectError(ProtocolErrorKind::MALFORMED, [&] { (void)ParseConnectDescriptor(reconnect); });
@@ -6928,6 +6919,45 @@ static void TestSessionPool() {
         lease.Poison();
     }
     CHECK(first->closes == 1 && pool.IdleCount() == 0 && pool.LiveCount() == 0);
+
+    // A session idle past probe_after answers the probe before it is leased;
+    // one that fails is closed and replaced, and one back sooner is not probed.
+    auto now = std::chrono::steady_clock::time_point {};
+    size_t probes = 0;
+    bool alive = true;
+    std::vector<std::shared_ptr<TestSession>> opened;
+    OracleSessionPool probed(
+        1,
+        [&] {
+            opened.push_back(std::make_shared<TestSession>());
+            return std::static_pointer_cast<OracleSession>(opened.back());
+        },
+        [&](OracleSession &) {
+            probes++;
+            if (!alive) {
+                throw ProtocolError(ProtocolErrorKind::TRUNCATED, "connection closed");
+            }
+        },
+        std::chrono::seconds(30), [&] { return now; });
+    {
+        auto lease = probed.Acquire();
+    }
+    {
+        auto lease = probed.Acquire();
+    }
+    CHECK(opened.size() == 1 && probes == 0);
+    now += std::chrono::seconds(31);
+    {
+        auto lease = probed.Acquire();
+    }
+    CHECK(opened.size() == 1 && probes == 1);
+    now += std::chrono::seconds(31);
+    alive = false;
+    {
+        auto lease = probed.Acquire();
+        CHECK(&lease.Get() == opened.back().get());
+    }
+    CHECK(probes == 2 && opened.size() == 2 && opened[0]->closes == 1 && probed.LiveCount() == 1);
 }
 
 static void TestAuthCrypto() {
@@ -7458,6 +7488,49 @@ static void TestLobPrefetchMaterializer() {
     UnicodeBoundary();
 }
 
+// JDBC Thin 23.7 against 19c, setLobPrefetchSize(4096), fetch size 10:
+// the define it sends for `SELECT id, ch5, c` (NUMBER, CHAR(5), CLOB). The CHAR
+// column is defined as VARCHAR2, as the omitted CHAR of the 19.3 captures was.
+// The one other difference from those captures is 23.7's: a CLOB entry says
+// 4000 where 19.3 said 0, and this encoder keeps 19.3's.
+static void TestLobPrefetchDefinesACharAsVarchar2() {
+    const std::vector<uint8_t> jdbc_lob_prefetch_define_char {
+        0x03, 0x5e, 0x0a, 0x02, 0x80, 0x50, 0x01, 0x02, 0x00, 0x00, 0x01, 0x01, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x04,
+        0x7f, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x03, 0x00, 0x00, 0x01, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x0a, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x00, 0x00, 0x04, 0x7f, 0xff,
+        0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x69, 0x01, 0x00, 0x00, 0x01, 0x03, 0x00, 0x00, 0x03, 0x01,
+        0xff, 0xfc, 0x00, 0x01, 0x10, 0x00, 0x00, 0x02, 0x03, 0x69, 0x01, 0x00, 0x00, 0x70, 0x03, 0x00, 0x00, 0x02,
+        0x0f, 0xa0, 0x00, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x69, 0x01, 0x02, 0x10, 0x00, 0x00};
+    OracleColumn number;
+    number.oracle_type = 2;
+    OracleColumn fixed;
+    fixed.oracle_type = 96;
+    fixed.character_set_form = 1;
+    fixed.byte_width = 5;
+    OracleColumn clob;
+    clob.oracle_type = 112;
+    clob.character_set_form = 1;
+    const std::vector<OracleColumn> columns {number, fixed, clob};
+    CHECK(SupportsLobPrefetchColumns(columns, 12));
+    auto expected = jdbc_lob_prefetch_define_char;
+    const std::vector<uint8_t> clob_23 {0x70, 0x03, 0x00, 0x00, 0x02, 0x0f, 0xa0};
+    const auto at = std::search(expected.begin(), expected.end(), clob_23.begin(), clob_23.end());
+    CHECK(at != expected.end());
+    const auto offset = at - expected.begin();
+    expected.erase(expected.begin() + offset + 4, expected.begin() + offset + 7);
+    expected.insert(expected.begin() + offset + 4, 0x00);
+    OracleLobPrefetchLimits limits;
+    CHECK(EncodeLobPrefetchDefine(0x0a, 2, columns, 10, 12, limits) == expected);
+    // Counted as a VARCHAR2 is, an unknown width at the define's 131068 bytes.
+    fixed.byte_width = 0;
+    OracleColumn text;
+    text.oracle_type = 1;
+    text.character_set_form = 1;
+    CHECK(BoundedLobPrefetchRows({number, fixed, clob}, 2048, limits) == 350);
+    CHECK(BoundedLobPrefetchRows({number, text, clob}, 2048, limits) == 350);
+}
+
 static void TestLobPrefetchScalarBudget() {
     OracleColumn lob;
     lob.oracle_type = 112;
@@ -7469,16 +7542,16 @@ static void TestLobPrefetchScalarBudget() {
     OracleLobPrefetchLimits limits;
     std::vector<OracleColumn> columns(240, text);
     columns.push_back(lob);
-    CHECK(BoundedLobPrefetchRows(columns, 128, limits) == 4);
+    CHECK(BoundedLobPrefetchRows(columns, 2048, limits) == 51);
     columns.insert(columns.end(), 40, text);
     bool refused = false;
     try { BoundedLobPrefetchRows(columns, 2, limits); }
     catch (const ProtocolError &error) { refused = error.Kind() == ProtocolErrorKind::LIMIT_EXCEEDED; }
     CHECK(refused);
     text.byte_width = 0;
-    CHECK(BoundedLobPrefetchRows({lob, text}, 128, limits) == 29);
+    CHECK(BoundedLobPrefetchRows({lob, text}, 2048, limits) == 350);
     text.omitted_from_row_data = true;
-    CHECK(BoundedLobPrefetchRows({lob, text}, 128, limits) == 128);
+    CHECK(BoundedLobPrefetchRows({lob, text}, 4096, limits) == 2048);
     text.omitted_from_row_data = false;
     text.byte_width = (std::numeric_limits<uint32_t>::max)();
     refused = false;
@@ -9882,13 +9955,13 @@ int main() {
     TestBindValidation();
     TestSqlBindExtraction();
     TestSqlStatementValidation();
-    TestTransactions();
     TestValidatedSession();
     TestInitialFetchHintIsValidatedAndForwarded();
     TestStatementCacheConfigurationReachesNativeSession();
     TestStatementRegistry();
     TestPreparedQueryCacheOwnershipAndBounds();
     TestTransientSnapshotAndRowIdQueriesBypassCursorCache();
+    TestRowLockingQueriesAreRecognised();
     TestPreparedQueryReexecuteWireAndState();
     TestPreparedQueryReparsesOnlySafeInvalidations();
     TestTtcStatementChannel();
@@ -9934,6 +10007,7 @@ int main() {
     TestLoadBalanceShufflesEachConnection();
     TestRedirectChainKeepsEachLevelsAlternatives();
     TestListenerEchoOfTheClientsConnectData();
+    TestClientIdentityIsSanitizedInTheDescriptor();
     TestOobProbeAfterRedirectAcceptsTheRedirectFlag();
     TestOobProbeWithoutAnswer();
     TestBudgetHoldsThroughTheListenerExchange();
@@ -9957,6 +10031,7 @@ int main() {
     TestEasyConnectAndTnsNamesFolder();
     TestLobPrefetchMaterializer();
     TestLobPrefetchScalarBudget();
+    TestLobPrefetchDefinesACharAsVarchar2();
     TestLobPrefetchDecoderResumes();
     TestTransactionPoolReusesAfterAConfirmedEnd();
     TestTransactionPoolClosesWhatIsNotClean();

@@ -252,8 +252,9 @@ unique_ptr<FunctionData> OracleParallelBind(ClientContext &context, TableFunctio
         select_list += OracleSelectExpression(column);
     }
 
-    // Ranges are half-open except the last, which closes on the maximum, so
-    // every key belongs to exactly one shard.
+    // Ranges are half-open and the last one has no upper end, so every key
+    // belongs to exactly one shard — a key between two whole numbers too, since
+    // only MIN and MAX are known to be whole (a plain NUMBER key can hold 1.5).
     // The key count is span + 1, which is 2^64 for the whole int64 range, so it
     // is kept as span (count - 1) and every step is done in unsigned
     // arithmetic, where wrapping is defined and nothing overflows: the signed
@@ -274,8 +275,12 @@ unique_ptr<FunctionData> OracleParallelBind(ClientContext &context, TableFunctio
     const auto offset = [&](idx_t shard) { return quotient * shard + remainder * shard / shards; };
     for (idx_t shard = 0; shard < shards; shard++) {
         const auto begin = static_cast<int64_t>(static_cast<uint64_t>(low) + offset(shard));
-        const auto end = static_cast<int64_t>(static_cast<uint64_t>(low) + offset(shard + 1) - 1);
-        auto predicate = key + " >= " + std::to_string(begin) + " AND " + key + " <= " + std::to_string(end);
+        auto predicate = key + " >= " + std::to_string(begin);
+        if (shard + 1 < shards) {
+            // low + offset(shards) is high + 1, which can overflow; the last shard needs no end.
+            predicate += " AND " + key + " < " +
+                         std::to_string(static_cast<int64_t>(static_cast<uint64_t>(low) + offset(shard + 1)));
+        }
         result->shard_sql.push_back("SELECT " + select_list + " FROM " + as_of + " WHERE " + predicate);
     }
     // A NULL key is in no range, and dropping those rows would make this scan

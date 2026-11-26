@@ -13,6 +13,7 @@
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 
 #include "oracle_scanner/auth_crypto.hpp"
@@ -487,7 +488,7 @@ std::vector<oracle_scanner::OracleBind> PositionalBinds(const Value &value, cons
             int32_t year;
             int32_t month;
             int32_t day;
-            Date::Convert(date, year, month, day);
+            DateToOracleCalendar(date, year, month, day);
             binds.push_back(oracle_scanner::OracleBind {std::to_string(index + 1), 12, oracle_scanner::BindDirection::BIND_IN,
                              oracle_scanner::EncodeOracleDate({year, static_cast<uint8_t>(month),
                                                                static_cast<uint8_t>(day)})});
@@ -506,7 +507,7 @@ std::vector<oracle_scanner::OracleBind> PositionalBinds(const Value &value, cons
             int32_t minute;
             int32_t second;
             int32_t microseconds;
-            Date::Convert(date, year, month, day);
+            DateToOracleCalendar(date, year, month, day);
             Time::Convert(time, hour, minute, second, microseconds);
             binds.push_back(oracle_scanner::OracleBind {std::to_string(index + 1), 180, oracle_scanner::BindDirection::BIND_IN,
                              oracle_scanner::EncodeOracleTimestamp(
@@ -578,7 +579,7 @@ std::vector<oracle_scanner::OracleBind> NamedBinds(const Value &value, const cha
             int32_t year;
             int32_t month;
             int32_t day;
-            Date::Convert(date, year, month, day);
+            DateToOracleCalendar(date, year, month, day);
             binds.push_back(oracle_scanner::OracleBind {name, 12, oracle_scanner::BindDirection::BIND_IN,
                              oracle_scanner::EncodeOracleDate({year, static_cast<uint8_t>(month),
                                                                static_cast<uint8_t>(day)})});
@@ -597,7 +598,7 @@ std::vector<oracle_scanner::OracleBind> NamedBinds(const Value &value, const cha
             int32_t minute;
             int32_t second;
             int32_t microseconds;
-            Date::Convert(date, year, month, day);
+            DateToOracleCalendar(date, year, month, day);
             Time::Convert(time, hour, minute, second, microseconds);
             binds.push_back(oracle_scanner::OracleBind {name, 180, oracle_scanner::BindDirection::BIND_IN,
                              oracle_scanner::EncodeOracleTimestamp(
@@ -681,6 +682,11 @@ unique_ptr<FunctionData> OracleQueryBindCommon(ClientContext &context, TableFunc
     }
     const auto secret_name = input.inputs[0].GetValue<std::string>();
     const auto sql = input.inputs[1].GetValue<std::string>();
+    if (!transactional && input.binder) {
+        // The bind opens the cursor and the scan consumes it, so a prepared
+        // statement has to bind again for each EXECUTE.
+        input.binder->SetAlwaysRequireRebind();
+    }
     return BindOracleSelect(
         context, secret_name, sql, [&] { return ParameterBinds(input, "oracle_query"); }, return_types, names,
         transactional);
@@ -713,6 +719,11 @@ unique_ptr<FunctionData> BindOracleSelect(ClientContext &context, const std::str
                                                    target.config, target.password);
     } else {
         result->session = AcquireOracleReadSession(context, secret_name, std::string(), config, password);
+        if (oracle_scanner::OracleQueryLocksRows(sql)) {
+            // Its locks are an open transaction nobody here commits or rolls
+            // back; closing the session at the end of the scan ends it.
+            result->session.Poison();
+        }
     }
     // Opening runs the query, in both forms: a long query, or a SELECT FOR
     // UPDATE waiting on its lock, runs right here, so the caller's interrupt
@@ -857,6 +868,10 @@ unique_ptr<FunctionData> OracleVectorSearchBind(ClientContext &context, TableFun
                                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
     if (input.inputs[0].IsNull()) {
         throw BinderException("oracle_vector_search secret cannot be NULL");
+    }
+    if (input.binder) {
+        // Like oracle_query: the cursor opened here is consumed by one scan.
+        input.binder->SetAlwaysRequireRebind();
     }
     const auto secret_name = input.inputs[0].GetValue<std::string>();
     const auto target = VectorSearchTable(input.inputs[1]);
@@ -1023,6 +1038,15 @@ unique_ptr<FunctionData> OracleTransactionTypedQueryBind(ClientContext &context,
     return std::move(result);
 }
 
+// DuckDB refuses a write in a READ ONLY transaction, or to a second database in
+// one transaction, only for statements that declare the database they modify.
+void RegisterOracleWrite(ClientContext &context, TableFunctionBindInput &input, const std::string &catalog_name) {
+    if (input.binder) {
+        input.binder->GetStatementProperties().RegisterDBModify(Catalog::GetCatalog(context, Identifier(catalog_name)),
+                                                                context, DatabaseModificationType::UPDATE_DATA);
+    }
+}
+
 unique_ptr<FunctionData> OracleTransactionExecuteBind(ClientContext &context, TableFunctionBindInput &input,
                                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
     if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
@@ -1036,6 +1060,7 @@ unique_ptr<FunctionData> OracleTransactionExecuteBind(ClientContext &context, Ta
     if (Catalog::GetCatalog(context, Identifier(target.catalog_name)).GetAttached().IsReadOnly()) {
         throw TransactionException("Cannot write to an attached read-only Oracle catalog");
     }
+    RegisterOracleWrite(context, input, target.catalog_name);
     result->catalog_name = target.catalog_name;
     names.push_back("affected_rows");
     return_types.push_back(LogicalType::UBIGINT);
@@ -1276,6 +1301,8 @@ unique_ptr<GlobalTableFunctionState> OracleCallNumberInit(ClientContext &context
             result.outputs[0].oracle_type != 2) {
             throw BinderException("oracle_call_number requires a scalar Oracle NUMBER result");
         }
+        // A call that succeeded is kept, as oracle_execute and oracle_plsql keep theirs.
+        session->Commit();
         std::optional<std::string> value;
         if (result.outputs[0].value) {
             value = oracle_scanner::DecodeOracleNumber(*result.outputs[0].value);
@@ -1316,6 +1343,8 @@ unique_ptr<GlobalTableFunctionState> OracleCallNumberArgsInit(ClientContext &con
             result.outputs[0].oracle_type != 2) {
             throw BinderException("oracle_call_number_args requires a scalar Oracle NUMBER result");
         }
+        // A call that succeeded is kept, as oracle_execute and oracle_plsql keep theirs.
+        session->Commit();
         std::optional<std::string> value;
         if (result.outputs[0].value) {
             value = oracle_scanner::DecodeOracleNumber(*result.outputs[0].value);
@@ -1364,6 +1393,8 @@ unique_ptr<GlobalTableFunctionState> OracleCallOutNumberInit(ClientContext &cont
             result.outputs[0].oracle_type != 2) {
             throw BinderException("oracle_call_out_number requires one scalar Oracle NUMBER OUT argument");
         }
+        // A call that succeeded is kept, as oracle_execute and oracle_plsql keep theirs.
+        session->Commit();
         std::optional<std::string> value;
         if (result.outputs[0].value) {
             value = oracle_scanner::DecodeOracleNumber(*result.outputs[0].value);
@@ -1403,6 +1434,8 @@ unique_ptr<GlobalTableFunctionState> OracleCallOutVarcharInit(ClientContext &con
             result.outputs[0].oracle_type != 1) {
             throw BinderException("oracle_call_out_varchar requires one scalar Oracle VARCHAR2 OUT argument");
         }
+        // A call that succeeded is kept, as oracle_execute and oracle_plsql keep theirs.
+        session->Commit();
         std::optional<std::string> value;
         if (result.outputs[0].value) {
             value = std::string(result.outputs[0].value->begin(), result.outputs[0].value->end());
@@ -1443,6 +1476,8 @@ unique_ptr<GlobalTableFunctionState> OracleCallInOutNumberInit(ClientContext &co
             result.outputs[0].oracle_type != 2) {
             throw BinderException("oracle_call_inout_number requires one scalar Oracle NUMBER IN OUT argument");
         }
+        // A call that succeeded is kept, as oracle_execute and oracle_plsql keep theirs.
+        session->Commit();
         std::optional<std::string> value;
         if (result.outputs[0].value) {
             value = oracle_scanner::DecodeOracleNumber(*result.outputs[0].value);
@@ -1484,6 +1519,8 @@ unique_ptr<GlobalTableFunctionState> OracleCallInOutVarcharInit(ClientContext &c
             result.outputs[0].oracle_type != 1) {
             throw BinderException("oracle_call_inout_varchar requires one scalar Oracle VARCHAR2 IN OUT argument");
         }
+        // A call that succeeded is kept, as oracle_execute and oracle_plsql keep theirs.
+        session->Commit();
         std::optional<std::string> value;
         if (result.outputs[0].value) {
             value = std::string(result.outputs[0].value->begin(), result.outputs[0].value->end());
@@ -1523,6 +1560,8 @@ unique_ptr<GlobalTableFunctionState> OracleCallInit(ClientContext &context, Tabl
         if (result.explicit_cursors.size() != 1 || !result.implicit_cursors.empty()) {
             throw BinderException("oracle_call currently requires exactly one explicit SYS_REFCURSOR result");
         }
+        // A call that succeeded is kept, as oracle_execute and oracle_plsql keep theirs.
+        session->Commit();
         std::vector<std::unique_ptr<oracle_scanner::OracleCursor>> owned;
         owned.reserve(1);
         for (auto &cursor : result.explicit_cursors) {
@@ -1576,6 +1615,8 @@ unique_ptr<GlobalTableFunctionState> OracleCallImplicitInit(ClientContext &conte
         if (!result.explicit_cursors.empty() || result.implicit_cursors.empty()) {
             throw BinderException("oracle_call_implicit requires one or more implicit cursor results");
         }
+        // A call that succeeded is kept, as oracle_execute and oracle_plsql keep theirs.
+        session->Commit();
         std::vector<std::unique_ptr<oracle_scanner::OracleCursor>> owned;
         owned.reserve(result.implicit_cursors.size());
         for (auto &cursor : result.implicit_cursors) {
@@ -1635,6 +1676,8 @@ unique_ptr<GlobalTableFunctionState> OracleCallCursorsInit(ClientContext &contex
         if (result.explicit_cursors.size() != bind.cursor_arguments.size() || !result.implicit_cursors.empty()) {
             throw BinderException("oracle_call_cursors procedure did not return every requested SYS_REFCURSOR");
         }
+        // A call that succeeded is kept, as oracle_execute and oracle_plsql keep theirs.
+        session->Commit();
         std::vector<std::unique_ptr<oracle_scanner::OracleCursor>> owned;
         owned.reserve(result.explicit_cursors.size());
         for (auto &cursor : result.explicit_cursors) {
@@ -1847,6 +1890,8 @@ unique_ptr<GlobalTableFunctionState> OracleCallAutoInit(ClientContext &context, 
         if (!result.implicit_cursors.empty()) {
             throw BinderException("oracle_call_auto does not combine explicit and implicit cursor results");
         }
+        // A call that succeeded is kept, as oracle_execute and oracle_plsql keep theirs.
+        session->Commit();
         std::vector<OracleCallNamedRow> rows;
         std::vector<std::unique_ptr<oracle_scanner::OracleCursor>> owned;
         std::vector<idx_t> cursor_rows;
@@ -1988,6 +2033,7 @@ unique_ptr<FunctionData> OracleTransactionManyBind(ClientContext &context, Table
     if (Catalog::GetCatalog(context, Identifier(target.catalog_name)).GetAttached().IsReadOnly()) {
         throw TransactionException("Cannot write to an attached read-only Oracle catalog");
     }
+    RegisterOracleWrite(context, input, target.catalog_name);
     result->catalog_name = target.catalog_name;
     names = {"row_index", "affected_rows", "exact_counts"};
     return_types = {LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::BOOLEAN};
@@ -2105,6 +2151,7 @@ unique_ptr<FunctionData> OracleCompositeBind(ClientContext &context, TableFuncti
     if (Catalog::GetCatalog(context, Identifier(target.catalog_name)).GetAttached().IsReadOnly()) {
         throw TransactionException("Cannot write to an attached read-only Oracle catalog");
     }
+    RegisterOracleWrite(context, input, target.catalog_name);
     result->catalog_name = target.catalog_name;
     names.push_back(Identifier("affected_rows"));
     return_types.push_back(LogicalType::UBIGINT);
@@ -2188,6 +2235,7 @@ unique_ptr<FunctionData> OracleTransactionCallBind(ClientContext &context, Table
     if (Catalog::GetCatalog(context, Identifier(target.catalog_name)).GetAttached().IsReadOnly()) {
         throw TransactionException("Cannot call through an attached read-only Oracle catalog");
     }
+    RegisterOracleWrite(context, input, target.catalog_name);
     result->catalog_name = target.catalog_name;
     names = {"name", "value"};
     return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
@@ -2414,6 +2462,7 @@ unique_ptr<FunctionData> OracleTransactionPlsqlBind(ClientContext &context, Tabl
     if (Catalog::GetCatalog(context, Identifier(target.catalog_name)).GetAttached().IsReadOnly()) {
         throw TransactionException("Cannot run PL/SQL through an attached read-only Oracle catalog");
     }
+    RegisterOracleWrite(context, input, target.catalog_name);
     result->catalog_name = target.catalog_name;
     names = {"name", "value"};
     return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
@@ -2489,6 +2538,8 @@ unique_ptr<GlobalTableFunctionState> OracleCallNamedInit(ClientContext &context,
         if (!result.implicit_cursors.empty()) {
             throw BinderException("oracle_call_named does not combine explicit and implicit cursor results");
         }
+        // A call that succeeded is kept, as oracle_execute and oracle_plsql keep theirs.
+        session->Commit();
         std::vector<OracleCallNamedRow> rows;
         std::vector<std::unique_ptr<oracle_scanner::OracleCursor>> owned;
         std::vector<idx_t> cursor_rows;
@@ -2608,6 +2659,8 @@ unique_ptr<GlobalTableFunctionState> OracleCallNamedFunctionInit(ClientContext &
         if (!result.implicit_cursors.empty()) {
             throw BinderException("oracle_call_named_function does not combine explicit and implicit cursor results");
         }
+        // A call that succeeded is kept, as oracle_execute and oracle_plsql keep theirs.
+        session->Commit();
         const auto returns_cursor = bind.return_bind.oracle_type == oracle_scanner::ORACLE_WIRE_TYPE_CURSOR;
         if (!returns_cursor &&
             (result.outputs.empty() || result.outputs[0].oracle_type != bind.return_bind.oracle_type)) {
@@ -2719,6 +2772,9 @@ unique_ptr<FunctionData> OracleCursorBind(ClientContext &context, TableFunctionB
 
 unique_ptr<GlobalTableFunctionState> OracleCursorInit(ClientContext &, TableFunctionInitInput &input) {
     auto &bind = input.bind_data->CastNoConst<OracleCursorBindData>();
+    if (!bind.cursor) {
+        throw InvalidInputException("oracle_cursor reads a handle once, and this one has been read");
+    }
     // A cursor handle already owns its session; this scan only reads it.
     return make_uniq<OracleQueryGlobalState>(OracleSessionHandle(), std::move(bind.cursor), std::move(bind.columns),
                                              std::move(bind.types), std::move(input.column_ids), bind.columns.size());
@@ -2844,6 +2900,7 @@ static bool DeferrableColumn(const OracleColumn &column);
 // supplies the wire representation and has to map to the same types.
 unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context, OracleQueryBindData &bind,
                                                          TableFunctionInitInput &input) {
+    std::string parallel_refusal;
     if (bind.count_source) {
         auto &source = *bind.count_source;
         Value enabled, requested;
@@ -2859,6 +2916,7 @@ unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context,
             sessions = MinValue<idx_t>(sessions, TaskScheduler::GetScheduler(context).NumberOfThreads());
         }
         auto plan = PlanParallelAttachedScan(context, source, {}, sessions, bind.count_select_list);
+        parallel_refusal = plan.refusal;
         auto &chunks = plan.statements;
         if (!chunks.empty()) {
             auto state = make_uniq<OracleQueryGlobalState>(OracleSessionHandle(), nullptr, bind.columns, bind.types,
@@ -2950,6 +3008,7 @@ unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context,
                                                    bind.types, std::move(input.column_ids), chunk_columns);
     state->catalog_name = bind.catalog_name;
     state->scalar_count = bool(bind.count_source);
+    state->parallel_refusal = std::move(parallel_refusal);
     state->schema_check_io = schema_check_io;
     state->schema_checked = !bind.source_schema_checks.empty();
     state->sent_sql = opened.sql;
@@ -3122,7 +3181,10 @@ static size_t OracleScanFetchRows(ClientContext &context, const OracleQueryBindD
         }
         width += 16 + MaxValue<size_t>(column.byte_width, 32);
     }
-    return MinValue<size_t>(requested, MaxValue<size_t>(1, (8U << 20U) / MaxValue<size_t>(width, 1)));
+    // Every row at its declared width must still fit one response (64 MiB), so
+    // the estimate is the worst case; real VARCHAR2(4000) values are usually far
+    // shorter. 8 MiB here made a 50-column table fetch 144 rows a round trip.
+    return MinValue<size_t>(requested, MaxValue<size_t>(1, (48U << 20U) / MaxValue<size_t>(width, 1)));
 }
 
 namespace {
@@ -3369,7 +3431,9 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
         OracleCallerInterruptScope interrupt(context, [&session] { session->Cancel(); });
         try {
             cursor = session->Query(bind.query_sql, bind.query_binds);
-            const auto &columns = cursor->Columns();
+            // Mapped as the bind mapped them, or a setting it applied reads as a changed type.
+            auto columns = cursor->Columns();
+            ApplyUnconstrainedNumberSetting(context, columns);
             if (bind.declared_schema) {
                 // The declaration is the plan's contract: Oracle's describe has
                 // to match it column for column, by name and by mapped type.
@@ -3665,6 +3729,7 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
     state->metrics.sessions = 1;
     state->last_io = io_after_open;
     state->top_n_execution = decision.reason;
+    state->parallel_refusal = plan.refusal;
     state->planning_nanoseconds = plan.planning_nanoseconds;
     state->planning_io = plan.planning_io;
     state->plan_cache_hit = plan.cache_hit;
@@ -3727,6 +3792,9 @@ void OracleQueryMetrics(TableFunctionGetMetricsInput &input) {
     }
     if (!state->top_n_execution.empty()) {
         metrics.AddExtraInfo("Oracle Top-N execution", state->top_n_execution);
+    }
+    if (!state->parallel_refusal.empty()) {
+        metrics.AddExtraInfo("Oracle parallel refused", state->parallel_refusal);
     }
     if (state->parallel || state->planning_nanoseconds != 0) {
         metrics.AddExtraInfo("Oracle plan cache", state->plan_cache_hit ? "hit" : "miss or disabled");
@@ -3963,76 +4031,108 @@ void OracleQueryFunction(ClientContext &context, TableFunctionInput &input, Data
         if (position == (typed_chunks.empty() ? batch.RowCount() : typed_rows)) {
             typed_chunks.clear();
             typed_rows = 0;
-            batch = TranslatingOracleErrors("oracle_query could not fetch from Oracle", [&] {
-                if (state.direct_scalar && state.chunk_columns == state.columns.size() &&
-                    OracleTypedSink::Fits(state.columns, state.types, state.fetch_rows)) {
-                    std::exception_ptr conversion_error;
-                    try {
-                        OracleTypedSink sink(context, state.columns, state.types, typed_chunks, state.fetch_rows);
-                        oracle_scanner::OracleFetchResult result;
-                        auto &cursor = local ? local->cursor : state.cursor;
-                        if (cursor->FetchInto(state.fetch_rows, sink, result)) {
-                            sink.Finish(result.rows);
-                            conversion_error = sink.ConversionError();
-                            if (!conversion_error) {
-                                typed_rows = result.rows;
-                                state.metrics.direct_batches++;
-                                oracle_scanner::OracleBatch direct;
-                                direct.exhausted = result.exhausted;
-                                return direct;
+            // A plain scan's fetch obeys Ctrl-C as a transaction's does: the
+            // cursor's cancel stops the statement on the server. The watcher
+            // lives for this one fetch, so it never meets the next range's cursor.
+            std::optional<OracleCallerInterruptScope> fetch_interrupt;
+            if (!interrupt) {
+                auto &cursor = local ? local->cursor : state.cursor;
+                fetch_interrupt.emplace(context, [&cursor] { cursor->Cancel(); });
+            }
+            try {
+                batch = TranslatingOracleErrors("oracle_query could not fetch from Oracle", [&] {
+                    if (state.direct_scalar && state.chunk_columns == state.columns.size() &&
+                        OracleTypedSink::Fits(state.columns, state.types, state.fetch_rows)) {
+                        std::exception_ptr conversion_error;
+                        try {
+                            OracleTypedSink sink(context, state.columns, state.types, typed_chunks, state.fetch_rows);
+                            oracle_scanner::OracleFetchResult result;
+                            auto &cursor = local ? local->cursor : state.cursor;
+                            if (cursor->FetchInto(state.fetch_rows, sink, result)) {
+                                sink.Finish(result.rows);
+                                conversion_error = sink.ConversionError();
+                                if (!conversion_error) {
+                                    typed_rows = result.rows;
+                                    state.metrics.direct_batches++;
+                                    oracle_scanner::OracleBatch direct;
+                                    direct.exhausted = result.exhausted;
+                                    return direct;
+                                }
                             }
+                        } catch (...) {
+                            if (local) {
+                                local->session.Poison();
+                                InvalidateOracleScanPlan(context, state.plan_cache_key);
+                            } else {
+                                if (interrupt) {
+                                    interrupt->Stop();
+                                }
+                                state.session.Poison();
+                                if (!state.catalog_name.empty()) {
+                                    state.cursor.reset();
+                                    PoisonTransactionSession(context, state.catalog_name);
+                                }
+                            }
+                            throw;
                         }
-                    } catch (...) {
-                        if (local) {
-                            local->session.Poison();
-                            InvalidateOracleScanPlan(context, state.plan_cache_key);
-                        } else {
+                        // The complete reply has been consumed. A value that DuckDB
+                        // cannot represent does not make the Oracle session unusable.
+                        if (conversion_error) {
                             if (interrupt) {
                                 interrupt->Stop();
                             }
-                            state.session.Poison();
-                            if (!state.catalog_name.empty()) {
-                                state.cursor.reset();
-                                PoisonTransactionSession(context, state.catalog_name);
-                            }
+                            std::rethrow_exception(conversion_error);
                         }
-                        throw;
                     }
-                    // The complete reply has been consumed. A value that DuckDB
-                    // cannot represent does not make the Oracle session unusable.
-                    if (conversion_error) {
+                    if (local) {
+                        try {
+                            return local->cursor->FetchPacked(state.fetch_rows);
+                        } catch (...) {
+                            local->session.Poison();
+                            InvalidateOracleScanPlan(context, state.plan_cache_key);
+                            throw;
+                        }
+                    }
+                    try {
+                        if (state.deferred) {
+                            return state.cursor->Fetch(STANDARD_VECTOR_SIZE);
+                        }
+                        if (state.next_batch.valid()) {
+                            return state.next_batch.get();
+                        }
+                        return state.cursor->FetchPacked(state.fetch_rows);
+                    } catch (...) {
                         if (interrupt) {
                             interrupt->Stop();
                         }
-                        std::rethrow_exception(conversion_error);
-                    }
-                }
-                if (local) {
-                    try {
-                        return local->cursor->FetchPacked(state.fetch_rows);
-                    } catch (...) {
-                        local->session.Poison();
-                        InvalidateOracleScanPlan(context, state.plan_cache_key);
+                        // Same rule as at bind: a failed fetch leaves the channel in a
+                        // state this side cannot describe, so the session is not reused.
+                        state.session.Poison();
+                        if (!state.catalog_name.empty()) {
+                            state.cursor.reset();
+                            PoisonTransactionSession(context, state.catalog_name);
+                        }
                         throw;
                     }
+                });
+            } catch (...) {
+                if (fetch_interrupt) {
+                    fetch_interrupt->Stop();
                 }
-                try {
-                    return state.deferred ? state.cursor->Fetch(STANDARD_VECTOR_SIZE)
-                                          : state.cursor->FetchPacked(state.fetch_rows);
-                } catch (...) {
-                    if (interrupt) {
-                        interrupt->Stop();
-                    }
-                    // Same rule as at bind: a failed fetch leaves the channel in a
-                    // state this side cannot describe, so the session is not reused.
-                    state.session.Poison();
-                    if (!state.catalog_name.empty()) {
-                        state.cursor.reset();
-                        PoisonTransactionSession(context, state.catalog_name);
-                    }
-                    throw;
-                }
-            });
+                ThrowIfInterrupted(context);
+                throw;
+            }
+            fetch_interrupt.reset();
+            // A serial scan asks for the next batch now and reads it on another
+            // thread while this one is converted and stored: the server's work
+            // and the round trip overlap DuckDB's. A transaction's scan shares
+            // its session, and a parallel scan already overlaps its sessions.
+            if (!local && !state.parallel && state.catalog_name.empty() && !state.deferred && typed_chunks.empty() &&
+                !batch.exhausted && state.cursor) {
+                auto *cursor = state.cursor.get();
+                const auto rows = state.fetch_rows;
+                state.next_batch = std::async(std::launch::async, [cursor, rows] { return cursor->FetchPacked(rows); });
+            }
             const auto fetching_ns = elapsed(fetch_started);
             state.metrics.fetch_nanoseconds += fetching_ns;
             if (local && state.top_n_feedback) {

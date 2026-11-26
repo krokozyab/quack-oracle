@@ -13,11 +13,11 @@ CREATE SECRET ora (TYPE oracle, HOST 'db.example.com', PORT 1521,
 SELECT * FROM oracle_query('ora', 'SELECT id, label FROM app.items');
 ```
 
-> **Status:** version 0.8.3, for DuckDB v2.0.0 and v2.0.1, published to DuckDB Community
+> **Status:** version 0.9.0, for DuckDB v2.0.1, published to DuckDB Community
 > Extensions — one `INSTALL` and you are done, see [Install](#1-install).
 > Reads, writes, procedure calls and TLS are verified against live Oracle 19c,
 > Oracle Free 23ai, and OCI Autonomous Database; the 0.6, 0.7 and 0.8 additions were
-> verified on 19c and Free 23ai. What changed: [0.8.3](docs/RELEASE_NOTES_0.8.3.md), [0.8.2](docs/RELEASE_NOTES_0.8.2.md), [0.8.1](docs/RELEASE_NOTES_0.8.1.md), [0.8.0](docs/RELEASE_NOTES_0.8.0.md), [0.7.0](docs/RELEASE_NOTES_0.7.0.md),
+> verified on 19c and Free 23ai. What changed: [0.9.0](docs/RELEASE_NOTES_0.9.0.md), [0.8.3](docs/RELEASE_NOTES_0.8.3.md), [0.8.2](docs/RELEASE_NOTES_0.8.2.md), [0.8.1](docs/RELEASE_NOTES_0.8.1.md), [0.8.0](docs/RELEASE_NOTES_0.8.0.md), [0.7.0](docs/RELEASE_NOTES_0.7.0.md),
 > [0.6.3](docs/RELEASE_NOTES_0.6.3.md), [0.6.2](docs/RELEASE_NOTES_0.6.2.md),
 > [0.6.1](docs/RELEASE_NOTES_0.6.1.md), [0.6.0](docs/RELEASE_NOTES_0.6.0.md).
 
@@ -98,8 +98,8 @@ LOAD oracle_scanner;
 
 A signed binary for your platform is downloaded once and stays installed; no
 `-unsigned` flag, no build, and nothing from an Oracle client comes with it.
-Version 0.8.3 targets **DuckDB v2.0.0 and v2.0.1**, and new releases are built for
-DuckDB 2.0 only. An extension loads only into the DuckDB version it was built for,
+Version 0.9.0 targets **DuckDB v2.0.1**; on v2.0.0 the same command installs 0.8.3.
+New releases are built for DuckDB 2.0 only. An extension loads only into the DuckDB version it was built for,
 so a DuckDB 2.0 pre-release cannot load it; upgrade to v2.0.0 or later. On **DuckDB v1.5.6**
 the same command installs 0.4.0, the last release built for it; on v1.5.5,
 0.2.2.
@@ -936,7 +936,10 @@ the table does not need a primary key. The scan that finds them reads them
 `FOR UPDATE` on the transaction's session, so they stay locked until it commits or
 rolls back: a change another session commits meanwhile is waited for and then read,
 not overwritten, and a row it changes so that it no longer matches is left alone.
-Rows DuckDB reads and then filters out itself stay locked too.
+Rows DuckDB reads and then filters out itself stay locked too: a condition Oracle
+cannot be given (`LIKE`, a function call) reads the whole table `FOR UPDATE`, so
+other sessions wait on every row until you commit. Keep such updates in short
+transactions, or send the statement itself with `oracle_execute`.
 
 `UPDATE ... RETURNING` gives the rows as Oracle stored them after the change, and
 `DELETE ... RETURNING` the rows as they were when it deleted them:
@@ -1221,6 +1224,10 @@ SELECT * FROM oracle_call_auto('ora', 'APP.CALCULATE_TOTAL', ['42', NULL]);
 
 You get back `(name, value, cursor_handle)` rows, with a function's return
 value first, named `return_value`.
+
+A call that succeeds is committed, as `oracle_execute` and `oracle_plsql` are;
+one that fails is rolled back. Inside a DuckDB transaction on an `ATTACH`,
+`oracle_call_named_transaction` leaves the commit to that transaction.
 
 ### The explicit way
 
@@ -1509,7 +1516,9 @@ divided evenly — a sample of its blocks came back in a few clumps and cut a te
 1); the table is under 2,048 blocks, index-organized, clustered or temporary; the database
 gives out no change number (`EXECUTE` on `DBMS_FLASHBACK`) or no flashback read of the
 table; the query is a `TABLESAMPLE`; or the transaction has already written to the catalog,
-whose own session is the only one that sees those rows. Filters Oracle can be sent go into
+whose own session is the only one that sees those rows. When a missing grant is the reason,
+EXPLAIN ANALYZE names the Oracle error in `Oracle parallel refused`, and later scans of that
+table no longer ask until it is read again. Filters Oracle can be sent go into
 every chunk. If the table is dropped or truncated while the scan runs, Oracle's own error
 (`ORA-01466`) is the answer.
 
@@ -1594,7 +1603,7 @@ response exceeding that count is rejected.
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| `oracle_session_pool_size` | `4` | How many authenticated Oracle sessions to keep and reuse for reads, per DuckDB connection per secret. `0` opens a fresh one every time. |
+| `oracle_session_pool_size` | `4` | How many authenticated Oracle sessions to keep and reuse for reads, per DuckDB connection per secret. A session idle for 30 seconds or more answers `SELECT 1 FROM DUAL` before it is reused, and is replaced if the server or a firewall closed it. `0` opens a fresh one every time. |
 | `oracle_statement_cache` | `true` | Reuse up to 20 fully fetched scalar query cursors per native session, within a 2 MiB accounting budget. False releases idle cursors and restores parse/describe on each execution. |
 | `oracle_transaction_pool_size` | `2` | How many idle sessions an attached catalog keeps between its transactions, so the next transaction need not connect and authenticate. Read at `ATTACH`; `0` opens a session per transaction. |
 | `oracle_unconstrained_number` | `'varchar'` | What a `NUMBER` with no declared precision becomes: `'varchar'`, `'double'` or `'decimal(38,9)'`-style. Set it before the query or the table's first use. See [section 9](#9-which-oracle-types-work). |
@@ -1604,7 +1613,7 @@ response exceeding that count is rejected.
 | `oracle_join_pushdown` | `true` | Let Oracle join attached tables of one database (an inner join on number, date or timestamp columns). See [Joining two attached tables](#joining-two-attached-tables). |
 | `oracle_deferred_columns` | `true` | Read LOB, JSON, VECTOR and XML columns only for the rows that pass a filter DuckDB applies itself. See [Heavy columns after the filter](#heavy-columns-after-the-filter). |
 | `oracle_direct_scan` | `true` | Decode eligible attached scalar scans directly into typed vectors. NUMBER, DATE/TIMESTAMP, binary floats, BOOLEAN and short VARCHAR2/CHAR/RAW are supported; other columns retain the existing path. Set `false` for comparisons or troubleshooting. |
-| `oracle_fetch_rows` | `16384` | Maximum scalar attached-scan fetch rows, 1..65536; invalid values and NULL fail at SET. Output vectors remain 2048 rows. Selected column widths reduce the request toward an 8 MiB estimate; deferred, locked and short-limit scans retain the smaller path. |
+| `oracle_fetch_rows` | `16384` | Maximum scalar attached-scan fetch rows, 1..65536; invalid values and NULL fail at SET. Output vectors remain 2048 rows. Selected column widths reduce the request toward a 48 MiB worst-case estimate (a serial scan also holds the next batch, fetched while the current one is used); deferred, locked and short-limit scans retain the smaller path. |
 | `oracle_parallel_scan` | `-1` | Maximum sessions one scan of an attached table may read through at once: `-1` chooses (up to 8 and DuckDB's thread count, for a table of 500,000 rows or more; roughly 16 MiB or 250,000 filtered rows per reader), `0` or `1` is one session. A positive count above one bypasses size/selectivity estimates; range, thread, privilege and transaction safeguards remain. See [section 7](#7-read-a-big-table-faster). |
 | `oracle_parallel_top_n` | `auto` | VARCHAR mode: learn serial work and compare planning, network and candidate costs before using ROWID Top-N. `true`/`parallel` forces eligible ranges, `false`/`serial` forces one ranked read. Reader/thread/pool caps and snapshot/privilege safeguards apply. Plain LIMIT retains its path. |
 | `oracle_parallel_count` | `false` | Compute eligible scalar COUNT(*) and COUNT(column) per ROWID range at one SCN, then sum in DuckDB. Uses the reader/thread caps and serial privilege/write fallback; DISTINCT and grouped or mixed aggregates retain their existing paths. Multiple counts may be slower than one indexed count. |
@@ -1626,7 +1635,7 @@ handshake and an authentication round trip: against a cloud endpoint that was
 | `NUMBER(p,s)` | `DECIMAL(p,s)` | up to p = 38; negative scale uses `BIGINT` up to 18 effective digits, then `DECIMAL(p-s,0)` up to 38; `NUMBER(2,4)` is `DECIMAL(4,4)` |
 | `NUMBER` (unconstrained) | `VARCHAR` | exact only as text; see `oracle_unconstrained_number` below |
 | `VARCHAR2`, `CHAR` | `VARCHAR` | UTF-8, whatever the database character set is |
-| `DATE` | `TIMESTAMP` | an Oracle `DATE` carries a time, so it is not a DuckDB `DATE` |
+| `DATE` | `TIMESTAMP` | an Oracle `DATE` carries a time, so it is not a DuckDB `DATE`. See the calendar note below |
 | `TIMESTAMP(0–6)` | `TIMESTAMP` | |
 | `TIMESTAMP(7–9)` | `TIMESTAMP_NS` | |
 | `TIMESTAMP WITH TIME ZONE` | `VARCHAR` | keeps its offset, which `TIMESTAMPTZ` would drop; the time is on that offset's clock, as Oracle prints it (`2026-03-28 15:30:00+03:00`) |
@@ -1644,6 +1653,14 @@ handshake and an authentication round trip: against a cloud endpoint that was
 | `XMLTYPE` | `VARCHAR` | the document as text (`XMLSERIALIZE ... NO INDENT`); written back through `XMLPARSE(DOCUMENT ...)`. An attached table only |
 | `ROWID`, `UROWID` | `VARCHAR` | the 18 characters `ROWIDTOCHAR` gives; a logical UROWID is refused |
 | `LONG`, `LONG RAW` | `VARCHAR`, `BLOB` | up to 1 MiB a value |
+
+**Dates before 1582-10-15.** Oracle keeps them in the Julian calendar; DuckDB keeps
+every date in the proleptic Gregorian one. A value crosses at the same day, the one
+`TO_CHAR(d, 'J')` numbers, so Oracle's `1500-02-29` reads as `1500-03-10` and is
+written back as `1500-02-29`, and date arithmetic agrees on both sides. Oracle counts
+BC days as though there were a year 0, so DuckDB labels a BC date one year earlier
+than Oracle prints it: Oracle's `0001-12-31 BC` is DuckDB's `0002-12-29 (BC)`. A
+DuckDB date in its year 1 BC, a year Oracle has no days in, is refused when written.
 
 Anything else — `BFILE`, object and collection types — is **refused when the query is
 bound**, with a message naming the column and the reason. It is never decoded

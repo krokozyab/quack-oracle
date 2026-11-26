@@ -193,7 +193,7 @@ OracleCallableBind EncodeOracleCallableArgument(const std::string &type_name,
             int32_t year;
             int32_t month;
             int32_t day;
-            Date::Convert(date, year, month, day);
+            DateToOracleCalendar(date, year, month, day);
             return {12, 7,
                     oracle_scanner::EncodeOracleDate({year, static_cast<uint8_t>(month), static_cast<uint8_t>(day)})};
         } catch (const std::exception &) {
@@ -206,8 +206,11 @@ OracleCallableBind EncodeOracleCallableArgument(const std::string &type_name,
         }
         const auto text = require_value("TIMESTAMP");
         try {
-            const auto timestamp = Timestamp::FromString(text, false);
-            if (!timestamp.IsFinite()) {
+            // Strict: an offset or zone name is refused, not dropped from the wall time.
+            timestamp_t timestamp;
+            if (Timestamp::TryConvertTimestamp(text.c_str(), text.size(), timestamp, false, nullptr, true) !=
+                    TimestampCastResult::SUCCESS ||
+                !timestamp.IsFinite()) {
                 throw BinderException("infinite TIMESTAMP");
             }
             date_t date;
@@ -220,7 +223,7 @@ OracleCallableBind EncodeOracleCallableArgument(const std::string &type_name,
             int32_t minute;
             int32_t second;
             int32_t microseconds;
-            Date::Convert(date, year, month, day);
+            DateToOracleCalendar(date, year, month, day);
             Time::Convert(time, hour, minute, second, microseconds);
             return {180, 11,
                     oracle_scanner::EncodeOracleTimestamp(
@@ -354,6 +357,21 @@ std::vector<oracle_scanner::OracleRowData> ReadMetadataRows(OracleSession &sessi
     return rows;
 }
 
+// The argument rows of the callables the predicate names. A procedure with no
+// arguments has no ALL_ARGUMENTS row at all (19c, packaged or standalone), so
+// ALL_PROCEDURES adds one row for it whose POSITION is NULL: it names the
+// overload and carries no argument.
+std::string CallableArgumentsQuery(const std::string &predicate) {
+    return "SELECT owner, package_name, object_name, overload, position, argument_name, data_type, in_out, "
+           "data_level FROM (SELECT owner, package_name, object_name, overload, position, argument_name, data_type, "
+           "in_out, data_level, sequence FROM all_arguments UNION ALL SELECT p.owner, "
+           "DECODE(p.object_type, 'PACKAGE', p.object_name), NVL(p.procedure_name, p.object_name), p.overload, NULL, "
+           "NULL, NULL, NULL, 0, 0 FROM all_procedures p WHERE ((p.object_type = 'PACKAGE' AND p.procedure_name IS "
+           "NOT NULL) OR p.object_type = 'PROCEDURE') AND NOT EXISTS (SELECT 1 FROM all_arguments a WHERE "
+           "a.object_id = p.object_id AND a.subprogram_id = p.subprogram_id)) WHERE (" +
+           predicate + ") ORDER BY owner, package_name, object_name, overload, sequence";
+}
+
 std::vector<OracleCallableSignature> ResolveOracleCallables(OracleSession &session, const std::string &qualified_name) {
     const auto components = TranslatingOracleErrors("oracle callable name is invalid", [&] {
         return oracle_scanner::SplitOracleCallableName(qualified_name);
@@ -391,9 +409,7 @@ std::vector<OracleCallableSignature> ResolveOracleCallables(OracleSession &sessi
         const auto object = bind_text(components[2]);
         predicate = "owner = " + owner + " AND package_name = " + package + " AND object_name = " + object;
     }
-    const auto sql = "SELECT owner, package_name, object_name, overload, position, argument_name, data_type, "
-                     "in_out, data_level FROM all_arguments WHERE (" +
-                     predicate + ") ORDER BY owner, package_name, object_name, overload, sequence";
+    const auto sql = CallableArgumentsQuery(predicate);
 
     constexpr auto reading = "oracle callable metadata could not be read";
     auto rows = ReadMetadataRows(session, sql, binds, 9, reading);
@@ -432,16 +448,11 @@ std::vector<OracleCallableSignature> ResolveOracleCallables(OracleSession &sessi
                 retry_predicate =
                     "owner = " + owner + " AND package_name = " + package + " AND object_name = " + object;
             }
-            const auto retry_sql =
-                "SELECT owner, package_name, object_name, overload, position, argument_name, data_type, "
-                "in_out, data_level FROM all_arguments WHERE (" +
-                retry_predicate + ") ORDER BY owner, package_name, object_name, overload, sequence";
-            rows = ReadMetadataRows(session, retry_sql, retry_binds, 9, reading);
+            rows = ReadMetadataRows(session, CallableArgumentsQuery(retry_predicate), retry_binds, 9, reading);
         }
     }
     if (rows.empty()) {
-        throw BinderException("Oracle callable '%s' was not found, or the connected user cannot see it. A procedure "
-                              "with no arguments has no ALL_ARGUMENTS rows either.",
+        throw BinderException("Oracle callable '%s' was not found, or the connected user cannot see it",
                               qualified_name);
     }
 
@@ -472,6 +483,11 @@ std::vector<OracleCallableSignature> ResolveOracleCallables(OracleSession &sessi
             overloads.push_back(std::move(next));
         }
         auto &signature = overloads.back();
+        if (!row[4] || (!row[5] && !row[6])) {
+            // A procedure with no arguments: the ALL_PROCEDURES row above, or
+            // the nameless, typeless row some releases put in ALL_ARGUMENTS.
+            continue;
+        }
         OracleCallableArgument argument;
         argument.position = static_cast<int32_t>(IntegerOf(row[4], "POSITION"));
         argument.name = TextOf(row[5]);

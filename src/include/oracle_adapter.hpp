@@ -27,6 +27,8 @@
 #include <memory>
 #include <mutex>
 #include <atomic>
+#include <chrono>
+#include <future>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -88,6 +90,11 @@ auto TranslatingOracleErrors(const char *operation, FUNCTION function) -> declty
 
 //! Refuses any column this client cannot read, then returns its DuckDB type.
 LogicalType TypeFor(const OracleColumn &column);
+//! An Oracle calendar date (Julian before 1582-10-15, no year 0) as the DuckDB
+//! date with Oracle's day number; false when either calendar has no such day.
+bool OracleCalendarToDate(int32_t year, int32_t month, int32_t day, date_t &result);
+//! The Oracle calendar fields of a DuckDB date, for a value or literal sent to Oracle.
+void DateToOracleCalendar(date_t date, int32_t &year, int32_t &month, int32_t &day);
 std::unique_ptr<OracleCursor> OpenOracleScalarRead(OracleSession &session, const std::string &sql,
                                                 const std::vector<OracleColumn> &columns);
 
@@ -373,6 +380,26 @@ struct OracleQueryGlobalState final : GlobalTableFunctionState {
         : session(std::move(session_p)), cursor(std::move(cursor_p)), columns(std::move(columns_p)),
           types(std::move(types_p)), output_columns(std::move(output_columns_p)), chunk_columns(chunk_columns_p) {
     }
+    // A fetch still running when the scan ends early (LIMIT, an error, an
+    // interrupt) is cancelled and waited for before the cursor goes, and its
+    // session, left mid-call, is not given back to the pool.
+    ~OracleQueryGlobalState() override {
+        if (!next_batch.valid()) {
+            return;
+        }
+        if (next_batch.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+            try {
+                cursor->Cancel();
+            } catch (...) {
+            }
+        }
+        try {
+            // Its rows are not wanted; whether it ended cleanly is.
+            static_cast<void>(next_batch.get());
+        } catch (...) {
+            session.Poison();
+        }
+    }
 
     // Keep the session before the cursor: member destruction is reverse order,
     // so the cursor can queue its remote close while its session is still live,
@@ -406,6 +433,9 @@ struct OracleQueryGlobalState final : GlobalTableFunctionState {
     size_t buffer_position = 0;
     std::vector<std::shared_ptr<DataChunk>> typed_chunks;
     size_t typed_rows = 0;
+    //! A serial scan fetches its next batch while DuckDB converts and stores this
+    //! one, so the round trip and the server's work overlap the client's.
+    std::future<oracle_scanner::OracleBatch> next_batch;
     //! Set when heavy columns are fetched for the rows that pass the local filter only.
     std::unique_ptr<OracleDeferredColumns> deferred;
 
@@ -426,6 +456,7 @@ struct OracleQueryGlobalState final : GlobalTableFunctionState {
     bool plan_cache_hit = false;
     unique_ptr<OracleTopNFeedback> top_n_feedback;
     std::string top_n_execution;
+    std::string parallel_refusal;
     std::atomic<idx_t> next_chunk {0};
     idx_t thread_count = 1;
     std::string secret_name;
@@ -634,6 +665,9 @@ struct OracleScanOpening {
 };
 //! Installs the plan rewrites for attached tables (src/oracle_optimizer.cpp).
 void RegisterOracleOptimizer(DatabaseInstance &db);
+//! The finalizer of an AVG computed from an Oracle SUM and COUNT. Registered so
+//! a plan holding it can be deserialized; only the optimizer places it.
+ScalarFunction OracleFinalizeAverageFunction();
 std::string OracleTopNClause(const OracleQueryBindData &bind);
 unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context, OracleQueryBindData &bind,
                                                          TableFunctionInitInput &input);
@@ -666,6 +700,8 @@ struct OracleParallelPlan {
     uint64_t probe_nanoseconds = 0;
     uint64_t probe_round_trips = 0;
     uint64_t identity_hash = 0;
+    // Why Oracle refused range planning (a missing grant), for EXPLAIN ANALYZE.
+    std::string refusal;
 };
 OracleParallelPlan PlanParallelAttachedScan(ClientContext &context, const OracleQueryBindData &bind,
                                            const std::vector<column_t> &selected, idx_t sessions,

@@ -19,6 +19,7 @@
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/operator/logical_update.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 #include <functional>
 #include <map>
@@ -49,6 +50,9 @@
 namespace duckdb {
 
 namespace {
+
+// A column this path reads as itself: no LOB, LONG, JSON, VECTOR or XML.
+bool PlainColumn(const OracleColumn &column);
 
 // Rows past this are not worth asking Oracle to rank for: the statement says how
 // many rows to return, and a client-side heap of that size is no longer cheap.
@@ -316,6 +320,11 @@ bool PlanPushedAggregate(ClientContext &context, LogicalAggregate &aggregate, Lo
 		const auto &source = bind.columns[column];
 		const auto type = MappedType(source);
 		if (name == "count" && wanted == LogicalType::BIGINT) {
+            if (!PlainColumn(source)) {
+                // Oracle refuses COUNT over LONG (ORA-00997); LOBs, JSON and
+                // VECTOR are not compared by value either. DuckDB counts them.
+                return false;
+            }
             if (call.IsDistinct()) {
                 const bool text_key = type.id() == LogicalTypeId::VARCHAR && source.oracle_type == 1 &&
                                       source.character_set_form != 2 && !source.xml && source.compared_as_bytes;
@@ -530,14 +539,8 @@ void PushAggregate(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &
                 LogicalType::BIGINT, ColumnBinding(get_index, ProjectionIndex(++index))));
             arguments.push_back(make_uniq<BoundConstantExpression>(Value::DOUBLE(average->second.first)));
             arguments.push_back(make_uniq<BoundConstantExpression>(Value::BOOLEAN(average->second.second)));
-            ScalarFunction function(
-                "oracle_finalize_average",
-                {LogicalType::HUGEINT, LogicalType::BIGINT, LogicalType::DOUBLE, LogicalType::BOOLEAN},
-                LogicalType::DOUBLE, FinalizeOracleAverage);
-            function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-            function.SetFallible();
-            reference =
-                make_uniq<BoundFunctionExpression>(BoundScalarFunction(function), std::move(arguments), nullptr);
+            reference = make_uniq<BoundFunctionExpression>(BoundScalarFunction(OracleFinalizeAverageFunction()),
+                                                           std::move(arguments), nullptr);
         }
         select.push_back(std::move(reference));
     }
@@ -1222,7 +1225,22 @@ void PushDistinctCounts(OptimizerExtensionInput &input, unique_ptr<LogicalOperat
     PushAggregate(input, op, replacer);
 }
 
-void RejectExplicitOracleInsertDefaults(LogicalOperator &plan) {
+void RejectExplicitOracleDefaults(LogicalOperator &plan) {
+    // DuckDB binds UPDATE ... SET col = DEFAULT to this catalog's default, a NULL
+    // marker, not to Oracle's DEFAULT; writing it would store NULL.
+    if (plan.type == LogicalOperatorType::LOGICAL_UPDATE &&
+        plan.Cast<LogicalUpdate>().table.catalog.GetCatalogType() == "oracle_scanner") {
+        LogicalOperatorVisitor::EnumerateExpressions(*plan.children[0], [&](unique_ptr<Expression> *expression) {
+            ExpressionIterator::EnumerateExpression(*expression, [&](unique_ptr<Expression> &part) {
+                if (part->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
+                    part->Cast<BoundFunctionExpression>().Function().GetName() ==
+                        Identifier("__oracle_scanner_default")) {
+                    throw NotImplementedException("Oracle UPDATE does not support explicit DEFAULT values; "
+                                                  "use oracle_execute with Oracle SQL");
+                }
+            });
+        });
+    }
     if (plan.type == LogicalOperatorType::LOGICAL_INSERT) {
         auto &insert = plan.Cast<LogicalInsert>();
         if (insert.table.catalog.GetCatalogType() == "oracle_scanner" && !insert.children.empty()) {
@@ -1255,12 +1273,12 @@ void RejectExplicitOracleInsertDefaults(LogicalOperator &plan) {
         }
     }
     for (auto &child : plan.children) {
-        RejectExplicitOracleInsertDefaults(*child);
+        RejectExplicitOracleDefaults(*child);
     }
 }
 
 void PreOptimizeOraclePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
-    RejectExplicitOracleInsertDefaults(*plan);
+    RejectExplicitOracleDefaults(*plan);
     RewriteOracleMerges(input, plan);
     Value enabled;
     if (input.context.TryGetCurrentSetting("oracle_aggregate_pushdown", enabled) && !enabled.IsNull() &&
@@ -1291,6 +1309,15 @@ void OptimizeOraclePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperat
 }
 
 } // namespace
+
+ScalarFunction OracleFinalizeAverageFunction() {
+    ScalarFunction function(Identifier("__oracle_scanner_finalize_average"),
+                            {LogicalType::HUGEINT, LogicalType::BIGINT, LogicalType::DOUBLE, LogicalType::BOOLEAN},
+                            LogicalType::DOUBLE, FinalizeOracleAverage);
+    function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+    function.SetFallible();
+    return function;
+}
 
 static OracleTopNMode ParseOracleTopNMode(const Value &value) {
     const auto mode = StringUtil::Lower(value.ToString());

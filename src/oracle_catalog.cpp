@@ -207,6 +207,9 @@ struct OracleAttachedState {
     // Whether the session compares text by bytes (NLS_COMP = BINARY), read once at
     // ATTACH. False when it could not be read: equality on text then stays in DuckDB.
     bool nls_comp_binary = false;
+    // Whether the database character set is Unicode, read with NLS_COMP. False
+    // when it could not be read: non-ASCII text literals then stay in DuckDB.
+    bool database_unicode = false;
 
     void RefreshMetadataLocked() const {
         const auto version = epoch->version.load();
@@ -438,17 +441,18 @@ struct OracleAttachedState {
         if (byte_width < 0) {
             throw IOException("Oracle ATTACH received negative USER_TAB_COLUMNS DATA_LENGTH");
         }
-        OracleColumn column {name,
-                             oracle_type,
-                             static_cast<uint32_t>(byte_width),
-                             number(row[offset + 3], 0),
+        OracleColumn column {name, oracle_type, static_cast<uint32_t>(byte_width),
+                             // INTEGER and NUMBER(*,s) have no DATA_PRECISION but a scale;
+                             // the describe reports them as precision 38, so must this.
+                             type == "NUMBER" && !row[offset + 3] && row[offset + 4] ? int16_t(38)
+                                                                                     : number(row[offset + 3], 0),
                              number(row[offset + 4], 0),
-                             std::string(row[offset + 5]->begin(), row[offset + 5]->end()) == "Y",
-                             character_set_form};
+                             std::string(row[offset + 5]->begin(), row[offset + 5]->end()) == "Y", character_set_form};
         column.xml = xml;
         // A column that declares a collation of its own is settled afterwards, by
         // ApplyCollationsLocked; this is the default, NLS_COMP's.
         column.compared_as_bytes = nls_comp_binary;
+        column.ascii_literals_only = !database_unicode;
         return column;
     }
 
@@ -510,9 +514,18 @@ struct OracleAttachedState {
             nls_comp_binary = !batch.rows.empty() && !batch.rows[0].empty() && batch.rows[0][0] &&
                               std::string(batch.rows[0][0]->begin(), batch.rows[0][0]->end()) == "BINARY";
             cursor->Close();
+            auto charset =
+                session->Query("SELECT value FROM nls_database_parameters WHERE parameter = 'NLS_CHARACTERSET'", {});
+            const auto set = charset->Fetch(1);
+            const auto name = !set.rows.empty() && !set.rows[0].empty() && set.rows[0][0]
+                                  ? std::string(set.rows[0][0]->begin(), set.rows[0][0]->end())
+                                  : std::string();
+            database_unicode = name == "AL32UTF8" || name == "UTF8";
+            charset->Close();
             session.Finish();
         } catch (const std::exception &) {
             nls_comp_binary = false;
+            database_unicode = false;
         }
     }
 
@@ -943,7 +956,10 @@ struct OracleAttachedState {
             if (column.oracle_type == 12 || column.oracle_type == 180) {
                 const auto value = column.oracle_type == 12 ? oracle_scanner::DecodeOracleDate(raw)
                                                             : oracle_scanner::DecodeOracleTimestamp(raw);
-                const auto day = Date::FromDate(value.year, value.month, value.day);
+                date_t day;
+                if (!OracleCalendarToDate(value.year, value.month, value.day, day)) {
+                    return std::nullopt;
+                }
                 return static_cast<double>(day.days) * 86400.0 + value.hour * 3600.0 + value.minute * 60.0 +
                        value.second + value.nanosecond / 1e9;
             }
@@ -1195,6 +1211,15 @@ public:
         return {state->epoch->identity, state->epoch->version.load()};
     }
 
+    //! The ORA code that refused range planning for this table, or 0.
+    uint32_t RangesRefused() const {
+        return ranges_refused.load();
+    }
+
+    void RefuseRanges(uint32_t code) const {
+        ranges_refused = code;
+    }
+
     static unique_ptr<OracleAttachedTableEntry> Create(ClientContext &context, Catalog &catalog,
                                                         SchemaCatalogEntry &schema,
                                                         shared_ptr<OracleAttachedState> state,
@@ -1378,6 +1403,8 @@ private:
     shared_ptr<OracleAttachedState> state;
     std::string object_name;
     std::vector<OracleColumn> oracle_columns;
+    // shortcut: a table refused range planning stays serial until it is re-read, even if granted later.
+    mutable std::atomic<uint32_t> ranges_refused {0};
 };
 
 class OracleAttachedTableGenerator final : public DefaultGenerator {
@@ -2159,10 +2186,17 @@ public:
         if (cached != schema_aliases.end()) {
             return cached->second;
         }
+        // A miss is remembered until the next DDL through this ATTACH, which
+        // can create the schema; DETACH and ATTACH see one created elsewhere.
+        const auto version = state->epoch->version.load();
+        if (missing_version != version) {
+            missing_schemas.clear();
+            missing_version = version;
+        }
         if (missing_schemas.count(requested)) {
             return nullptr;
         }
-        if (schema_aliases.size() + missing_schemas.size() >= 4096) {
+        if (schema_aliases.size() >= 4096) {
             throw BinderException("Oracle ATTACH exceeds the 4096 named-schema limit");
         }
         auto scoped = make_shared_ptr<OracleAttachedState>();
@@ -2172,12 +2206,15 @@ public:
         scoped->transaction_pool = state->transaction_pool;
         scoped->current_schema = state->current_schema;
         scoped->nls_comp_binary = state->nls_comp_binary;
+        scoped->database_unicode = state->database_unicode;
         scoped->epoch = state->epoch;
         scoped->named_schema = true;
         scoped->owner = requested;
         if (!known_owner && requested != state->current_schema && requested != state->owner &&
             !scoped->ResolveOwner(true)) {
-            missing_schemas.insert(requested);
+            if (missing_schemas.size() < 4096) {
+                missing_schemas.insert(requested);
+            }
             return nullptr;
         }
         const auto system = CatalogTransaction::GetSystemTransaction(GetDatabase());
@@ -2269,6 +2306,7 @@ private:
     bool schemas_discovered = false;
     std::unordered_map<std::string, OracleSchemaEntry *> schema_aliases;
     std::unordered_set<std::string> missing_schemas;
+    idx_t missing_version = 0;
 };
 
 constexpr int64_t ORACLE_TRANSACTION_POOL_DEFAULT_SIZE = 2;
@@ -2294,12 +2332,13 @@ MakeOracleTransactionPool(ClientContext &context, const ConnectionConfig &config
     }
     auto pooled = config;
     pooled.io_deadline = nullptr;
+    // Shared, so copying the opener copies a pointer and cannot throw.
+    const auto login = std::make_shared<const std::pair<ConnectionConfig, std::string>>(std::move(pooled), password);
     return std::make_shared<oracle_scanner::OracleTransactionSessionPool>(
-        static_cast<size_t>(size),
-        [pooled, password](std::shared_ptr<oracle_scanner::OracleIoDeadlineBinding> binding) {
-            auto opened = pooled;
+        static_cast<size_t>(size), [login](std::shared_ptr<oracle_scanner::OracleIoDeadlineBinding> binding) {
+            auto opened = login->first;
             opened.io_deadline_binding = std::move(binding);
-            return std::shared_ptr<OracleSession>(OpenOracleSession(opened, password));
+            return std::shared_ptr<OracleSession>(OpenOracleSession(opened, login->second));
         });
 }
 
@@ -2517,10 +2556,21 @@ void OraclePinSnapshot(ClientContext &context, const std::string &catalog_name, 
     state->pinned_scn = scn;
 }
 
+// A statement that fails can leave the channel mid-message, so the pooled
+// session it ran on must not answer the next one.
+std::vector<std::vector<std::string>> PooledTextRows(OracleSessionHandle &session, const std::string &sql) {
+    try {
+        return TextRows(session.Get(), sql);
+    } catch (...) {
+        session.Poison();
+        throw;
+    }
+}
+
 std::string OracleCurrentScn(ClientContext &context, const std::string &catalog_name) {
     auto target = ResolveOracleWriteTarget(context, catalog_name);
     auto session = AcquireOracleReadSession(context, std::string(), target.catalog_name, target.config, target.password);
-    const auto rows = TextRows(session.Get(), "SELECT dbms_flashback.get_system_change_number FROM dual");
+    const auto rows = PooledTextRows(session, "SELECT dbms_flashback.get_system_change_number FROM dual");
     if (rows.size() != 1 || rows[0].size() != 1 || rows[0][0].empty()) {
         throw IOException("Oracle returned no change number");
     }
@@ -2556,7 +2606,7 @@ std::string OracleQuerySnapshot(ClientContext &context, const OracleQueryBindDat
     try {
         auto session = AcquireOracleReadSession(context, bind.secret_name, bind.catalog_name, bind.config, bind.password);
         const auto before = session->IoStats();
-        const auto rows = TextRows(session.Get(), "SELECT dbms_flashback.get_system_change_number FROM dual");
+        const auto rows = PooledTextRows(session, "SELECT dbms_flashback.get_system_change_number FROM dual");
         if (rows.size() != 1 || rows[0].size() != 1 || rows[0][0].empty()) {
             throw IOException("Oracle returned no change number");
         }
@@ -2578,17 +2628,17 @@ std::string OracleSnapshotOfHeapTable(ClientContext &context, const OracleQueryB
         auto session = AcquireOracleReadSession(context, bind.secret_name, bind.catalog_name, bind.config, bind.password);
         auto scn = OracleQuerySnapshot(context, bind);
         if (scn.empty()) {
-            const auto scn_rows = TextRows(session.Get(), "SELECT dbms_flashback.get_system_change_number FROM dual");
+            const auto scn_rows = PooledTextRows(session, "SELECT dbms_flashback.get_system_change_number FROM dual");
             if (scn_rows.size() != 1 || scn_rows[0].size() != 1 || scn_rows[0][0].empty()) {
                 return std::string();
             }
             scn = scn_rows[0][0];
         }
         const bool own = bind.schema_name.empty();
-        const auto kind = TextRows(session.Get(), std::string("SELECT iot_type, temporary, cluster_name FROM ") +
-                                                 (own ? "user_tables" : "all_tables") +
-                                                 " WHERE table_name = " + TextLiteral(bind.object_name) +
-                                                 (own ? std::string() : " AND owner = " + TextLiteral(bind.schema_name)));
+        const auto kind = PooledTextRows(
+            session, std::string("SELECT iot_type, temporary, cluster_name FROM ") +
+                         (own ? "user_tables" : "all_tables") + " WHERE table_name = " + TextLiteral(bind.object_name) +
+                         (own ? std::string() : " AND owner = " + TextLiteral(bind.schema_name)));
         if (kind.size() != 1 || !kind[0][0].empty() || kind[0][1] != "N" || !kind[0][2].empty()) {
             return std::string();
         }
@@ -2702,9 +2752,12 @@ std::vector<OracleColumn> ProjectedDescribe(const OracleQueryBindData &bind, con
         const auto &dictionary = bind.columns[selected[index]];
         const auto &actual = columns[index];
         const auto character_form = [](const OracleColumn &column) {
-            return (column.oracle_type == 1 || column.oracle_type == 96 || column.oracle_type == 112) &&
+            // The dictionary gives a character column no form; the describe says 1.
+            return (column.oracle_type == 1 || column.oracle_type == 96 || column.oracle_type == 112 ||
+                    column.oracle_type == 8) &&
                            column.character_set_form == 0
-                       ? uint8_t(1) : column.character_set_form;
+                       ? uint8_t(1)
+                       : column.character_set_form;
         };
         const auto number_scale = [](const OracleColumn &column) {
             // Unconstrained NUMBER is described with either 0 or -127 scale.
@@ -2851,6 +2904,16 @@ OracleParallelPlan PlanParallelAttachedScan(ClientContext &context, const Oracle
             return {};
         }
     }
+    const auto *entry = bind.table_entry ? dynamic_cast<const OracleAttachedTableEntry *>(bind.table_entry.get()) : nullptr;
+    const auto refused = [](uint32_t code) {
+        OracleParallelPlan plan;
+        plan.refusal = "ORA-" + StringUtil::Format("%05d", code) +
+                       "; parallel needs EXECUTE on SYS.DBMS_FLASHBACK, SELECT on DBA_EXTENTS and FLASHBACK on the table";
+        return plan;
+    };
+    if (entry && entry->RangesRefused()) {
+        return refused(entry->RangesRefused());
+    }
     OracleSessionHandle session;
     std::string cache_key;
     const auto started = std::chrono::steady_clock::now();
@@ -2889,7 +2952,6 @@ OracleParallelPlan PlanParallelAttachedScan(ClientContext &context, const Oracle
         (void)UnsignedPlanNumber(scn);
         const auto select_list = aggregate_select.empty() ? ProjectedSelectList(bind, selected) : aggregate_select;
         Value enabled;
-        const auto *entry = bind.table_entry ? dynamic_cast<const OracleAttachedTableEntry *>(bind.table_entry.get()) : nullptr;
         const bool caching = entry && context.TryGetCurrentSetting("oracle_scan_plan_cache", enabled) &&
                              !enabled.IsNull() && BooleanValue::Get(enabled);
         if (caching) {
@@ -2988,6 +3050,21 @@ OracleParallelPlan PlanParallelAttachedScan(ClientContext &context, const Oracle
         result.planning_nanoseconds = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - started).count());
         return result;
+    } catch (const oracle_scanner::ProtocolError &error) {
+        // ORA-00904/00942/01031: no EXECUTE on DBMS_FLASHBACK, no DBA_EXTENTS or no
+        // FLASHBACK. The server ended that call, so the session stays usable; asking
+        // again on every scan would only repeat the refusal.
+        const auto code = error.OracleCode();
+        if (code == 904U || code == 942U || code == 1031U) {
+            if (entry) {
+                entry->RefuseRanges(*code);
+            }
+            InvalidateOracleScanPlan(context, cache_key);
+            return refused(*code);
+        }
+        session.Poison();
+        InvalidateOracleScanPlan(context, cache_key);
+        return {};
     } catch (const std::exception &) {
         session.Poison();
         InvalidateOracleScanPlan(context, cache_key);
@@ -3128,6 +3205,9 @@ void RegisterOracleAttachedCatalog(ExtensionLoader &loader) {
         },
         nullptr, nullptr, nullptr, LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
     loader.RegisterFunction(default_marker);
+    // In the catalog only so a plan that carries it can be read back by name
+    // (DuckDB's debug build round-trips every plan); the optimizer places it.
+    loader.RegisterFunction(OracleFinalizeAverageFunction());
     RegisterOracleOptimizer(loader.GetDatabaseInstance());
     // On by default. Once a filter is handed to a scan DuckDB removes it from
     // the plan, so the scan must apply it exactly: the filters this translator

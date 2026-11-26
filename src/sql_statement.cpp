@@ -157,6 +157,42 @@ bool OracleQueryUsesTransientCursor(const std::string &sql) {
     return false;
 }
 
+bool OracleQueryLocksRows(const std::string &sql) {
+    size_t index = 0;
+    bool after_for = false;
+    while (index < sql.size()) {
+        SkipTrivia(sql, index);
+        if (index == sql.size()) {
+            break;
+        }
+        if ((sql[index] == 'q' || sql[index] == 'Q') && index + 2 < sql.size() && sql[index + 1] == '\'') {
+            const auto end = sql.find(std::string() + QQuoteTerminator(sql[index + 2]) + "'", index + 3);
+            if (end == std::string::npos) {
+                return true;
+            }
+            index = end + 2;
+            after_for = false;
+        } else if (sql[index] == '\'' || sql[index] == '"') {
+            SkipQuoted(sql, index, sql[index]);
+            after_for = false;
+        } else if (std::isalpha(static_cast<unsigned char>(sql[index])) || sql[index] == '_') {
+            std::string word;
+            while (index < sql.size() && (std::isalnum(static_cast<unsigned char>(sql[index])) || sql[index] == '_' ||
+                                          sql[index] == '$' || sql[index] == '#')) {
+                word += static_cast<char>(std::toupper(static_cast<unsigned char>(sql[index++])));
+            }
+            if (after_for && word == "UPDATE") {
+                return true;
+            }
+            after_for = word == "FOR";
+        } else {
+            ++index;
+            after_for = false;
+        }
+    }
+    return false;
+}
+
 OracleSqlKind ClassifyOracleSql(const std::string &sql) {
     const auto keyword = FirstKeyword(sql);
     if (keyword == "SELECT" || keyword == "WITH") {

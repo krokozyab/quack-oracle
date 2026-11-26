@@ -17,16 +17,21 @@ static bool IsLeapYear(int32_t year) {
 
 static uint8_t DaysInMonth(int32_t year, uint8_t month) {
     static constexpr uint8_t days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-    if (month == 2 && IsLeapYear(year)) {
+    // Oracle counts dates before 1582-10-15 in the Julian calendar, where every
+    // fourth year leaps: 1500, and BC years whose number divides by 4 (4 BC,
+    // not 1 BC), except 4712 BC, its first year (19c: ORA-01839 for its Feb 29).
+    if (month == 2 && (year < 1582 ? year % 4 == 0 && year != -4712 : IsLeapYear(year))) {
         return 29;
     }
     return days[month - 1];
 }
 
 static void ValidateDateTime(const OracleDateTime &value) {
-    if (value.year < -4712 || value.year > 9999 || value.month < 1 || value.month > 12 || value.day < 1 ||
-        value.day > DaysInMonth(value.year, value.month) || value.hour > 23 || value.minute > 59 ||
-        value.second > 59 || value.nanosecond >= 1000000000U) {
+    // Year 0 and 1582-10-05..14 are not dates in Oracle's calendar.
+    if (value.year < -4712 || value.year > 9999 || value.year == 0 || value.month < 1 || value.month > 12 ||
+        value.day < 1 || value.day > DaysInMonth(value.year, value.month) ||
+        (value.year == 1582 && value.month == 10 && value.day > 4 && value.day < 15) || value.hour > 23 ||
+        value.minute > 59 || value.second > 59 || value.nanosecond >= 1000000000U) {
         throw ProtocolError(ProtocolErrorKind::MALFORMED, "invalid Oracle date/time fields");
     }
     if (value.has_offset && (value.offset_minutes < -15 * 60 || value.offset_minutes > 15 * 60)) {

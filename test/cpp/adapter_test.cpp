@@ -116,6 +116,8 @@ OracleColumn Column(const std::string &name, uint16_t oracle_type, int16_t preci
 struct FakeResponse {
     std::vector<OracleColumn> columns;
     std::vector<WireRow> rows;
+    // Fetching this answer fails the way a cut-off response does.
+    std::optional<oracle_scanner::ProtocolErrorKind> failure = std::nullopt;
 };
 
 // A dictionary fixture for the combined heap/identity/SCN planning exchange.
@@ -211,6 +213,9 @@ struct FakeScript {
     std::optional<oracle_scanner::ProtocolErrorKind> fetch_failure;
     std::string fetch_failure_message;
     bool batch_should_fail = false;
+    // Fail the ExecuteBatch with this 1-based number (0: none), counted in batches.
+    size_t batch_fail_at = 0;
+    size_t batches = 0;
     bool execute_should_fail = false;
     bool honor_connect_cancelled = false;
     bool commit_should_fail = false;
@@ -218,6 +223,7 @@ struct FakeScript {
     // (until it fails or closes), and a rollback that fails.
     bool sessions_reusable = false;
     std::string query_failure_fragment;
+    std::optional<uint32_t> query_failure_code;
     bool rollback_should_fail = false;
     size_t session_closes = 0;
     // USER of the secret each session was opened from, in opening order, and
@@ -229,6 +235,15 @@ struct FakeScript {
     // A statement containing this fragment waits, the way one waiting on a row
     // lock does, until the deadline of the caller it is bound to expires.
     std::string block_until_deadline;
+    // A cursor whose SQL holds this fragment waits in its fetch until it is
+    // cancelled (up to 5 s), then fails as Oracle's ORA-01013 does.
+    std::string block_fetch_until_cancel;
+    // With block_fetch_until_cancel: the first fetch of the cursor that waits.
+    size_t block_fetch_from = 1;
+    // Hand out at most the requested rows a fetch, as a real cursor does,
+    // rather than every row on the first.
+    bool honor_fetch_size = false;
+    std::atomic<size_t> fetches {0};
     size_t blocked_statements = 0;
     // Cancelling the session ends its blocked statement with ORA-01013, the way
     // a server answers a break; false makes a server that never answers, so
@@ -341,14 +356,16 @@ static bool ProjectScriptedTable(const FakeScript &script, const std::string &sq
 class FakeCursor final : public OracleCursor {
 public:
     FakeCursor(std::shared_ptr<FakeScript> script_p, const std::string &sql = std::string())
-        : script(std::move(script_p)) {
+        : script(std::move(script_p)), cursor_sql(sql) {
         // The catalog's collation probes also read the dictionary views other
         // routes name (`FROM user_tab_columns`); only a route written for them answers.
         const bool collation_probe = sql.find("collation IS NOT NULL") != std::string::npos ||
-                                     sql.find("FROM nls_session_parameters") != std::string::npos;
+                                     sql.find("FROM nls_session_parameters") != std::string::npos ||
+                                     sql.find("FROM nls_database_parameters") != std::string::npos;
         for (const auto &route : script->routes) {
             if (collation_probe && route.first.find("collation") == std::string::npos &&
-                route.first.find("nls_session_parameters") == std::string::npos) {
+                route.first.find("nls_session_parameters") == std::string::npos &&
+                route.first.find("nls_database_parameters") == std::string::npos) {
                 continue;
             }
             if (sql.find(route.first) != std::string::npos) {
@@ -366,6 +383,9 @@ public:
         if (sql.find("FROM nls_session_parameters WHERE parameter = 'NLS_COMP'") != std::string::npos) {
             projected = {{Column("VALUE", 1)}, {{Text("BINARY")}}};
             answer = &projected;
+        } else if (sql.find("FROM nls_database_parameters WHERE parameter = 'NLS_CHARACTERSET'") != std::string::npos) {
+            projected = {{Column("VALUE", 1)}, {{Text("AL32UTF8")}}};
+            answer = &projected;
         } else if (sql.find("collation IS NOT NULL") != std::string::npos) {
             projected = {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("COLLATION", 1)}, {}};
             answer = &projected;
@@ -377,6 +397,9 @@ public:
     }
 
     OracleBatch Fetch(size_t requested) override {
+        fetch_calls++;
+        script->fetches++;
+        WaitIfFetchBlocked();
         {
             std::lock_guard<std::mutex> guard(script->record_lock);
             script->maximum_fetch_request = (std::max)(script->maximum_fetch_request, requested);
@@ -388,8 +411,26 @@ public:
         if (script->fetch_failure) {
             throw oracle_scanner::ProtocolError(*script->fetch_failure, script->fetch_failure_message);
         }
+        if (answer && answer->failure) {
+            throw oracle_scanner::ProtocolError(*answer->failure, "injected route failure");
+        }
         OracleBatch batch;
         batch.columns = Columns();
+        if (script->honor_fetch_size && !answer) {
+            const auto arena = std::make_shared<oracle_scanner::OracleRowArena>();
+            const auto &source_rows = script->rows;
+            for (; next_row < source_rows.size() && batch.rows.size() < requested; next_row++) {
+                const auto &source = source_rows[next_row];
+                oracle_scanner::OracleRowData row(source.size(), arena);
+                for (size_t column = 0; column < source.size(); column++) {
+                    row.SetOwned(column, source[column]);
+                }
+                batch.rows.push_back(std::move(row));
+            }
+            batch.exhausted = next_row == source_rows.size();
+            exhausted = batch.exhausted;
+            return batch;
+        }
         if (!drained) {
             const auto arena = std::make_shared<oracle_scanner::OracleRowArena>();
             for (const auto &source : answer ? answer->rows : script->rows) {
@@ -450,7 +491,11 @@ public:
         return true;
     }
 
+    // Called from the interrupt watcher while another thread waits in Fetch.
     void Cancel() override {
+        std::lock_guard<std::mutex> guard(script->record_lock);
+        script->cancel_requests++;
+        cancelled = true;
     }
 
     void Close() override {
@@ -459,7 +504,27 @@ public:
     }
 
 private:
+    void WaitIfFetchBlocked() {
+        {
+            std::lock_guard<std::mutex> guard(script->record_lock);
+            if (script->block_fetch_until_cancel.empty() || fetch_calls < script->block_fetch_from ||
+                cursor_sql.find(script->block_fetch_until_cancel) == std::string::npos) {
+                return;
+            }
+        }
+        const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < limit && !cancelled.exchange(false)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        throw oracle_scanner::ProtocolError(oracle_scanner::ProtocolErrorKind::INVALID_STATE,
+                                            "ORA-01013: user requested cancel of current operation", 1013);
+    }
+
     std::shared_ptr<FakeScript> script;
+    std::string cursor_sql;
+    std::atomic<bool> cancelled {false};
+    std::atomic<size_t> fetch_calls {0};
+    size_t next_row = 0;
     FakeResponse projected;
     const FakeResponse *answer = nullptr;
     bool drained = false;
@@ -508,7 +573,7 @@ public:
         }
         if (!script->query_failure_fragment.empty() && sql.find(script->query_failure_fragment) != std::string::npos) {
             throw oracle_scanner::ProtocolError(oracle_scanner::ProtocolErrorKind::MALFORMED,
-                                               "injected dictionary read failure");
+                                               "injected dictionary read failure", script->query_failure_code);
         }
         return std::make_unique<FakeCursor>(script, sql);
     }
@@ -560,6 +625,12 @@ public:
         script->counted_executes.push_back(sql);
         script->write_sessions.push_back(session_id);
         script->batch_rows = rows;
+        if (script->batch_fail_at && ++script->batches == script->batch_fail_at) {
+            throw oracle_scanner::ProtocolError(oracle_scanner::ProtocolErrorKind::INVALID_STATE,
+                                                "ORA-00001: unique constraint violated", 1);
+        } else if (!script->batch_fail_at) {
+            ++script->batches;
+        }
         if (script->batch_should_fail) {
             throw oracle_scanner::ProtocolError(*script->fetch_failure, script->fetch_failure_message);
         }
@@ -1783,6 +1854,15 @@ void TestNamedCallRequestAndOutputs() {
     CHECK(request.arguments[0].direction == oracle_scanner::BindDirection::BIND_IN);
     CHECK(request.arguments[1].direction == oracle_scanner::BindDirection::BIND_OUT);
     CHECK(request.arguments[1].oracle_type == 2 && request.arguments[2].oracle_type == 1);
+    // The procedure's work is committed, as oracle_execute's is; a failed call
+    // commits nothing and its session takes the work with it.
+    CHECK(script->commits == 1);
+    script->call_should_fail = true;
+    CHECK(database
+              .Query("SELECT * FROM oracle_call_named('ora', 'app.compute', "
+                     "[{name: 'i', direction: 'in', type: 'number', value: '3'}])")
+              ->HasError());
+    CHECK(script->commits == 1);
 }
 
 // A REF CURSOR result becomes a connection-local handle that oracle_cursor
@@ -1800,6 +1880,7 @@ void TestCursorHandlesAreConsumedOnce() {
     CHECK(handles->RowCount() == 1);
     const auto handle = handles->GetValue(0, 0).ToString();
     CHECK(handle.rfind("oracle:", 0) == 0);
+    CHECK(script->commits == 1);
 
     auto rows = database.Query("SELECT * FROM oracle_cursor('" + handle + "')");
     CHECK(!rows->HasError());
@@ -1809,6 +1890,15 @@ void TestCursorHandlesAreConsumedOnce() {
     // silently reopening or reusing a closed cursor.
     auto again = database.Query("SELECT * FROM oracle_cursor('" + handle + "')");
     CHECK(again->HasError());
+
+    // A prepared read binds the handle once, so a second EXECUTE has nothing to
+    // read and says so instead of dereferencing the spent cursor.
+    auto fresh = database.Query("SELECT * FROM oracle_call_cursors('ora', 'app.open_one', ['c'])");
+    CHECK(!fresh->HasError());
+    database.Run("PREPARE read_handle AS SELECT * FROM oracle_cursor('" + fresh->GetValue(0, 0).ToString() + "')");
+    CHECK(database.Query("EXECUTE read_handle")->RowCount() == 1);
+    auto spent = database.Query("EXECUTE read_handle");
+    CHECK(spent->HasError() && spent->GetError().find("has been read") != std::string::npos);
 }
 
 // The scan owns its session: once the query result is gone the session is gone
@@ -1870,6 +1960,8 @@ void TestWriteBindsFollowTheOracleColumnType() {
     CHECK(bind_for(number_column, duckdb::Value("12.34")).value == number_bind.value);
     unsupported(number_column, duckdb::Value::DOUBLE(1.5), "not exact");
     unconvertible(number_column, duckdb::Value("twelve"), "invalid character in Oracle NUMBER text");
+    // Text for a TIMESTAMP is wall time; an offset in it is refused, not dropped.
+    unconvertible(Column("AT", 180), duckdb::Value("2024-03-01 10:00:00+05:00"), "without a time zone");
 
     // Oracle stores an empty string as NULL and this client reads one back as
     // NULL, so binding it says the same thing rather than leaving it to the
@@ -2201,6 +2293,16 @@ void TestAutomaticCallBindsFromTheSignature() {
     CHECK(wrong_arity->GetError().find("takes 3 arguments, not 1") != std::string::npos);
     CHECK(script->calls.size() == 1);
 
+    // A procedure with no arguments has no ALL_ARGUMENTS row; ALL_PROCEDURES
+    // answers for it with a row that carries no position, and it is callable.
+    WireRow no_arguments {Text("APP"), Text("PKG"), Text("RESET"), WireValue(), WireValue(),
+                          WireValue(), WireValue(), WireValue(),   Number("0")};
+    script->rows = {no_arguments};
+    script->call_outputs.clear();
+    CHECK(!database.Query("SELECT * FROM oracle_call_auto('ora', 'pkg.reset', []::VARCHAR[]);")->HasError());
+    CHECK(script->calls.size() == 2 && script->calls[1].arguments.empty());
+    CHECK(script->calls[1].qualified_name == "\"APP\".\"PKG\".\"RESET\"");
+
     std::cout << "automatic calls bind from the resolved signature" << std::endl;
 }
 
@@ -2270,6 +2372,29 @@ void TestAttachedScanRefusesChangedNumericShape() {
     script->tables["SHAPE_CHANGE"] = {{Column("V", 2, 10, 0)}, {{Number("42")}}};
     CHECK(database.Query(query)->GetValue(0, 0).ToString() == "42");
     std::cout << "attached scans and pushed aggregates refuse stale numeric precision and scale" << std::endl;
+}
+
+// USER_TAB_COLUMNS gives INTEGER no DATA_PRECISION but a scale of 0, and the
+// describe calls the same column NUMBER(38): the two must agree or no scan runs.
+void TestAttachedIntegerColumnMatchesItsDescribe() {
+    auto script = std::make_shared<FakeScript>();
+    script->routes = {
+        {"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}},
+        {"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("INT_T")}}}},
+        {"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}},
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {{Text("INT_T"), Text("V"), Text("NUMBER"), Number("22"), std::nullopt, Number("0"), Text("Y")}}}},
+        {"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}}};
+    script->tables["INT_T"] = {{Column("V", 2, 38, 0)}, {{Number("7")}}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS o(TYPE oracle_scanner); SET oracle_parallel_scan=1;");
+    auto result = database.Query("SELECT V FROM o.INT_T");
+    CHECK(!result->HasError() && result->GetValue(0, 0).ToString() == "7");
+    CHECK(result->GetTypes()[0] == duckdb::LogicalType::DECIMAL(38, 0));
+    std::cout << "an attached INTEGER column reads as NUMBER(38)" << std::endl;
 }
 
 void TestAttachedScanRefusesChangedTemporalAndCharacterShape() {
@@ -2413,6 +2538,100 @@ void TestReadSessionsArePooledPerConnection() {
     }
 
     std::cout << "read sessions are pooled per connection" << std::endl;
+}
+
+// oracle_query opens its cursor at bind and the scan consumes it, so each
+// EXECUTE of a prepared statement binds again and reads the rows again.
+void TestPreparedOracleQueryRunsOnEveryExecute() {
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {Column("label", 1)};
+    script->rows = {{Text("only")}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("PREPARE twice AS SELECT * FROM oracle_query('ora', 'SELECT label FROM app.items')");
+    for (int run = 0; run < 2; run++) {
+        auto result = database.Query("EXECUTE twice");
+        CHECK(!result->HasError() && result->RowCount() == 1 && result->GetValue(0, 0).ToString() == "only");
+    }
+    std::cout << "a prepared oracle_query reads again on every EXECUTE" << std::endl;
+}
+
+// A change-number read that fails mid-answer must not hand its session back to
+// the pool: the next statement on it would read what is left of that answer.
+void TestFailedSnapshotReadDropsItsPooledSession() {
+    auto script = std::make_shared<FakeScript>();
+    script->routes = {
+        {"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}},
+        {"get_system_change_number",
+         {{Column("SCN", 2)}, {{Number("100")}}, oracle_scanner::ProtocolErrorKind::TRUNCATED}},
+        {"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("ITEMS")}}}},
+        {"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}},
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {{Text("ITEMS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("N")}}}},
+        {"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}}};
+    script->tables["ITEMS"] = {{Column("ID", 2, 10, 0)}, {{Number("1")}}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner); SET oracle_session_pool_size = 1; "
+                 "SET oracle_parallel_scan = 1; SET oracle_consistent_read = true;");
+    CHECK(database.Query("SELECT ID FROM o.ITEMS")->HasError());
+    script->routes[1].second.failure.reset();
+    const auto opened = script->sessions_opened;
+    CHECK(!database.Query("SELECT ID FROM o.ITEMS")->HasError());
+    CHECK(script->sessions_opened > opened);
+    std::cout << "a failed change-number read drops its pooled session" << std::endl;
+}
+
+// Whole seconds can fit DuckDB's nanosecond range while the fraction carries
+// past its end; that is a range error, not a wrap to 1677.
+void TestNanosecondTimestampAtTheEndOfTheRangeIsRefused() {
+    auto column = Column("ts", 180);
+    column.scale = 9;
+    oracle_scanner::OracleDateTime moment;
+    moment.year = 2262;
+    moment.month = 4;
+    moment.day = 11;
+    moment.hour = 23;
+    moment.minute = 47;
+    moment.second = 16;
+    moment.nanosecond = 900000000;
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {column};
+    script->rows = {{oracle_scanner::EncodeOracleTimestamp(moment, false)}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    auto result = database.Query("SELECT * FROM oracle_query('ora', 'SELECT ts FROM t')");
+    CHECK(result->HasError() && result->GetError().find("outside the nanosecond range") != std::string::npos);
+    std::cout << "a nanosecond timestamp past 2262 is refused, not wrapped" << std::endl;
+}
+
+// A pooled session must not outlive what opened it: a secret replaced under
+// the same name (a rotated password) gets sessions of its own, and a query that
+// took row locks has its session closed, which ends the transaction holding them.
+void TestReadPoolFollowsReplacedSecretAndDropsLockingSessions() {
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {Column("label", 1)};
+    script->rows = {{Text("only")}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("SET oracle_session_pool_size = 2;");
+    const auto query = "SELECT * FROM oracle_query('ora', 'SELECT label FROM app.items')";
+    CHECK(!database.Query(query)->HasError());
+    CHECK(!database.Query(query)->HasError());
+    CHECK(script->sessions_opened == 1);
+    database.Run("CREATE OR REPLACE SECRET ora (TYPE oracle, HOST '127.0.0.1', PORT 1521, "
+                 "SERVICE_NAME 'service', USER 'app_user', PASSWORD 'rotated');");
+    CHECK(!database.Query(query)->HasError());
+    CHECK(script->sessions_opened == 2);
+    // The idle session runs the locking query and is closed after it, so the
+    // next query finds the pool empty.
+    CHECK(!database.Query("SELECT * FROM oracle_query('ora', 'SELECT label FROM app.items FOR UPDATE')")->HasError());
+    CHECK(script->sessions_opened == 2);
+    CHECK(!database.Query(query)->HasError());
+    CHECK(script->sessions_opened == 3);
+    std::cout << "the read pool follows a replaced secret and drops sessions holding row locks" << std::endl;
 }
 
 // The attached catalog, end to end, with no database. Every path here —
@@ -3695,6 +3914,14 @@ void TestTextComparesByTheSessionCollation() {
         auto code = database.Query("SELECT ID FROM o.main.ITEMS WHERE CODE = 'beta';");
         CHECK(!code->HasError() && code->RowCount() == 1 && code->GetValue(0, 0).ToString() == "1");
         CHECK(!pushed(script, "\"CODE\" ="));
+        // The snapshot marker a pushed statement rewrites, and a constant past
+        // Oracle's 4000-byte literal, are compared by DuckDB instead.
+        auto marker = database.Query("SELECT ID FROM o.main.ITEMS WHERE LABEL = 'beta /*SCN*/';");
+        CHECK(!marker->HasError() && marker->RowCount() == 0);
+        CHECK(!pushed(script, "/*SCN*/"));
+        auto longer = database.Query("SELECT ID FROM o.main.ITEMS WHERE LABEL = '" + std::string(4001, 'x') + "';");
+        CHECK(!longer->HasError() && longer->RowCount() == 0);
+        CHECK(!pushed(script, "xxxx"));
         // Grouping needs only equality: by LABEL in Oracle, by CODE in DuckDB.
         database.Run("SET oracle_aggregate_pushdown = true;");
         script->routes.insert(script->routes.begin(),
@@ -3720,6 +3947,23 @@ void TestTextComparesByTheSessionCollation() {
         database.Run("SET oracle_aggregate_pushdown = true;");
         CHECK(!database.Query("SELECT LABEL, count(*) FROM o.main.ITEMS GROUP BY LABEL;")->HasError());
         CHECK(!pushed(script, "GROUP BY"));
+    }
+    {
+        // A database that is not Unicode turns what it cannot hold into '?' or
+        // '¿', so a non-ASCII literal stays in DuckDB; an ASCII one still goes.
+        auto script = script_for("BINARY");
+        script->routes.push_back({"nls_database_parameters", {text_columns({"VALUE"}), {{Text("WE8MSWIN1252")}}}});
+        auto factory = InstallFake(script);
+        TestDatabase database;
+        database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner);");
+        CHECK(!database.Query("SELECT ID FROM o.main.ITEMS WHERE LABEL = 'beta';")->HasError());
+        CHECK(pushed(script, "\"LABEL\" = 'beta'"));
+        auto other = database.Query("SELECT ID FROM o.main.ITEMS WHERE LABEL = 'Жbeta';");
+        CHECK(!other->HasError() && other->RowCount() == 0);
+        CHECK(!pushed(script, "\"LABEL\" ="));
+        auto listed = database.Query("SELECT ID FROM o.main.ITEMS WHERE LABEL IN ('beta', 'é');");
+        CHECK(!listed->HasError() && listed->RowCount() == 1);
+        CHECK(!pushed(script, "\"LABEL\" IN"));
     }
     std::cout << "text equality and grouping go to Oracle only where it compares by bytes" << std::endl;
 }
@@ -3885,6 +4129,133 @@ void TestLargeScalarFetchKeepsRowsAndLocalFilters() {
             CHECK(script->direct_fetches == calls);
         }
     }
+}
+
+// Names that are not schemas are remembered so a binder's repeated lookups do
+// not each ask Oracle, but they do not count toward the limit on schemas: past
+// 4096 of them a real schema still resolves.
+// Oracle refuses COUNT over a LONG column (ORA-00997), so DuckDB counts it.
+// Oracle dates before 1582-10-15 are Julian and have no year 0; DuckDB's are
+// proleptic Gregorian with astronomical years. A value read, written, bound or
+// compared crosses between the two at the same day.
+void TestOracleJulianDatesMeetDuckDBGregorianDates() {
+    // Oracle 19c's own day numbers, TO_CHAR(TO_DATE(d, 'YYYY-MM-DD BC'), 'J').
+    struct Day {
+        int32_t year, month, day;
+        int64_t oracle_day;
+    };
+    const std::vector<Day> days = {{2000, 1, 1, 2451545},  {1582, 10, 15, 2299161}, {1582, 10, 4, 2299160},
+                                   {1500, 2, 29, 2268992}, {1, 1, 1, 1721424},      {-1, 12, 31, 1721057},
+                                   {-1, 1, 1, 1720693},    {-2, 1, 1, 1720328},     {-4, 1, 1, 1719597},
+                                   {-5, 1, 1, 1719232},    {-101, 1, 1, 1684168},   {-1001, 1, 1, 1355443},
+                                   {-4708, 1, 1, 1461},    {-4711, 1, 1, 366},      {-4712, 12, 31, 365},
+                                   {-4712, 3, 1, 60},      {-4712, 2, 28, 59},      {-4712, 1, 1, 1}};
+    for (const auto &expected : days) {
+        duckdb::date_t date;
+        CHECK(duckdb::OracleCalendarToDate(expected.year, expected.month, expected.day, date));
+        CHECK(int64_t(date.days) + 2440588 == expected.oracle_day);
+        int32_t year;
+        int32_t month;
+        int32_t day;
+        duckdb::DateToOracleCalendar(date, year, month, day);
+        CHECK(year == expected.year && month == expected.month && day == expected.day);
+    }
+    duckdb::date_t refused;
+    CHECK(!duckdb::OracleCalendarToDate(1582, 10, 10, refused));
+    CHECK(!duckdb::OracleCalendarToDate(0, 6, 1, refused));
+    // Every Oracle day from its first to past the change comes back as itself.
+    duckdb::date_t first;
+    duckdb::date_t last;
+    CHECK(duckdb::OracleCalendarToDate(-4712, 1, 1, first) && duckdb::OracleCalendarToDate(1585, 1, 1, last));
+    for (auto day_number = first.days; day_number <= last.days; day_number++) {
+        int32_t year;
+        int32_t month;
+        int32_t day;
+        duckdb::DateToOracleCalendar(duckdb::date_t(day_number), year, month, day);
+        duckdb::date_t back;
+        if (year == 0) {
+            continue; // the 366 days between Oracle's 1 BC and AD 1
+        }
+        if (!duckdb::OracleCalendarToDate(year, month, day, back) || back.days != day_number) {
+            CHECK(false && "a day did not come back");
+            break;
+        }
+    }
+
+    // Read: the Julian leap day of 1500 is DuckDB's 1500-03-10.
+    oracle_scanner::OracleDateTime leap;
+    leap.year = 1500;
+    leap.month = 2;
+    leap.day = 29;
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {Column("D", 12)};
+    script->rows = {{oracle_scanner::EncodeOracleDate(leap)}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    auto read = database.Query("SELECT D FROM oracle_query('ora', 'SELECT d FROM t')");
+    CHECK(!read->HasError() && read->GetValue(0, 0).ToString() == "1500-03-10 00:00:00");
+    // Write: the same day goes back as Oracle's 1500-02-29.
+    const auto bind =
+        duckdb::OracleBindForColumn(duckdb::Value::DATE(duckdb::Date::FromDate(1500, 3, 10)), Column("D", 12), "1");
+    CHECK(bind.value == oracle_scanner::EncodeOracleDate(leap));
+    std::cout << "Oracle's Julian dates meet DuckDB's Gregorian ones at the same day" << std::endl;
+}
+
+void TestCountOfALongColumnStaysLocal() {
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+    script->routes.push_back({"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("NOTES")}}}});
+    script->routes.push_back({"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}});
+    script->routes.push_back(
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {{Text("NOTES"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("N")},
+           {Text("NOTES"), Text("BODY"), Text("LONG"), Number("0"), WireValue(), WireValue(), Text("Y")}}}});
+    script->routes.push_back({"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}});
+    // Described as Oracle describes a LONG: a character column, form 1.
+    auto body = Column("BODY", 8);
+    body.character_set_form = 1;
+    script->tables["NOTES"] = {
+        {Column("ID", 2, 10, 0), body},
+        {{Number("1"), Text("first")}, {Number("2"), WireValue()}, {Number("3"), Text("third")}}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner); SET oracle_aggregate_pushdown = true; "
+                 "SET oracle_parallel_scan = 1;");
+    auto counted = database.Query("SELECT count(BODY) FROM o.main.NOTES");
+    CHECK(!counted->HasError() && counted->GetValue(0, 0).ToString() == "2");
+    for (const auto &query : script->queries) {
+        CHECK(query.find("COUNT(\"BODY\")") == std::string::npos);
+    }
+    std::cout << "COUNT over a LONG column is counted by DuckDB" << std::endl;
+}
+
+void TestMissingSchemasDoNotExhaustTheSchemaLimit() {
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+    script->routes.push_back({"username = 'EXTRA'", {{Column("USERNAME", 1)}, {{Text("EXTRA")}}}});
+    script->routes.push_back({"FROM all_users", {{Column("USERNAME", 1)}, {}}});
+    script->routes.push_back({"FROM user_tables", {{Column("TABLE_NAME", 1)}, {}}});
+    script->routes.push_back({"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}});
+    script->routes.push_back({"FROM all_tables", {{Column("TABLE_NAME", 1)}, {{Text("LINKS_B")}}}});
+    script->routes.push_back({"FROM all_views", {{Column("VIEW_NAME", 1)}, {}}});
+    script->routes.push_back(
+        {"FROM all_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {{Text("LINKS_B"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("Y")}}}});
+    script->routes.push_back({"FROM all_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}});
+    script->tables["LINKS_B"] = {{Column("ID", 2, 10, 0)}, {{Number("7")}}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS o (TYPE oracle_scanner); SET oracle_parallel_scan = 1;");
+    for (int index = 0; index < 4100; index++) {
+        CHECK(database.Query("SELECT * FROM o.NOPE" + std::to_string(index) + ".LINKS_B")->HasError());
+    }
+    auto found = database.Query("SELECT ID FROM o.EXTRA.LINKS_B");
+    CHECK(!found->HasError() && found->GetValue(0, 0).ToString() == "7");
+    std::cout << "missing schemas do not exhaust the schema limit" << std::endl;
 }
 
 void TestNestedOracleJoinsAndAggregates() {
@@ -4348,6 +4719,22 @@ void TestAttachedScanReadsInRowidRanges() {
     script->query_failure_fragment.clear();
     database.Run("SELECT count(*) FROM o.main.FACTS;");
     CHECK(script->sessions_opened == warm_sessions + 1);
+    // No DBA_EXTENTS (ORA-00942) keeps the lease, and later scans stop asking.
+    script->query_failure_fragment = "dba_extents";
+    script->query_failure_code = 942U;
+    database.Run("SELECT count(*) FROM o.main.FACTS;");
+    CHECK(script->sessions_opened == warm_sessions + 1);
+    script->query_failure_fragment.clear();
+    script->queries.clear();
+    database.Run("SELECT count(*) FROM o.main.FACTS;");
+    CHECK(std::none_of(script->queries.begin(), script->queries.end(),
+                       [](const std::string &query) { return query.find("dba_extents") != std::string::npos; }));
+    auto refused = database.Query("EXPLAIN ANALYZE SELECT count(*) FROM o.main.FACTS;");
+    std::string refusal;
+    for (duckdb::idx_t row = 0; !refused->HasError() && row < refused->RowCount(); row++) {
+        refusal += refused->GetValue(1, row).ToString();
+    }
+    CHECK(refusal.find("Oracle parallel refused") != std::string::npos && refusal.find("ORA-00942") != std::string::npos);
     // Once the transaction has written, the one session that sees its rows reads, as one stream.
     database.Run("BEGIN;");
     database.Run("INSERT INTO o.main.FACTS VALUES (5);");
@@ -4934,6 +5321,18 @@ void TestCallableArgumentsOfTheNewTypes() {
     // A local-zone value is bound as the TIMESTAMP of its UTC wall time.
     const auto local_zone = encode("timestamp_ltz", "2024-03-01 10:00:00+02");
     CHECK(local_zone.oracle_type == 180 && local_zone.value && local_zone.value->size() == 11);
+    // A plain TIMESTAMP is wall time: an offset or zone in the text is refused,
+    // not dropped from it.
+    CHECK(encode("timestamp", "2024-03-01 10:00:00").value);
+    for (const auto *zoned : {"2024-03-01 10:00:00+05:00", "2024-03-01 10:00:00 America/New_York"}) {
+        bool zone_refused = false;
+        try {
+            encode("timestamp", zoned);
+        } catch (const duckdb::BinderException &) {
+            zone_refused = true;
+        }
+        CHECK(zone_refused);
+    }
     const auto null_out = duckdb::EncodeOracleCallableArgument("nvarchar", BindDirection::BIND_OUT, duckdb::Value(),
                                                                "P", "test");
     CHECK(!null_out.value && null_out.character_set_form == 2);
@@ -5295,15 +5694,16 @@ void TestAttachedUpsertsUseOracleMerge() {
                  "ON t.ID=s.ID WHEN NOT MATCHED THEN INSERT(ID,LABEL) VALUES(s.ID,s.LABEL);");
     database.Run("INSERT INTO ora.main.ITEMS VALUES (70,'a'),(70,'b') ON CONFLICT DO NOTHING;");
 
-    for (const auto *sql : {
-            "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT);",
-            "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT),(91,NULL);",
-            "INSERT INTO ora.main.ITEMS(ID,LABEL) VALUES (90,DEFAULT) RETURNING ID;",
-            "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT) ON CONFLICT DO NOTHING;",
-            "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT),(91,DEFAULT) ON CONFLICT DO NOTHING;",
-            "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT),(91,NULL) ON CONFLICT DO NOTHING;",
-            "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT) ON CONFLICT(ID) DO UPDATE SET LABEL=excluded.LABEL;",
-            "INSERT OR REPLACE INTO ora.main.ITEMS VALUES (90,DEFAULT);"}) {
+    for (const auto *sql :
+         {"INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT);",
+          "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT),(91,NULL);",
+          "INSERT INTO ora.main.ITEMS(ID,LABEL) VALUES (90,DEFAULT) RETURNING ID;",
+          "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT) ON CONFLICT DO NOTHING;",
+          "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT),(91,DEFAULT) ON CONFLICT DO NOTHING;",
+          "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT),(91,NULL) ON CONFLICT DO NOTHING;",
+          "INSERT INTO ora.main.ITEMS VALUES (90,DEFAULT) ON CONFLICT(ID) DO UPDATE SET LABEL=excluded.LABEL;",
+          "INSERT OR REPLACE INTO ora.main.ITEMS VALUES (90,DEFAULT);",
+          "UPDATE ora.main.ITEMS SET LABEL=DEFAULT WHERE ID=1;"}) {
         const auto writes = script->counted_executes.size();
         auto result = database.Query(sql);
         CHECK(result->HasError() && result->GetError().find("explicit DEFAULT") != std::string::npos);
@@ -5402,6 +5802,45 @@ void TestAttachedMergesRefuseUnsafeKeyEquality() {
         }
         CHECK(!database.Query("SELECT 42;")->HasError());
     }
+}
+
+// An INSERT larger than one chunk goes to Oracle in several batches: every row
+// arrives, the count is the whole count, and a batch that fails after others
+// succeeded fails the statement and its transaction.
+void TestAttachedInsertSpansSeveralBatches() {
+    auto script = std::make_shared<FakeScript>();
+    script->routes.push_back({"SELECT USER FROM DUAL", {{Column("USER", 1)}, {{Text("APP")}}}});
+    script->routes.push_back({"FROM user_tables", {{Column("TABLE_NAME", 1)}, {{Text("ITEMS")}}}});
+    script->routes.push_back({"FROM user_views", {{Column("VIEW_NAME", 1)}, {}}});
+    script->routes.push_back(
+        {"FROM user_tab_columns",
+         {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1), Column("DATA_TYPE", 1), Column("DATA_LENGTH", 2),
+           Column("DATA_PRECISION", 2), Column("DATA_SCALE", 2), Column("NULLABLE", 1)},
+          {{Text("ITEMS"), Text("ID"), Text("NUMBER"), Number("22"), Number("10"), Number("0"), Text("N")},
+           {Text("ITEMS"), Text("LABEL"), Text("VARCHAR2"), Number("20"), WireValue(), WireValue(), Text("Y")}}}});
+    script->routes.push_back({"FROM user_constraints", {{Column("TABLE_NAME", 1), Column("COLUMN_NAME", 1)}, {}}});
+    script->tables["ITEMS"] = {{Column("ID", 2, 10, 0), Column("LABEL", 1)}, {}};
+    script->affected_rows = 1;
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    database.Run("ATTACH 'ora' AS ora (TYPE oracle_scanner); SET threads = 1;");
+    const std::string insert = "INSERT INTO ora.main.ITEMS SELECT i, 'x' FROM range(5000) t(i)";
+    const auto before = script->counted_executes.size();
+    auto inserted = database.Query(insert);
+    CHECK(!inserted->HasError() && inserted->GetValue(0, 0).ToString() == "5000");
+    CHECK(script->counted_executes.size() - before >= 3);
+
+    // The second batch fails after the first succeeded.
+    script->batch_fail_at = 2;
+    script->batches = 0;
+    database.Run("BEGIN;");
+    auto failed = database.Query(insert);
+    CHECK(failed->HasError() && failed->GetError().find("ORA-00001") != std::string::npos);
+    CHECK(database.Query("INSERT INTO ora.main.ITEMS VALUES (1, 'y')")->HasError());
+    database.Run("ROLLBACK;");
+    script->batch_fail_at = 0;
+    CHECK(!database.Query("INSERT INTO ora.main.ITEMS VALUES (1, 'y')")->HasError());
+    std::cout << "an INSERT spans several batches and fails on a failed one" << std::endl;
 }
 
 void TestAttachedWritesAgainstAFakeSession() {
@@ -5659,22 +6098,27 @@ void TestParallelScanRangesDoNotOverflow() {
         CHECK(!database.Query("SELECT count(*) FROM oracle_scan_parallel('ora', 'items', 'id', shards => " +
                               std::to_string(item.shards) + ");")
                    ->HasError());
-        std::vector<std::pair<long long, long long>> ranges;
+        // Half-open [begin, next) ranges and an open last one, so a key between
+        // two whole numbers (a plain NUMBER can hold 1.5) is in a shard too.
+        std::vector<std::pair<long long, std::optional<long long>>> ranges;
         for (const auto &statement : script->queries) {
             const auto low_at = statement.find("\"ID\" >= ");
-            const auto high_at = statement.find("\"ID\" <= ");
-            if (statement.find("AS OF SCN") != std::string::npos && low_at != std::string::npos && high_at != std::string::npos) {
-                ranges.emplace_back(std::stoll(statement.substr(low_at + 8)), std::stoll(statement.substr(high_at + 8)));
+            const auto high_at = statement.find("\"ID\" < ");
+            CHECK(statement.find("\"ID\" <= ") == std::string::npos);
+            if (statement.find("AS OF SCN") != std::string::npos && low_at != std::string::npos) {
+                ranges.emplace_back(std::stoll(statement.substr(low_at + 8)),
+                                    high_at == std::string::npos
+                                        ? std::nullopt
+                                        : std::optional<long long>(std::stoll(statement.substr(high_at + 7))));
             }
         }
         std::sort(ranges.begin(), ranges.end());
         CHECK(!ranges.empty());
-        CHECK(ranges.front().first == std::stoll(item.low) && ranges.back().second == std::stoll(item.high));
-        for (size_t index = 0; index < ranges.size(); index++) {
-            CHECK(ranges[index].first <= ranges[index].second);
-            if (index != 0) {
-                CHECK(ranges[index].first == ranges[index - 1].second + 1);
-            }
+        CHECK(ranges.front().first == std::stoll(item.low) && !ranges.back().second);
+        CHECK(ranges.back().first <= std::stoll(item.high));
+        for (size_t index = 0; index + 1 < ranges.size(); index++) {
+            CHECK(ranges[index].second && *ranges[index].second == ranges[index + 1].first);
+            CHECK(ranges[index].first < *ranges[index].second);
         }
     }
     std::cout << "parallel scan ranges cover every key once, at the extremes too" << std::endl;
@@ -5714,10 +6158,11 @@ void TestParallelScanShardsOneSnapshot() {
         // make this several moments rather than one snapshot.
         CHECK(statement.find("AS OF SCN 991144 ") != std::string::npos);
         const auto low_at = statement.find("\"ID\" >= ");
-        const auto high_at = statement.find("\"ID\" <= ");
-        CHECK(low_at != std::string::npos && high_at != std::string::npos);
+        const auto high_at = statement.find("\"ID\" < ");
+        CHECK(low_at != std::string::npos);
         const auto low = std::stoll(statement.substr(low_at + 8));
-        const auto high = std::stoll(statement.substr(high_at + 8));
+        // Half-open; the last shard has no upper end and runs to the maximum.
+        const auto high = high_at == std::string::npos ? 100LL : std::stoll(statement.substr(high_at + 7)) - 1;
         CHECK(low <= high);
         for (auto key = low; key <= high; key++) {
             CHECK(key >= 1 && key <= 100);
@@ -6760,6 +7205,12 @@ void TestRawCatalogTransactionsPinReadsAndWrites() {
     database.Run("BEGIN;");
     database.Run("SELECT * FROM oracle_execute_transaction('tx', 'DELETE FROM items');");
     database.Run("COMMIT;");
+    // A write declares itself, so DuckDB's READ ONLY transaction refuses it.
+    database.Run("BEGIN TRANSACTION READ ONLY;");
+    const auto read_only_writes = script->counted_executes.size();
+    CHECK(database.Query("SELECT * FROM oracle_execute_transaction('tx', 'DELETE FROM items');")->HasError());
+    CHECK(script->counted_executes.size() == read_only_writes);
+    database.Run("ROLLBACK;");
     CHECK(script->sessions_opened == opened + 2 && script->commits == commits + 1);
 
     // Invalid DDL must fail before opening an Oracle session.
@@ -6831,6 +7282,15 @@ void TestRawCatalogTransactionsPinReadsAndWrites() {
     database.Run("BEGIN;");
     database.Run("SELECT * FROM oracle_execute_transaction('tx', 'INSERT INTO items VALUES (7)');");
     database.Run("ROLLBACK;");
+    // The open maps the columns the way the bind did, setting included, or every
+    // unconstrained NUMBER reads as a changed type.
+    database.Run("SET oracle_unconstrained_number = 'double';");
+    database.Run("BEGIN;");
+    auto doubled = database.Query("SELECT * FROM oracle_query_transaction('tx', 'SELECT 42 FROM dual');");
+    CHECK(!doubled->HasError() && doubled->GetTypes()[0] == duckdb::LogicalType::DOUBLE &&
+          doubled->GetValue(0, 0).GetValue<double>() == 42);
+    database.Run("ROLLBACK;");
+    database.Run("RESET oracle_unconstrained_number;");
     std::cout << "raw catalog reads and writes follow commit/rollback and reject failed transaction reuse" << std::endl;
 }
 
@@ -7139,6 +7599,68 @@ void TestInterruptCancelsStandaloneCalls() {
 // A server that never answers the cancel: the call is given up once
 // ORACLE_CANCEL_GRACE (2 s) has passed, as before there was a cancel, and the
 // caller still gets DuckDB's interrupt.
+// A plain scan's fetch obeys the interrupt too: its cursor is cancelled, the
+// query ends in DuckDB's interrupt at once, and the connection goes on.
+void TestInterruptReachesAPlainScanFetch() {
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {Column("ID", 2)};
+    script->rows = {{Number("1")}};
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    script->block_fetch_until_cancel = "SLOW_FETCH";
+    const auto outcome = InterruptAfterStart(
+        database, "SELECT * FROM oracle_query('ora', 'SELECT id FROM app.items /* SLOW_FETCH */');");
+    if (outcome.first.find("INTERRUPT") == std::string::npos || outcome.second >= std::chrono::seconds(1)) {
+        std::cerr << "plain scan fetch: " << outcome.first << " after " << outcome.second.count() << " ms\n";
+    }
+    CHECK(outcome.first.find("INTERRUPT") != std::string::npos && outcome.second < std::chrono::seconds(1));
+    CHECK(script->cancel_requests == 1);
+    script->block_fetch_until_cancel.clear();
+    CHECK(!database.Query("SELECT * FROM oracle_query('ora', 'SELECT id FROM app.items')")->HasError());
+    std::cout << "a plain scan's fetch obeys the interrupt" << std::endl;
+}
+
+// A serial scan asks for its next batch while DuckDB converts this one. The
+// rows still arrive whole and in order, a LIMIT that ends the scan with a fetch
+// in flight leaves the connection usable, and an interrupt reaches a fetch that
+// is running in the background.
+void TestSerialScanFetchesAhead() {
+    auto script = std::make_shared<FakeScript>();
+    script->columns = {Column("ID", 2, 10, 0)};
+    for (int id = 1; id <= 10000; id++) {
+        script->rows.push_back({Number(std::to_string(id))});
+    }
+    script->honor_fetch_size = true;
+    auto factory = InstallFake(script);
+    TestDatabase database;
+    const std::string scan = "oracle_query('ora', 'SELECT id FROM app.items')";
+    auto all = database.Query("SELECT count(*), sum(ID), bool_and(ID = position) FROM (SELECT ID, "
+                              "row_number() OVER () AS position FROM " +
+                              scan + ")");
+    CHECK(!all->HasError() && all->GetValue(0, 0).ToString() == "10000" &&
+          all->GetValue(1, 0).ToString() == "50005000" && all->GetValue(2, 0).ToString() == "true");
+    const auto before_few = script->fetches.load();
+    auto few = database.Query("SELECT ID FROM " + scan + " LIMIT 3");
+    CHECK(!few->HasError() && few->RowCount() == 3 && few->GetValue(0, 2).ToString() == "3");
+    // The first batch, and the next one asked for before the first was used.
+    CHECK(script->fetches.load() - before_few == 2);
+    auto again = database.Query("SELECT count(*) FROM " + scan);
+    CHECK(!again->HasError() && again->GetValue(0, 0).ToString() == "10000");
+
+    script->block_fetch_until_cancel = "SELECT id";
+    script->block_fetch_from = 2;
+    const auto cancels = script->cancel_requests;
+    const auto outcome = InterruptAfterStart(database, "SELECT count(*) FROM " + scan);
+    if (outcome.first.find("INTERRUPT") == std::string::npos || outcome.second >= std::chrono::seconds(1)) {
+        std::cerr << "background fetch: " << outcome.first << " after " << outcome.second.count() << " ms\n";
+    }
+    CHECK(outcome.first.find("INTERRUPT") != std::string::npos && outcome.second < std::chrono::seconds(1));
+    CHECK(script->cancel_requests == cancels + 1);
+    script->block_fetch_until_cancel.clear();
+    CHECK(!database.Query("SELECT count(*) FROM " + scan)->HasError());
+    std::cout << "a serial scan fetches ahead and still stops on an interrupt" << std::endl;
+}
+
 void TestInterruptWithoutCancelAnswer() {
     auto script = std::make_shared<FakeScript>();
     script->columns = {Column("ID", 2)};
@@ -7381,6 +7903,8 @@ int main() {
     TestTransactionPoolsDoNotMixSecrets();
     TestInterruptReachesEveryTransactionPath();
     TestInterruptCancelsStandaloneCalls();
+    TestInterruptReachesAPlainScanFetch();
+    TestSerialScanFetchesAhead();
     TestInterruptWithoutCancelAnswer();
     TestQueryTypeMappingAndValues();
     TestWriteOracleValueMatchesValueFor();
@@ -7406,16 +7930,22 @@ int main() {
     TestUnknownSecretIsRejected();
     TestScanReleasesItsSession();
     TestReadSessionsArePooledPerConnection();
+    TestReadPoolFollowsReplacedSecretAndDropsLockingSessions();
+    TestPreparedOracleQueryRunsOnEveryExecute();
+    TestFailedSnapshotReadDropsItsPooledSession();
+    TestNanosecondTimestampAtTheEndOfTheRangeIsRefused();
     TestStatementCacheSettingKeepsSessionPoolBounded();
     TestPreparedQueryRecoveryKeepsWriteSessionUsable();
     TestAttachedCatalogAgainstAFakeSession();
     TestAttachedScanRefusesChangedWireTypes();
     TestAttachedScanRefusesChangedNumericShape();
+    TestAttachedIntegerColumnMatchesItsDescribe();
     TestAttachedScanRefusesChangedTemporalAndCharacterShape();
     TestAttachedDdlRefreshesAndCompensates();
     TestAttachedUpsertsUseOracleMerge();
     TestAttachedMergesRefuseUnsafeKeyEquality();
     TestAttachedWritesAgainstAFakeSession();
+    TestAttachedInsertSpansSeveralBatches();
     TestAttachedCatalogNamesTheNewTypes();
     TestInsertBindsMatchTheValuePath();
     TestAttachToAnotherSchema();
@@ -7436,6 +7966,9 @@ int main() {
     TestDirectConversionFailureKeepsSessionUsable();
     TestUnselectedLobKeepsLargeScalarFetches();
     TestWideDirectScanFallsBackBeforeFetching();
+    TestOracleJulianDatesMeetDuckDBGregorianDates();
+    TestCountOfALongColumnStaysLocal();
+    TestMissingSchemasDoNotExhaustTheSchemaLimit();
     TestNestedOracleJoinsAndAggregates();
     TestExactAveragePartialPushdown();
     TestDistinctCountPushesOnlyEquivalentEquality();

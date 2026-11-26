@@ -17,8 +17,10 @@ namespace {
 
 // Bounds on joining one response out of several DATA fragments. A response is
 // normally one packet and a large fetch a handful; these exist so a server that
-// never terminates a response cannot make this loop run forever.
-constexpr size_t MAX_RESPONSE_FRAGMENTS = 4096;
+// never terminates a response cannot make this loop run forever. The byte bound
+// is the one meant to bind: at an 8 KiB SDU, 4096 fragments stopped a fetch at
+// 32 MiB, below the 48 MiB a scan may ask for (OracleScanFetchRows).
+constexpr size_t MAX_RESPONSE_FRAGMENTS = 65536;
 constexpr size_t MAX_RESPONSE_BYTES = 64U << 20U;
 
 // Reads a response that Oracle may split across DATA fragments, which it does

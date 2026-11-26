@@ -9,6 +9,7 @@
 #include "duckdb/common/vector/array_vector.hpp"
 #include "duckdb/common/vector/list_vector.hpp"
 #include "duckdb/common/operator/decimal_cast_operators.hpp"
+#include "duckdb/common/operator/add.hpp"
 #include "duckdb/common/types/time.hpp"
 #include "oracle_scanner/oracle_vector.hpp"
 #include "oracle_scanner/oson.hpp"
@@ -267,12 +268,71 @@ std::string FormatDateTime(const oracle_scanner::OracleDateTime &value) {
     return result.str();
 }
 
+// Oracle counts dates before 1582-10-15 in the Julian calendar; DuckDB counts
+// every date in the proleptic Gregorian one. They meet at Oracle's own day
+// number (TO_CHAR(d, 'J')), so DuckDB date arithmetic is Oracle's. That number
+// is the astronomical Julian day, with Oracle's BC year -y counted as the
+// astronomical year -y (Oracle has no year 0 to label, and its 1 BC is 367
+// days before AD 1), except that 4712 BC, the first year, has no Feb 29 and
+// starts at day 1. So DuckDB labels a BC date one year earlier than Oracle.
+// Checked against 19c's day numbers in TestOracleJulianDatesMeetDuckDBGregorianDates.
+static constexpr int64_t GREGORIAN_START_JDN = 2299161; // 1582-10-15
+static constexpr int64_t UNIX_EPOCH_JDN = 2440588;      // 1970-01-01
+
+bool OracleCalendarToDate(int32_t year, int32_t month, int32_t day, date_t &result) {
+    if (year > 1582 || (year == 1582 && (month > 10 || (month == 10 && day >= 15)))) {
+        return Date::TryFromDate(year, month, day, result);
+    }
+    if (year == 0 || year < -4712 || month < 1 || month > 12 || day < 1 || day > 31) {
+        return false;
+    }
+    const int64_t a = (14 - month) / 12;
+    const int64_t y = int64_t(year) + 4800 - a;
+    const int64_t m = month + 12 * a - 3;
+    auto jdn = day + (153 * m + 2) / 5 + 365 * y + y / 4 - 32083;
+    if (year == -4712 && month <= 2) {
+        jdn++;
+    }
+    if (jdn >= GREGORIAN_START_JDN) {
+        return false; // 1582-10-05..14: the days the calendar change skipped
+    }
+    result = date_t(static_cast<int32_t>(jdn - UNIX_EPOCH_JDN));
+    return true;
+}
+
+void DateToOracleCalendar(date_t date, int32_t &year, int32_t &month, int32_t &day) {
+    auto jdn = static_cast<int64_t>(date.days) + UNIX_EPOCH_JDN;
+    if (jdn >= GREGORIAN_START_JDN) {
+        Date::Convert(date, year, month, day);
+        return;
+    }
+    if (jdn < 1) {
+        // Before Oracle's first day: a year its encoder refuses.
+        year = -4713;
+        month = 1;
+        day = 1;
+        return;
+    }
+    if (jdn <= 59) {
+        jdn--; // 4712 BC Jan 1 .. Feb 28, a year without Feb 29
+    }
+    const int64_t c = jdn + 32082;
+    const int64_t d = (4 * c + 3) / 1461;
+    const int64_t e = c - 1461 * d / 4;
+    const int64_t m = (5 * e + 2) / 153;
+    day = static_cast<int32_t>(e - (153 * m + 2) / 5 + 1);
+    month = static_cast<int32_t>(m + 3 - 12 * (m / 10));
+    // The astronomical year is Oracle's; year 0, which Oracle has no date in,
+    // is left 0 for its encoder to refuse.
+    year = static_cast<int32_t>(d - 4800 + m / 10);
+}
+
 // One Oracle date or timestamp as the DuckDB value its column maps to. The
 // nanosecond form spans only 1677..2262, so a value outside it is reported
 // rather than wrapped into a different instant.
 Value TimestampValueFor(const OracleColumn &column, const oracle_scanner::OracleDateTime &value) {
     date_t date;
-    if (!Date::TryFromDate(value.year, value.month, value.day, date)) {
+    if (!OracleCalendarToDate(value.year, value.month, value.day, date)) {
         throw ConversionException("Oracle date %s is outside the range DuckDB can represent",
                                   FormatDateTime(value));
     }
@@ -298,7 +358,13 @@ Value TimestampValueFor(const OracleColumn &column, const oracle_scanner::Oracle
         throw ConversionException("Oracle timestamp %s is outside the nanosecond range DuckDB can represent",
                                   FormatDateTime(value));
     }
-    return Value::TIMESTAMPNS(timestamp_ns_t(nanoseconds + static_cast<int64_t>(value.nanosecond)));
+    // The whole seconds can fit and the fraction still carry past the end.
+    if (!TryAddOperator::Operation(nanoseconds, static_cast<int64_t>(value.nanosecond), nanoseconds) ||
+        !timestamp_t(nanoseconds).IsFinite()) {
+        throw ConversionException("Oracle timestamp %s is outside the nanosecond range DuckDB can represent",
+                                  FormatDateTime(value));
+    }
+    return Value::TIMESTAMPNS(timestamp_ns_t(nanoseconds));
 }
 
 

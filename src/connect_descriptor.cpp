@@ -204,8 +204,19 @@ static std::string BuildDescriptor(const ConnectionConfig &config, const Connect
         result << "(SERVER=" << Upper(config.server_type) << ')';
     }
     if (include_cid) {
-        result << "(CID=(PROGRAM=" << identity.program << ")(HOST=" << identity.machine << ")(USER=" << identity.os_user
-               << "))";
+        // A path such as C:\Program Files (x86)\... would add parentheses and
+        // '=' to the descriptor; python-oracledb's sanitize() turns those and
+        // spaces into '?', and so does this.
+        const auto sanitize = [](std::string value) {
+            for (auto &character : value) {
+                if (character == ' ' || character == '(' || character == ')' || character == '=') {
+                    character = '?';
+                }
+            }
+            return value;
+        };
+        result << "(CID=(PROGRAM=" << sanitize(identity.program) << ")(HOST=" << sanitize(identity.machine)
+               << ")(USER=" << sanitize(identity.os_user) << "))";
     }
     if (!config.connection_id.empty()) {
         result << "(CONNECTION_ID=" << config.connection_id << ')';

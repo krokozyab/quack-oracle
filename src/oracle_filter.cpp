@@ -267,7 +267,7 @@ std::string OracleLiteral(const Value &constant, const OracleColumn &column) {
             date_t date;
             dtime_t time;
             Timestamp::Convert(micros, date, time);
-            Date::Convert(date, year, month, day);
+            DateToOracleCalendar(date, year, month, day);
             Time::Convert(time, hour, minute, second, microseconds);
         } else {
             const auto value = TimestampValue::Get(constant);
@@ -277,7 +277,7 @@ std::string OracleLiteral(const Value &constant, const OracleColumn &column) {
             date_t date;
             dtime_t time;
             Timestamp::Convert(value, date, time);
-            Date::Convert(date, year, month, day);
+            DateToOracleCalendar(date, year, month, day);
             Time::Convert(time, hour, minute, second, microseconds);
         }
         if (year < 1 || year > 9999) {
@@ -331,8 +331,20 @@ std::string OracleLiteral(const Value &constant, const OracleColumn &column) {
             // column declared COLLATE BINARY_CI, 'shipped' = 'SHIPPED' in Oracle.
             Refuse("a string comparison against a column Oracle compares by a collation rather than by bytes");
         }
+        if (text.find("/*SCN*/") != std::string::npos) {
+            // A pushed aggregate or join marks each table with this comment and
+            // later replaces it, everywhere in the text, with AS OF SCN.
+            Refuse("a string constant containing the scan's snapshot marker");
+        }
+        if (text.size() > 4000) {
+            // ORA-01704: a SQL string literal holds at most 4000 bytes.
+            Refuse("a string constant longer than 4000 bytes");
+        }
         std::string literal = "'";
         for (const auto character : text) {
+            if (column.ascii_literals_only && static_cast<unsigned char>(character) >= 0x80) {
+                Refuse("a non-ASCII string constant on a database whose character set is not Unicode");
+            }
             if (character == '\'') {
                 literal.push_back('\'');
             }

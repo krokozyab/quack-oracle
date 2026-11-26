@@ -165,14 +165,19 @@ struct OracleWriteState final : ClientContextState {
         PinnedOracleSession entry;
         {
             std::lock_guard<std::mutex> guard(lock);
-            if (poison) {
-                failed.insert(catalog_name);
-                status[catalog_name].connection_state = "discarded";
-            } else {
-                failed.erase(catalog_name);
-                if (status[catalog_name].commit_outcome != "unknown") {
-                    status[catalog_name].connection_state = "idle";
+            try {
+                if (poison) {
+                    failed.insert(catalog_name);
+                    status[catalog_name].connection_state = "discarded";
+                } else {
+                    failed.erase(catalog_name);
+                    if (status[catalog_name].commit_outcome != "unknown") {
+                        status[catalog_name].connection_state = "idle";
+                    }
                 }
+            } catch (...) {
+                // Out of memory for the bookkeeping: the session is still closed
+                // or rolled back below, which is what must not be skipped.
             }
             const auto found = pinned.find(catalog_name);
             if (found == pinned.end()) {
@@ -191,14 +196,11 @@ struct OracleWriteState final : ClientContextState {
         }
     }
 
-    std::vector<PinnedOracleSession> TakeAll() noexcept {
+    // A swap, so taking them allocates nothing and cannot fail.
+    std::unordered_map<std::string, PinnedOracleSession> TakeAll() noexcept {
         std::lock_guard<std::mutex> guard(lock);
-        std::vector<PinnedOracleSession> sessions;
-        sessions.reserve(pinned.size());
-        for (auto &entry : pinned) {
-            sessions.push_back(std::move(entry.second));
-        }
-        pinned.clear();
+        std::unordered_map<std::string, PinnedOracleSession> sessions;
+        sessions.swap(pinned);
         return sessions;
     }
 
@@ -280,7 +282,7 @@ struct OracleWriteState final : ClientContextState {
             }
         }
         for (auto &entry : TakeAll()) {
-            RollBack(std::move(entry));
+            RollBack(std::move(entry.second));
         }
     }
 };
@@ -330,8 +332,11 @@ oracle_scanner::OracleDateTime DateTimeFromValue(const Value &value, const Oracl
     if (value.type().id() == LogicalTypeId::VARCHAR) {
         const auto text = value.GetValue<std::string>();
         timestamp_ns_t parsed;
-        if (Timestamp::TryConvertTimestamp(text.c_str(), text.size(), parsed, false) != TimestampCastResult::SUCCESS) {
-            RefuseValue(column, "'" + text + "' is not an ISO date or timestamp");
+        // Strict, so text carrying an offset or a zone is refused rather than
+        // written as its wall time with the zone dropped.
+        if (Timestamp::TryConvertTimestamp(text.c_str(), text.size(), parsed, false, true) !=
+            TimestampCastResult::SUCCESS) {
+            RefuseValue(column, "'" + text + "' is not an ISO date or timestamp without a time zone");
         }
         auto microseconds = parsed.value / 1000;
         auto remainder = parsed.value % 1000;
@@ -385,7 +390,7 @@ oracle_scanner::OracleDateTime DateTimeFromTimestamp(timestamp_t timestamp, int6
     int32_t minute;
     int32_t second;
     int32_t microseconds;
-    Date::Convert(date, year, month, day);
+    DateToOracleCalendar(date, year, month, day);
     Time::Convert(time, hour, minute, second, microseconds);
     oracle_scanner::OracleDateTime result;
     result.year = year;
@@ -979,8 +984,9 @@ OracleTransactionStatus GetOracleTransactionStatus(ClientContext &context, const
 
 std::function<void()> OracleRollbackForCleanup(ClientContext &context, const std::string &catalog_name) {
     auto state = context.registered_state->GetOrCreate<OracleWriteState>("oracle_scanner.write_state");
-    return [state, catalog_name] {
-        state->Discard(catalog_name);
+    // Shared, so copying the cleanup copies a pointer and cannot throw.
+    return [state, name = std::make_shared<const std::string>(catalog_name)] {
+        state->Discard(*name);
     };
 }
 
@@ -1794,13 +1800,6 @@ PhysicalOperator &PlanOracleUpdate(ClientContext &, PhysicalPlanGenerator &plann
             assignments += ", ";
         }
         assignments += KeywordHelper::WriteQuotedAndEscaped(columns[position].name, '"') + " = ";
-        if (op.expressions[index]->GetExpressionType() == ExpressionType::VALUE_DEFAULT) {
-            // Oracle's own DEFAULT for the column, which is the right answer and
-            // not the same as the NULL this catalog would otherwise supply: it
-            // does not read DATA_DEFAULT from the dictionary.
-            assignments += "DEFAULT";
-            continue;
-        }
         if (op.expressions[index]->GetExpressionType() != ExpressionType::BOUND_REF) {
             throw NotImplementedException("Oracle UPDATE cannot evaluate this SET expression");
         }

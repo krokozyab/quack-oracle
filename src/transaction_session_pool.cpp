@@ -130,13 +130,21 @@ bool OracleTransactionSessionPool::Release(std::shared_ptr<OracleSession> sessio
         if (counters.leased > 0) {
             counters.leased--;
         }
-        expired = TakeExpiredLocked();
-        if (clean && !closed && idle.size() < maximum_idle) {
-            idle.push_back({std::move(session), clock()});
-            counters.returned++;
-            counters.idle = idle.size();
-            kept = true;
-        } else {
+        try {
+            expired = TakeExpiredLocked();
+            if (clean && !closed && idle.size() < maximum_idle) {
+                const auto since = clock();
+                // The one step that can fail, taken before the session moves.
+                idle.reserve(idle.size() + 1);
+                idle.push_back({std::move(session), since});
+                counters.returned++;
+                counters.idle = idle.size();
+                kept = true;
+            } else {
+                counters.closed++;
+            }
+        } catch (...) {
+            // No room to keep it: it is closed below instead.
             counters.closed++;
         }
     }
