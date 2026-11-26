@@ -13,11 +13,11 @@ CREATE SECRET ora (TYPE oracle, HOST 'db.example.com', PORT 1521,
 SELECT * FROM oracle_query('ora', 'SELECT id, label FROM app.items');
 ```
 
-> **Status:** version 0.8.3, for DuckDB v2.0.0 and v2.0.1, published to DuckDB Community
+> **Status:** version 0.9.0, for DuckDB v2.0.1, published to DuckDB Community
 > Extensions — one `INSTALL` and you are done, see [Install](#1-install).
 > Reads, writes, procedure calls and TLS are verified against live Oracle 19c,
 > Oracle Free 23ai, and OCI Autonomous Database; the 0.6, 0.7 and 0.8 additions were
-> verified on 19c and Free 23ai. What changed: [0.8.3](docs/RELEASE_NOTES_0.8.3.md), [0.8.2](docs/RELEASE_NOTES_0.8.2.md), [0.8.1](docs/RELEASE_NOTES_0.8.1.md), [0.8.0](docs/RELEASE_NOTES_0.8.0.md), [0.7.0](docs/RELEASE_NOTES_0.7.0.md),
+> verified on 19c and Free 23ai. What changed: [0.9.0](docs/RELEASE_NOTES_0.9.0.md), [0.8.3](docs/RELEASE_NOTES_0.8.3.md), [0.8.2](docs/RELEASE_NOTES_0.8.2.md), [0.8.1](docs/RELEASE_NOTES_0.8.1.md), [0.8.0](docs/RELEASE_NOTES_0.8.0.md), [0.7.0](docs/RELEASE_NOTES_0.7.0.md),
 > [0.6.3](docs/RELEASE_NOTES_0.6.3.md), [0.6.2](docs/RELEASE_NOTES_0.6.2.md),
 > [0.6.1](docs/RELEASE_NOTES_0.6.1.md), [0.6.0](docs/RELEASE_NOTES_0.6.0.md).
 
@@ -98,8 +98,8 @@ LOAD oracle_scanner;
 
 A signed binary for your platform is downloaded once and stays installed; no
 `-unsigned` flag, no build, and nothing from an Oracle client comes with it.
-Version 0.8.3 targets **DuckDB v2.0.0 and v2.0.1**, and new releases are built for
-DuckDB 2.0 only. An extension loads only into the DuckDB version it was built for,
+Version 0.9.0 targets **DuckDB v2.0.1**; on v2.0.0 the same command installs 0.8.3.
+New releases are built for DuckDB 2.0 only. An extension loads only into the DuckDB version it was built for,
 so a DuckDB 2.0 pre-release cannot load it; upgrade to v2.0.0 or later. On **DuckDB v1.5.6**
 the same command installs 0.4.0, the last release built for it; on v1.5.5,
 0.2.2.
