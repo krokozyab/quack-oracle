@@ -4729,6 +4729,12 @@ void TestAttachedScanReadsInRowidRanges() {
     database.Run("SELECT count(*) FROM o.main.FACTS;");
     CHECK(std::none_of(script->queries.begin(), script->queries.end(),
                        [](const std::string &query) { return query.find("dba_extents") != std::string::npos; }));
+    auto refused = database.Query("EXPLAIN ANALYZE SELECT count(*) FROM o.main.FACTS;");
+    std::string refusal;
+    for (duckdb::idx_t row = 0; !refused->HasError() && row < refused->RowCount(); row++) {
+        refusal += refused->GetValue(1, row).ToString();
+    }
+    CHECK(refusal.find("Oracle parallel refused") != std::string::npos && refusal.find("ORA-00942") != std::string::npos);
     // Once the transaction has written, the one session that sees its rows reads, as one stream.
     database.Run("BEGIN;");
     database.Run("INSERT INTO o.main.FACTS VALUES (5);");

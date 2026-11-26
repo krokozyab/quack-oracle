@@ -2900,6 +2900,7 @@ static bool DeferrableColumn(const OracleColumn &column);
 // supplies the wire representation and has to map to the same types.
 unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context, OracleQueryBindData &bind,
                                                          TableFunctionInitInput &input) {
+    std::string parallel_refusal;
     if (bind.count_source) {
         auto &source = *bind.count_source;
         Value enabled, requested;
@@ -2915,6 +2916,7 @@ unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context,
             sessions = MinValue<idx_t>(sessions, TaskScheduler::GetScheduler(context).NumberOfThreads());
         }
         auto plan = PlanParallelAttachedScan(context, source, {}, sessions, bind.count_select_list);
+        parallel_refusal = plan.refusal;
         auto &chunks = plan.statements;
         if (!chunks.empty()) {
             auto state = make_uniq<OracleQueryGlobalState>(OracleSessionHandle(), nullptr, bind.columns, bind.types,
@@ -3006,6 +3008,7 @@ unique_ptr<GlobalTableFunctionState> OracleAggregateInit(ClientContext &context,
                                                    bind.types, std::move(input.column_ids), chunk_columns);
     state->catalog_name = bind.catalog_name;
     state->scalar_count = bool(bind.count_source);
+    state->parallel_refusal = std::move(parallel_refusal);
     state->schema_check_io = schema_check_io;
     state->schema_checked = !bind.source_schema_checks.empty();
     state->sent_sql = opened.sql;
@@ -3726,6 +3729,7 @@ unique_ptr<GlobalTableFunctionState> OracleQueryInit(ClientContext &context, Tab
     state->metrics.sessions = 1;
     state->last_io = io_after_open;
     state->top_n_execution = decision.reason;
+    state->parallel_refusal = plan.refusal;
     state->planning_nanoseconds = plan.planning_nanoseconds;
     state->planning_io = plan.planning_io;
     state->plan_cache_hit = plan.cache_hit;
@@ -3788,6 +3792,9 @@ void OracleQueryMetrics(TableFunctionGetMetricsInput &input) {
     }
     if (!state->top_n_execution.empty()) {
         metrics.AddExtraInfo("Oracle Top-N execution", state->top_n_execution);
+    }
+    if (!state->parallel_refusal.empty()) {
+        metrics.AddExtraInfo("Oracle parallel refused", state->parallel_refusal);
     }
     if (state->parallel || state->planning_nanoseconds != 0) {
         metrics.AddExtraInfo("Oracle plan cache", state->plan_cache_hit ? "hit" : "miss or disabled");

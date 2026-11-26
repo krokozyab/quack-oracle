@@ -1516,7 +1516,9 @@ divided evenly — a sample of its blocks came back in a few clumps and cut a te
 1); the table is under 2,048 blocks, index-organized, clustered or temporary; the database
 gives out no change number (`EXECUTE` on `DBMS_FLASHBACK`) or no flashback read of the
 table; the query is a `TABLESAMPLE`; or the transaction has already written to the catalog,
-whose own session is the only one that sees those rows. Filters Oracle can be sent go into
+whose own session is the only one that sees those rows. When a missing grant is the reason,
+EXPLAIN ANALYZE names the Oracle error in `Oracle parallel refused`, and later scans of that
+table no longer ask until it is read again. Filters Oracle can be sent go into
 every chunk. If the table is dropped or truncated while the scan runs, Oracle's own error
 (`ORA-01466`) is the answer.
 

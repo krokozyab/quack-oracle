@@ -456,6 +456,7 @@ struct OracleQueryGlobalState final : GlobalTableFunctionState {
     bool plan_cache_hit = false;
     unique_ptr<OracleTopNFeedback> top_n_feedback;
     std::string top_n_execution;
+    std::string parallel_refusal;
     std::atomic<idx_t> next_chunk {0};
     idx_t thread_count = 1;
     std::string secret_name;
@@ -699,6 +700,8 @@ struct OracleParallelPlan {
     uint64_t probe_nanoseconds = 0;
     uint64_t probe_round_trips = 0;
     uint64_t identity_hash = 0;
+    // Why Oracle refused range planning (a missing grant), for EXPLAIN ANALYZE.
+    std::string refusal;
 };
 OracleParallelPlan PlanParallelAttachedScan(ClientContext &context, const OracleQueryBindData &bind,
                                            const std::vector<column_t> &selected, idx_t sessions,

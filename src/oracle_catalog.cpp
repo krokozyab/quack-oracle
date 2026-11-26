@@ -1211,12 +1211,13 @@ public:
         return {state->epoch->identity, state->epoch->version.load()};
     }
 
-    bool RangesRefused() const {
+    //! The ORA code that refused range planning for this table, or 0.
+    uint32_t RangesRefused() const {
         return ranges_refused.load();
     }
 
-    void RefuseRanges() const {
-        ranges_refused = true;
+    void RefuseRanges(uint32_t code) const {
+        ranges_refused = code;
     }
 
     static unique_ptr<OracleAttachedTableEntry> Create(ClientContext &context, Catalog &catalog,
@@ -1403,7 +1404,7 @@ private:
     std::string object_name;
     std::vector<OracleColumn> oracle_columns;
     // shortcut: a table refused range planning stays serial until it is re-read, even if granted later.
-    mutable std::atomic<bool> ranges_refused {false};
+    mutable std::atomic<uint32_t> ranges_refused {0};
 };
 
 class OracleAttachedTableGenerator final : public DefaultGenerator {
@@ -2904,8 +2905,14 @@ OracleParallelPlan PlanParallelAttachedScan(ClientContext &context, const Oracle
         }
     }
     const auto *entry = bind.table_entry ? dynamic_cast<const OracleAttachedTableEntry *>(bind.table_entry.get()) : nullptr;
+    const auto refused = [](uint32_t code) {
+        OracleParallelPlan plan;
+        plan.refusal = "ORA-" + StringUtil::Format("%05d", code) +
+                       "; parallel needs EXECUTE on SYS.DBMS_FLASHBACK, SELECT on DBA_EXTENTS and FLASHBACK on the table";
+        return plan;
+    };
     if (entry && entry->RangesRefused()) {
-        return {};
+        return refused(entry->RangesRefused());
     }
     OracleSessionHandle session;
     std::string cache_key;
@@ -3050,11 +3057,12 @@ OracleParallelPlan PlanParallelAttachedScan(ClientContext &context, const Oracle
         const auto code = error.OracleCode();
         if (code == 904U || code == 942U || code == 1031U) {
             if (entry) {
-                entry->RefuseRanges();
+                entry->RefuseRanges(*code);
             }
-        } else {
-            session.Poison();
+            InvalidateOracleScanPlan(context, cache_key);
+            return refused(*code);
         }
+        session.Poison();
         InvalidateOracleScanPlan(context, cache_key);
         return {};
     } catch (const std::exception &) {
